@@ -19,11 +19,15 @@ data class WorkspaceShellContext(
     val workingDir: File,
     val timeoutMillis: Long,
     val stdin: ByteArray? = null,
+    val accessMode: WorkspaceShellAccessMode = WorkspaceShellAccessMode.FULL_ROOTFS,
     val bindMounts: List<WorkspaceBindMount> = emptyList(),
 )
 
 class HostShellRunner : WorkspaceShellRunner {
     override fun execute(context: WorkspaceShellContext): WorkspaceCommandResult {
+        require(context.accessMode == WorkspaceShellAccessMode.FULL_ROOTFS) {
+            "Workspace-only commands require a sandboxed shell runner"
+        }
         val process = ProcessBuilder(defaultShell(), "-c", context.command)
             .directory(context.workingDir)
             .redirectErrorStream(false)

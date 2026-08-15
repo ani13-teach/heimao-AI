@@ -141,7 +141,7 @@ sealed class SearchServiceOptions {
 
         val TYPES = mapOf(
             BingLocalOptions::class to "Bing",
-            RikkaHubOptions::class to "RikkaHub",
+            RikkaHubOptions::class to "黑猫ai",
             ZhipuOptions::class to "智谱",
             TavilyOptions::class to "Tavily",
             ExaOptions::class to "Exa",

@@ -34,7 +34,7 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "rikkahub"
+rootProject.name = "黑猫ai"
 include(":app")
 include(":highlight")
 include(":ai")

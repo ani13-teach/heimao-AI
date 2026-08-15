@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import me.rerere.ai.provider.Model
@@ -63,6 +64,22 @@ class ChatVM(
 ) : ViewModel() {
     private val _conversationId: Uuid = Uuid.parse(id)
     val conversation: StateFlow<Conversation> = chatService.getConversationFlow(_conversationId)
+    val summarySources: StateFlow<List<Conversation>> = conversation
+        .map { current ->
+            current.summarySourceAssistantId to current.summarySourceConversationIds
+        }
+        .distinctUntilChanged()
+        .mapLatest { (sourceAssistantId, sourceConversationIds) ->
+            if (sourceAssistantId == null || sourceConversationIds.isEmpty()) {
+                emptyList()
+            } else {
+                conversationRepo.getConversationSummariesOfAssistantByIds(
+                    assistantId = sourceAssistantId,
+                    conversationIds = sourceConversationIds,
+                )
+            }
+        }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
     var chatListInitialized by mutableStateOf(false) // 聊天列表是否已经滚动到底部
 
     // 聊天输入状态 - 保存在 ViewModel 中避免 TransactionTooLargeException
@@ -201,6 +218,12 @@ class ChatVM(
 
         viewModelScope.launch {
             chatService.editMessage(_conversationId, messageId, parts)
+        }
+    }
+
+    fun clearSummaryContext() {
+        viewModelScope.launch {
+            chatService.clearSummaryContext(_conversationId)
         }
     }
 

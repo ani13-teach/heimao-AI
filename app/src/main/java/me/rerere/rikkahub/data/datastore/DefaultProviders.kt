@@ -18,11 +18,12 @@ import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
 import kotlin.uuid.Uuid
 
 val DEFAULT_AUTO_MODEL_ID = Uuid.parse("b7055fb4-39f9-4042-a88a-0d80ed76cf08")
+val DEFAULT_BRANDED_PROVIDER_ID = Uuid.parse("a8d2d463-e8c0-41f2-b89e-f5eb8e716cce")
 
 val DEFAULT_PROVIDERS = listOf(
     ProviderSetting.OpenAI(
-        id = Uuid.parse("a8d2d463-e8c0-41f2-b89e-f5eb8e716cce"),
-        name = "RikkaHub",
+        id = DEFAULT_BRANDED_PROVIDER_ID,
+        name = "黑猫ai",
         baseUrl = "https://api.rikka-ai.com/v1",
         apiKey = "",
         enabled = true,

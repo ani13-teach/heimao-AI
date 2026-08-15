@@ -9,16 +9,16 @@ import me.rerere.rikkahub.data.db.entity.MemoryEntity
 
 @Dao
 interface MemoryDAO {
-    @Query("SELECT * FROM memoryentity WHERE assistant_id = :assistantId")
+    @Query("SELECT * FROM memoryentity WHERE assistant_id = :assistantId ORDER BY id DESC")
     fun getMemoriesOfAssistantFlow(assistantId: String): Flow<List<MemoryEntity>>
 
-    @Query("SELECT * FROM memoryentity WHERE assistant_id = :assistantId")
+    @Query("SELECT * FROM memoryentity WHERE assistant_id = :assistantId ORDER BY id DESC")
     suspend fun getMemoriesOfAssistant(assistantId: String): List<MemoryEntity>
 
-    @Query("SELECT * FROM memoryentity")
+    @Query("SELECT * FROM memoryentity ORDER BY id DESC")
     fun getAllMemoriesFlow(): Flow<List<MemoryEntity>>
 
-    @Query("SELECT * FROM memoryentity")
+    @Query("SELECT * FROM memoryentity ORDER BY id DESC")
     suspend fun getAllMemories(): List<MemoryEntity>
 
     @Query("SELECT * FROM memoryentity WHERE id = :id")

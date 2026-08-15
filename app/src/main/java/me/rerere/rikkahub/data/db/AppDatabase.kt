@@ -15,6 +15,7 @@ import me.rerere.rikkahub.data.db.dao.MemoryDAO
 import me.rerere.rikkahub.data.db.dao.MessageNodeDAO
 import me.rerere.rikkahub.data.db.dao.WorkspaceDAO
 import me.rerere.rikkahub.data.db.entity.ConversationEntity
+import me.rerere.rikkahub.data.db.entity.ConversationNumberSequenceEntity
 import me.rerere.rikkahub.data.db.entity.FavoriteEntity
 import me.rerere.rikkahub.data.db.entity.FolderEntity
 import me.rerere.rikkahub.data.db.entity.GenMediaEntity
@@ -30,6 +31,7 @@ import me.rerere.rikkahub.utils.JsonInstant
 @Database(
     entities = [
         ConversationEntity::class,
+        ConversationNumberSequenceEntity::class,
         MemoryEntity::class,
         GenMediaEntity::class,
         MessageNodeEntity::class,
@@ -38,7 +40,7 @@ import me.rerere.rikkahub.utils.JsonInstant
         WorkspaceEntity::class,
         FolderEntity::class,
     ],
-    version = 24,
+    version = 25,
     autoMigrations = [
         AutoMigration(from = 1, to = 2),
         AutoMigration(from = 2, to = 3),

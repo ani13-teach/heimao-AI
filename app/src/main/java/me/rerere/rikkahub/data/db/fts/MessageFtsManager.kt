@@ -65,20 +65,26 @@ class MessageFtsManager(private val database: AppDatabase) {
     suspend fun search(
         keyword: String,
         sort: MessageSearchSort = MessageSearchSort.RELEVANCE,
+    ): List<MessageSearchResult> = searchInternal(keyword, sort, assistantId = null)
+
+    suspend fun searchForAssistant(
+        assistantId: String,
+        keyword: String,
+        sort: MessageSearchSort = MessageSearchSort.RELEVANCE,
+    ): List<MessageSearchResult> {
+        require(assistantId.isNotBlank()) { "Assistant id is required" }
+        return searchInternal(keyword, sort, assistantId)
+    }
+
+    private suspend fun searchInternal(
+        keyword: String,
+        sort: MessageSearchSort,
+        assistantId: String?,
     ): List<MessageSearchResult> = withContext(Dispatchers.IO) {
         val results = mutableListOf<MessageSearchResult>()
-        val cursor = db.query(
-            """
-            SELECT node_id, message_id, conversation_id, title, update_at,
-                   simple_snippet(message_fts, 0, '[', ']', '...', 30) AS snippet
-            FROM message_fts
-            WHERE text MATCH jieba_query(?)
-            ORDER BY ${sort.orderBy}
-            LIMIT 50
-            """.trimIndent(),
-            arrayOf(keyword)
-        )
-        Log.i(TAG, "search: $keyword")
+        val statement = buildMessageSearchStatement(keyword, sort, assistantId)
+        val cursor = db.query(statement.sql, statement.args.toTypedArray())
+        Log.i(TAG, "search: $keyword, assistantId: ${assistantId ?: "all"}")
         cursor.use {
             while (it.moveToNext()) {
                 results.add(
@@ -95,6 +101,45 @@ class MessageFtsManager(private val database: AppDatabase) {
         }
         results
     }
+}
+
+internal data class MessageSearchStatement(
+    val sql: String,
+    val args: List<Any?>,
+)
+
+internal fun buildMessageSearchStatement(
+    keyword: String,
+    sort: MessageSearchSort,
+    assistantId: String?,
+): MessageSearchStatement {
+    val assistantFilter = if (assistantId == null) {
+        ""
+    } else {
+        """
+        AND EXISTS (
+            SELECT 1
+            FROM conversationentity
+            WHERE conversationentity.id = message_fts.conversation_id
+              AND conversationentity.assistant_id = ?
+        )
+        """.trimIndent()
+    }
+    return MessageSearchStatement(
+        sql = """
+            SELECT node_id, message_id, conversation_id, title, update_at,
+                   simple_snippet(message_fts, 0, '[', ']', '...', 30) AS snippet
+            FROM message_fts
+            WHERE text MATCH jieba_query(?)
+            $assistantFilter
+            ORDER BY ${sort.orderBy}
+            LIMIT 50
+        """.trimIndent(),
+        args = buildList {
+            add(keyword)
+            if (assistantId != null) add(assistantId)
+        },
+    )
 }
 
 private fun UIMessage.extractFtsText(): String =

@@ -8,6 +8,13 @@ import org.junit.Test
 
 class DefaultProvidersTest {
     @Test
+    fun `branded provider uses black cat ai name`() {
+        val provider = DEFAULT_PROVIDERS.single { it.id == DEFAULT_BRANDED_PROVIDER_ID }
+
+        assertEquals("黑猫ai", provider.name)
+    }
+
+    @Test
     fun `default providers should include vercel ai gateway with expected balance config`() {
         val vercelProviders = DEFAULT_PROVIDERS
             .filterIsInstance<ProviderSetting.OpenAI>()

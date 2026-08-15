@@ -37,6 +37,7 @@ class ConversationRepository(
     companion object {
         private const val PAGE_SIZE = 20
         private const val INITIAL_LOAD_SIZE = 40
+        private const val SUMMARY_QUERY_BATCH_SIZE = 500
     }
 
     suspend fun getRecentConversations(assistantId: Uuid, limit: Int = 10): List<Conversation> {
@@ -275,6 +276,76 @@ class ConversationRepository(
         } else null
     }
 
+    suspend fun getConversationSummariesOfAssistantByIds(
+        assistantId: Uuid,
+        conversationIds: List<Uuid>,
+    ): List<Conversation> {
+        if (conversationIds.isEmpty()) return emptyList()
+        val entities = getConversationEntitiesByIdsOfAssistant(
+            assistantId = assistantId,
+            conversationIds = conversationIds,
+        ).associateBy { it.id }
+        return conversationIds.mapNotNull { id ->
+            entities[id.toString()]?.let { entity ->
+                conversationEntityToConversation(entity, emptyList())
+            }
+        }
+    }
+
+    suspend fun getFullConversationsOfAssistantByIds(
+        assistantId: Uuid,
+        conversationIds: List<Uuid>,
+    ): List<Conversation> {
+        if (conversationIds.isEmpty()) return emptyList()
+        val entities = getConversationEntitiesByIdsOfAssistant(
+            assistantId = assistantId,
+            conversationIds = conversationIds,
+        ).associateBy { it.id }
+        return conversationIds.mapNotNull { id ->
+            entities[id.toString()]?.let { entity ->
+                conversationEntityToConversation(entity, loadMessageNodes(entity.id))
+            }
+        }
+    }
+
+    private suspend fun getConversationEntitiesByIdsOfAssistant(
+        assistantId: Uuid,
+        conversationIds: List<Uuid>,
+    ): List<ConversationEntity> = conversationIds
+        .distinct()
+        .chunked(SUMMARY_QUERY_BATCH_SIZE)
+        .flatMap { batch ->
+            conversationDAO.getConversationsByIdsOfAssistant(
+                assistantId = assistantId.toString(),
+                ids = batch.map { it.toString() },
+            )
+        }
+
+    suspend fun createSummaryConversation(
+        sourceAssistantId: Uuid,
+        summarizerAssistantId: Uuid,
+        sourceConversationIds: List<Uuid>,
+        title: String,
+    ): Conversation {
+        val normalizedIds = sourceConversationIds.distinct()
+        require(normalizedIds.isNotEmpty()) { "At least one source conversation is required" }
+        val sources = getConversationSummariesOfAssistantByIds(sourceAssistantId, normalizedIds)
+        require(sources.size == normalizedIds.size) {
+            "One or more source conversations do not belong to the selected assistant"
+        }
+
+        val summaryConversation = Conversation(
+            assistantId = summarizerAssistantId,
+            title = title,
+            messageNodes = emptyList(),
+            summarySourceAssistantId = sourceAssistantId,
+            summarySourceConversationIds = normalizedIds,
+        )
+        insertConversation(summaryConversation)
+        return getConversationById(summaryConversation.id)
+            ?: error("Failed to load created summary conversation")
+    }
+
     suspend fun existsConversationById(uuid: Uuid): Boolean {
         return conversationDAO.existsById(uuid.toString())
     }
@@ -283,26 +354,57 @@ class ConversationRepository(
         return conversationDAO.countAll()
     }
 
-    suspend fun insertConversation(conversation: Conversation) {
-        database.withTransaction {
+    suspend fun insertConversation(conversation: Conversation): Conversation {
+        val persistedConversation = database.withTransaction {
+            val numberedConversation = assignConversationNumber(conversation)
             conversationDAO.insert(
-                conversationToConversationEntity(conversation)
+                conversationToConversationEntity(numberedConversation)
             )
-            saveMessageNodes(conversation.id.toString(), conversation.messageNodes)
+            saveMessageNodes(numberedConversation.id.toString(), numberedConversation.messageNodes)
+            numberedConversation
         }
-        messageFtsManager.indexConversation(conversation)
+        messageFtsManager.indexConversation(persistedConversation)
+        return persistedConversation
     }
 
-    suspend fun updateConversation(conversation: Conversation) {
-        database.withTransaction {
+    suspend fun updateConversation(conversation: Conversation): Conversation {
+        val persistedConversation = database.withTransaction {
+            val existing = conversationDAO.getConversationById(conversation.id.toString())
+            val numberedConversation = if (existing != null) {
+                conversation.copy(conversationNumber = existing.conversationNumber)
+            } else {
+                assignConversationNumber(conversation)
+            }
             conversationDAO.update(
-                conversationToConversationEntity(conversation)
+                conversationToConversationEntity(numberedConversation)
             )
             // 删除旧的节点，插入新的节点
-            messageNodeDAO.deleteByConversation(conversation.id.toString())
-            saveMessageNodes(conversation.id.toString(), conversation.messageNodes)
+            messageNodeDAO.deleteByConversation(numberedConversation.id.toString())
+            saveMessageNodes(numberedConversation.id.toString(), numberedConversation.messageNodes)
+            numberedConversation
         }
-        messageFtsManager.indexConversation(conversation)
+        messageFtsManager.indexConversation(persistedConversation)
+        return persistedConversation
+    }
+
+    private suspend fun assignConversationNumber(conversation: Conversation): Conversation {
+        conversationDAO.ensureConversationNumberSequence()
+        if (conversation.conversationNumber > 0) {
+            val numberOwner = conversationDAO.getConversationIdByNumber(conversation.conversationNumber)
+            if (numberOwner == null || numberOwner == conversation.id.toString()) {
+                require(conversation.conversationNumber < Long.MAX_VALUE) {
+                    "Conversation number is too large"
+                }
+                conversationDAO.ensureNextConversationNumber(conversation.conversationNumber + 1)
+                return conversation
+            }
+        }
+
+        val number = conversationDAO.getNextConversationNumber()
+            ?: throw IllegalStateException("Conversation number sequence is unavailable")
+        require(number < Long.MAX_VALUE) { "Conversation number sequence is exhausted" }
+        conversationDAO.incrementConversationNumber()
+        return conversation.copy(conversationNumber = number)
     }
 
     suspend fun deleteConversation(conversation: Conversation) {
@@ -326,6 +428,12 @@ class ConversationRepository(
         keyword: String,
         sort: MessageSearchSort = MessageSearchSort.RELEVANCE,
     ) = messageFtsManager.search(keyword, sort)
+
+    suspend fun searchMessagesOfAssistant(
+        assistantId: Uuid,
+        keyword: String,
+        sort: MessageSearchSort = MessageSearchSort.RELEVANCE,
+    ) = messageFtsManager.searchForAssistant(assistantId.toString(), keyword, sort)
 
     suspend fun rebuildAllIndexes(onProgress: (current: Int, total: Int) -> Unit = { _, _ -> }) {
         messageFtsManager.deleteAll()
@@ -362,6 +470,12 @@ class ConversationRepository(
             lorebookIds = JsonInstant.encodeToString(conversation.lorebookIds),
             workspaceCwd = conversation.workspaceCwd ?: "",
             folderId = conversation.folderId?.toString() ?: "",
+            conversationNumber = conversation.conversationNumber,
+            summarySourceAssistantId = conversation.summarySourceAssistantId?.toString() ?: "",
+            summarySourceConversationIds = JsonInstant.encodeToString(
+                conversation.summarySourceConversationIds.map { it.toString() }
+            ),
+            summaryContext = conversation.summaryContext,
         )
     }
 
@@ -383,6 +497,15 @@ class ConversationRepository(
             lorebookIds = JsonInstant.decodeFromString(conversationEntity.lorebookIds),
             workspaceCwd = conversationEntity.workspaceCwd.ifEmpty { null },
             folderId = conversationEntity.folderId.ifEmpty { null }?.let { Uuid.parse(it) },
+            conversationNumber = conversationEntity.conversationNumber,
+            summarySourceAssistantId = conversationEntity.summarySourceAssistantId
+                .ifEmpty { null }
+                ?.let { runCatching { Uuid.parse(it) }.getOrNull() },
+            summarySourceConversationIds = runCatching {
+                JsonInstant.decodeFromString<List<String>>(conversationEntity.summarySourceConversationIds)
+                    .mapNotNull { runCatching { Uuid.parse(it) }.getOrNull() }
+            }.getOrDefault(emptyList()),
+            summaryContext = conversationEntity.summaryContext,
         )
     }
 
@@ -421,6 +544,7 @@ class ConversationRepository(
             isPinned = entity.isPinned,
             createAt = Instant.ofEpochMilli(entity.createAt),
             updateAt = Instant.ofEpochMilli(entity.updateAt),
+            conversationNumber = entity.conversationNumber,
             messageNodes = emptyList(),
             folderId = entity.folderId.ifEmpty { null }?.let { Uuid.parse(it) },
         )
@@ -491,6 +615,7 @@ data class LightConversationEntity(
     val isPinned: Boolean,
     val createAt: Long,
     val updateAt: Long,
+    val conversationNumber: Long = 0,
     val folderId: String = "",
 )
 

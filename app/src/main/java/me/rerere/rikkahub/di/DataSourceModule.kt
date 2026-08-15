@@ -30,6 +30,7 @@ import me.rerere.rikkahub.data.db.migrations.Migration_11_12
 import me.rerere.rikkahub.data.db.migrations.Migration_13_14
 import me.rerere.rikkahub.data.db.migrations.Migration_14_15
 import me.rerere.rikkahub.data.db.migrations.Migration_15_16
+import me.rerere.rikkahub.data.db.migrations.Migration_24_25
 import me.rerere.rikkahub.data.ai.mcp.McpManager
 import me.rerere.rikkahub.data.sync.webdav.WebDavSync
 import me.rerere.search.SearchService
@@ -52,7 +53,7 @@ val dataSourceModule = module {
         val context: Context = get()
         Room.databaseBuilder(context, AppDatabase::class.java, "rikka_hub")
             .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
-            .addMigrations(Migration_6_7, Migration_11_12, Migration_13_14, Migration_14_15, Migration_15_16)
+            .addMigrations(Migration_6_7, Migration_11_12, Migration_13_14, Migration_14_15, Migration_15_16, Migration_24_25)
             .addCallback(object : RoomDatabase.Callback() {
                 override fun onOpen(db: SupportSQLiteDatabase) {
                     val dictDir = SimpleDictManager.extractDict(context)
@@ -157,7 +158,8 @@ val dataSourceModule = module {
             context = get(),
             providerManager = get(),
             json = get(),
-            memoryRepo = get()
+            memoryRepo = get(),
+            workspaceRepository = get(),
         )
     }
 
@@ -177,7 +179,7 @@ val dataSourceModule = module {
                     .addHeader(HttpHeaders.AcceptLanguage, acceptLang)
 
                 if (originalRequest.header(HttpHeaders.UserAgent) == null) {
-                    requestBuilder.addHeader(HttpHeaders.UserAgent, "RikkaHub-Android/${BuildConfig.VERSION_NAME}")
+                    requestBuilder.addHeader(HttpHeaders.UserAgent, "HeimaoAI-Android/${BuildConfig.VERSION_NAME}")
                 }
 
                 chain.proceed(requestBuilder.build())

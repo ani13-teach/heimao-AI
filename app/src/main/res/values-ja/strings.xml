@@ -7,7 +7,7 @@
   <string name="about_page_version">バージョン</string>
   <string name="about_page_website">ウェブサイト</string>
   <string name="add">追加</string>
-  <string name="app_name">RikkaHub</string>
+  <string name="app_name">黑猫ai</string>
   <string name="asr_button_content_description">音声認識</string>
   <string name="asr_button_stop">停止</string>
   <string name="assistant_detail_basic_desc">名前、アバター、モデル、パラメータを設定</string>
@@ -296,6 +296,13 @@
   <string name="chat_page_save">保存</string>
   <string name="chat_page_scroll_to_bottom">一番下へスクロール</string>
   <string name="chat_page_search_chats">チャットを検索</string>
+  <string name="chat_page_summary_clear">まとめ対象を削除</string>
+  <string name="chat_page_summary_preparing">ソースを整理中 %1$d/%2$d…</string>
+  <string name="chat_page_summary_scope">過去の会話 %1$d 件</string>
+  <string name="chat_page_summary_source_empty">選択した会話に表示可能なテキストがありません。</string>
+  <string name="chat_page_summary_source_invalid">まとめ元のアシスタントが無効です。</string>
+  <string name="chat_page_summary_source_missing">選択した会話の一部が存在しないか、まとめ元のアシスタントに属していません。</string>
+  <string name="chat_page_summary_source_too_large">選択した履歴が大きすぎます。範囲を小さくしてください。</string>
   <string name="chat_page_today">今日</string>
   <string name="chat_page_yesterday">昨日</string>
   <string name="chat_size_dialog_content">現在のメッセージ数: %1$d。これによりアプリがクラッシュしたり動作が遅くなったり、この会話データが失われる可能性があります。チャットを続けるには、できるだけ早く新しい会話を作成してください。</string>
@@ -378,6 +385,20 @@
   <string name="history_page_pin">ピン留め</string>
   <string name="history_page_search">検索</string>
   <string name="history_page_search_messages">メッセージを検索</string>
+  <string name="history_page_summary">会話をまとめる</string>
+  <string name="history_page_summary_ai_title">まとめ用 AI</string>
+  <string name="history_page_summary_by_date">日付で選択</string>
+  <string name="history_page_summary_by_number">番号または ID で選択</string>
+  <string name="history_page_summary_continue">%1$d 件をまとめる</string>
+  <string name="history_page_summary_create">まとめチャットを開く</string>
+  <string name="history_page_summary_create_failed">まとめチャットを作成できませんでした</string>
+  <string name="history_page_summary_default_title">会話のまとめ</string>
+  <string name="history_page_summary_date_empty">指定した日付範囲に会話がありません。</string>
+  <string name="history_page_summary_number_hint">例: 1,3,8-10 または会話 UUID</string>
+  <string name="history_page_summary_number_invalid">有効な正の番号または範囲を入力してください。</string>
+  <string name="history_page_summary_number_missing">現在のアシスタントにありません: %1$s</string>
+  <string name="history_page_summary_select_all">すべての会話を選択</string>
+  <string name="history_page_summary_selected">%1$d 件選択</string>
   <string name="history_page_title">チャット履歴</string>
   <string name="history_page_undo">元に戻す</string>
   <string name="history_page_unpin">ピン留め解除</string>
@@ -819,7 +840,7 @@
   <string name="setting_page_search_title">検索サービス</string>
   <string name="setting_page_share">共有</string>
   <string name="setting_page_share_desc">このアプリを友達と共有</string>
-  <string name="setting_page_share_text">RikkaHub - オープンソースAndroid AIアシスタント\n\nウェブサイト: https://rikka-ai.com/</string>
+  <string name="setting_page_share_text">黑猫ai - オープンソースAndroid AIアシスタント\n\nウェブサイト: https://rikka-ai.com/</string>
   <string name="setting_page_sponsor_alert_confirm">寄付</string>
   <string name="setting_page_sponsor_alert_desc">アプリを100回以上起動しました！気に入っていただけたら、開発者をサポートしていただけると嬉しいです。</string>
   <string name="setting_page_sponsor_alert_dismiss">今はしない</string>
@@ -847,7 +868,7 @@
   <string name="setting_page_web_server_address_note_desc">LANアドレス: デバイスのWiFi IPを使用し、同じネットワーク上の他のデバイスからアクセス可能です。モバイルデータでは利用できません。
 ローカルアドレス: localhostを使用し、このデバイスのみでアクセス可能です。
 mDNSアドレス: .localホスト名を使用し、IPを知らなくても同じネットワーク上の他のデバイスから名前でアクセス可能です。</string>
-  <string name="setting_page_web_server_desc">Web経由でRikkaHubにアクセスできるようにする</string>
+  <string name="setting_page_web_server_desc">Web経由で黑猫aiにアクセスできるようにする</string>
   <string name="setting_page_web_server_error">エラー</string>
   <string name="setting_page_web_server_jwt_enable">認証を有効にする</string>
   <string name="setting_page_web_server_jwt_enable_desc">Webインターフェースにアクセスする際にパスワード認証が必要</string>
@@ -1242,7 +1263,7 @@ mDNSアドレス: .localホスト名を使用し、IPを知らなくても同じ
   <string name="setting_asr_configure_step_itn">ITN を有効化</string>
   <string name="setting_asr_configure_step_itn_desc">逆テキスト正規化: 話し言葉の数字を数字表記に変換します（例: 三百 → 300）</string>
   <string name="setting_asr_configure_step_timestamp">タイムスタンプを有効化</string>
-  <string name="setting_asr_configure_step_timestamp_desc">単語単位のタイムスタンプを返します。rikkahub では現在使用していないため、token 節約のため既定では無効です</string>
+  <string name="setting_asr_configure_step_timestamp_desc">単語単位のタイムスタンプを返します。黑猫ai では現在使用していないため、token 節約のため既定では無効です</string>
   <string name="setting_asr_configure_step_hotwords">ホットワード</string>
   <string name="setting_asr_configure_step_hotwords_desc">固有名詞や専門用語の認識精度を高める、カンマ区切りのホットワード一覧</string>
   <string name="log_page_record_requests">リクエスト記録</string>

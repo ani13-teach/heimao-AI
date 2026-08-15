@@ -17,6 +17,11 @@ enum class WorkspaceShellStatus {
     BROKEN,
 }
 
+enum class WorkspaceShellAccessMode {
+    FULL_ROOTFS,
+    WORKSPACE_ONLY,
+}
+
 enum class WorkspaceStorageArea {
     FILES,
     LINUX,

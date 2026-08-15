@@ -186,7 +186,7 @@ fun ImportExportTab(
                         {
                             val timestamp = LocalDateTime.now()
                                 .format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
-                            createDocumentLauncher.launch("rikkahub_backup_$timestamp.zip")
+                            createDocumentLauncher.launch("黑猫ai_backup_$timestamp.zip")
                         }
                     } else null,
                     headlineContent = { Text(stringResource(R.string.backup_page_local_backup_export)) },

@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.datastore.getCurrentAssistant
 import me.rerere.rikkahub.data.model.Conversation
@@ -22,7 +23,10 @@ class HistoryVM(
     private val conversationRepo: ConversationRepository,
     private val settingsStore: SettingsStore,
 ) : ViewModel() {
-    val assistant = settingsStore.settingsFlow
+    val settings = settingsStore.settingsFlow
+        .stateIn(viewModelScope, SharingStarted.Eagerly, Settings.dummy())
+
+    val assistant = settings
         .map { it.getCurrentAssistant() }
         .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
@@ -58,6 +62,21 @@ class HistoryVM(
         viewModelScope.launch {
             conversationRepo.insertConversation(conversation)
         }
+    }
+
+    suspend fun createSummaryConversation(
+        sourceConversationIds: List<Uuid>,
+        summarizerAssistantId: Uuid,
+        title: String,
+    ): Conversation {
+        val sourceAssistant = assistant.value
+            ?: error("Source assistant is unavailable")
+        return conversationRepo.createSummaryConversation(
+            sourceAssistantId = sourceAssistant.id,
+            summarizerAssistantId = summarizerAssistantId,
+            sourceConversationIds = sourceConversationIds,
+            title = title,
+        )
     }
 
     suspend fun getFullConversation(conversationId: Uuid): Conversation? {

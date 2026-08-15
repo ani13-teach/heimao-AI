@@ -2,9 +2,12 @@ package me.rerere.rikkahub.data.db.entity
 
 import androidx.room.ColumnInfo
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 
-@Entity
+@Entity(
+    indices = [Index(value = ["conversation_number"], unique = true)]
+)
 data class ConversationEntity(
     @PrimaryKey
     val id: String,
@@ -32,4 +35,12 @@ data class ConversationEntity(
     val workspaceCwd: String = "",
     @ColumnInfo("folder_id", defaultValue = "")
     val folderId: String = "",
+    @ColumnInfo("conversation_number", defaultValue = "0")
+    val conversationNumber: Long = 0,
+    @ColumnInfo("summary_source_assistant_id", defaultValue = "")
+    val summarySourceAssistantId: String = "",
+    @ColumnInfo("summary_source_conversation_ids", defaultValue = "[]")
+    val summarySourceConversationIds: String = "[]",
+    @ColumnInfo("summary_context", defaultValue = "")
+    val summaryContext: String = "",
 )

@@ -7,7 +7,7 @@
   <string name="about_page_version">版本</string>
   <string name="about_page_website">官网</string>
   <string name="add">添加</string>
-  <string name="app_name">RikkaHub</string>
+  <string name="app_name">黑猫ai</string>
   <string name="asr_button_content_description">语音识别</string>
   <string name="asr_button_stop">停止</string>
   <string name="assistant_detail_basic_desc">配置名称、头像、模型和参数</string>
@@ -298,6 +298,13 @@
   <string name="chat_page_save">保存</string>
   <string name="chat_page_scroll_to_bottom">滚动到底部</string>
   <string name="chat_page_search_chats">搜索聊天</string>
+  <string name="chat_page_summary_clear">移除总结范围</string>
+  <string name="chat_page_summary_preparing">正在整理来源 %1$d/%2$d…</string>
+  <string name="chat_page_summary_scope">%1$d 个历史对话</string>
+  <string name="chat_page_summary_source_empty">选中的对话没有可见文本。</string>
+  <string name="chat_page_summary_source_invalid">总结来源助手无效。</string>
+  <string name="chat_page_summary_source_missing">部分选中对话已不存在，或不属于来源助手。</string>
+  <string name="chat_page_summary_source_too_large">选中的历史记录过大，无法安全归并，请缩小范围。</string>
   <string name="chat_page_today">今天</string>
   <string name="chat_page_yesterday">昨天</string>
   <string name="chat_size_dialog_content">当前消息数：%1$d。这可能导致应用崩溃或卡顿，甚至丢失本次对话数据。请尽快新建对话以继续聊天。</string>
@@ -380,6 +387,20 @@
   <string name="history_page_pin">置顶</string>
   <string name="history_page_search">搜索</string>
   <string name="history_page_search_messages">搜索消息</string>
+  <string name="history_page_summary">总结对话</string>
+  <string name="history_page_summary_ai_title">总结 AI</string>
+  <string name="history_page_summary_by_date">按日期选择</string>
+  <string name="history_page_summary_by_number">按编号或 ID 选择</string>
+  <string name="history_page_summary_continue">总结 %1$d 个对话</string>
+  <string name="history_page_summary_create">进入总结对话</string>
+  <string name="history_page_summary_create_failed">创建总结对话失败</string>
+  <string name="history_page_summary_default_title">对话总结</string>
+  <string name="history_page_summary_date_empty">该日期范围内没有对话。</string>
+  <string name="history_page_summary_number_hint">例如：1,3,8-10 或会话 UUID</string>
+  <string name="history_page_summary_number_invalid">请输入有效的正整数或编号范围。</string>
+  <string name="history_page_summary_number_missing">当前助手不存在这些编号：%1$s</string>
+  <string name="history_page_summary_select_all">选择全部对话</string>
+  <string name="history_page_summary_selected">已选 %1$d 项</string>
   <string name="history_page_title">聊天历史</string>
   <string name="history_page_undo">撤销</string>
   <string name="history_page_unpin">取消置顶</string>
@@ -646,7 +667,7 @@
   <string name="setting_asr_configure_step_itn">逆文本归一化</string>
   <string name="setting_asr_configure_step_itn_desc">把口语数字转成阿拉伯数字（如「三百」→「300」），方便后续处理</string>
   <string name="setting_asr_configure_step_timestamp">返回时间戳</string>
-  <string name="setting_asr_configure_step_timestamp_desc">在 delta 事件里返回词级时间戳。rikkahub 当前不消费时间戳，默认关闭节省 token</string>
+  <string name="setting_asr_configure_step_timestamp_desc">在 delta 事件里返回词级时间戳。黑猫ai 当前不消费时间戳，默认关闭节省 token</string>
   <string name="setting_asr_configure_step_hotwords">热词</string>
   <string name="setting_asr_configure_step_hotwords_desc">逗号分隔的热词列表，提升专有名词、术语的识别准确率</string>
   <string name="setting_asr_page_add_provider">添加ASR提供商</string>
@@ -857,7 +878,7 @@
   <string name="setting_page_search_title">搜索服务</string>
   <string name="setting_page_share">分享</string>
   <string name="setting_page_share_desc">分享本APP给朋友</string>
-  <string name="setting_page_share_text">RikkaHub - 开源安卓AI助手\n\n官网: https://rikka-ai.com/</string>
+  <string name="setting_page_share_text">黑猫ai - 开源安卓AI助手\n\n官网: https://rikka-ai.com/</string>
   <string name="setting_page_sponsor_alert_confirm">捐赠</string>
   <string name="setting_page_sponsor_alert_desc">您已启动应用超过100次！如果您喜欢使用它，请考虑支持开发者。</string>
   <string name="setting_page_sponsor_alert_dismiss">暂不</string>
@@ -885,7 +906,7 @@
   <string name="setting_page_web_server_address_note_desc">局域网地址：使用设备 WiFi IP，同一网络中的其他设备可访问。移动数据网络下不可用。
 本地地址：使用 localhost，仅限本设备访问。
 mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过名称访问，无需知道 IP。</string>
-  <string name="setting_page_web_server_desc">允许你通过网页访问 RikkaHub</string>
+  <string name="setting_page_web_server_desc">允许你通过网页访问黑猫ai</string>
   <string name="setting_page_web_server_error">错误</string>
   <string name="setting_page_web_server_jwt_enable">启用身份验证</string>
   <string name="setting_page_web_server_jwt_enable_desc">访问网页界面时需要密码验证</string>

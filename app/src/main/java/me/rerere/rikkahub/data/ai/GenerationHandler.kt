@@ -34,8 +34,6 @@ import me.rerere.ai.ui.limitContext
 import me.rerere.rikkahub.data.ai.transformers.InputMessageTransformer
 import me.rerere.rikkahub.data.ai.transformers.MessageTransformer
 import me.rerere.rikkahub.data.ai.transformers.OutputMessageTransformer
-import me.rerere.rikkahub.data.files.FileFolders
-import java.io.File
 import me.rerere.rikkahub.data.ai.transformers.onGenerationFinish
 import me.rerere.rikkahub.data.ai.transformers.transforms
 import me.rerere.rikkahub.data.ai.transformers.visualTransforms
@@ -46,6 +44,7 @@ import me.rerere.rikkahub.data.datastore.findProvider
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.AssistantMemory
 import me.rerere.rikkahub.data.repository.MemoryRepository
+import me.rerere.rikkahub.data.repository.WorkspaceRepository
 import me.rerere.rikkahub.utils.applyPlaceholders
 import java.util.Locale
 import kotlin.time.Clock
@@ -62,16 +61,27 @@ sealed interface GenerationChunk {
     ) : GenerationChunk
 }
 
+internal fun List<UIMessage>.withAdditionalContextMessages(
+    additionalContextMessages: List<UIMessage>,
+): List<UIMessage> {
+    if (additionalContextMessages.isEmpty()) return this
+    val latestUserIndex = indexOfLast { it.role == me.rerere.ai.core.MessageRole.USER }
+    val insertionIndex = if (latestUserIndex >= 0) latestUserIndex else size
+    return take(insertionIndex) + additionalContextMessages + drop(insertionIndex)
+}
+
 class GenerationHandler(
     private val context: Context,
     private val providerManager: ProviderManager,
     private val json: Json,
     private val memoryRepo: MemoryRepository,
+    private val workspaceRepository: WorkspaceRepository,
 ) {
     fun generateText(
         settings: Settings,
         model: Model,
         messages: List<UIMessage>,
+        additionalContextMessages: List<UIMessage> = emptyList(),
         inputTransformers: List<InputMessageTransformer> = emptyList(),
         outputTransformers: List<OutputMessageTransformer> = emptyList(),
         assistant: Assistant,
@@ -129,6 +139,7 @@ class GenerationHandler(
                     assistant = assistant,
                     settings = settings,
                     messages = messages,
+                    additionalContextMessages = additionalContextMessages,
                     onUpdateMessages = {
                         messages = it.transforms(
                             transformers = outputTransformers,
@@ -287,7 +298,12 @@ class GenerationHandler(
                             val result = toolDef.execute(args)
                             val hasShellAccess = toolsInternal.any { it.name == "workspace_shell" }
                             executedTools += tool.copy(
-                                output = maybeTruncateToolOutput(tool.toolCallId, result, hasShellAccess)
+                                output = maybeTruncateToolOutput(
+                                    toolCallId = tool.toolCallId,
+                                    output = result,
+                                    hasShellAccess = hasShellAccess,
+                                    workspaceId = assistant.workspaceId?.toString(),
+                                )
                             )
                         }.onFailure {
                             // 取消必须向上传播，否则停止生成会被误报为工具执行错误
@@ -347,6 +363,7 @@ class GenerationHandler(
         assistant: Assistant,
         settings: Settings,
         messages: List<UIMessage>,
+        additionalContextMessages: List<UIMessage>,
         onUpdateMessages: suspend (List<UIMessage>) -> Unit,
         transformers: List<MessageTransformer>,
         model: Model,
@@ -396,7 +413,7 @@ class GenerationHandler(
             conversationLorebookIds = conversationLorebookIds,
             processingStatus = processingStatus,
             workspaceCwd = workspaceCwd,
-        )
+        ).withAdditionalContextMessages(additionalContextMessages)
 
         var messages: List<UIMessage> = messages
         val params = TextGenerationParams(
@@ -436,33 +453,44 @@ class GenerationHandler(
         }
     }
 
-    private fun maybeTruncateToolOutput(
+    private suspend fun maybeTruncateToolOutput(
         toolCallId: String,
         output: List<UIMessagePart>,
         hasShellAccess: Boolean,
+        workspaceId: String?,
     ): List<UIMessagePart> {
         val textParts = output.filterIsInstance<UIMessagePart.Text>()
         val nonTextParts = output.filter { it !is UIMessagePart.Text }
         val totalChars = textParts.sumOf { it.text.length }
 
-        if (totalChars <= MAX_TOOL_OUTPUT_CHARS || !hasShellAccess) return output
+        if (totalChars <= MAX_TOOL_OUTPUT_CHARS || !hasShellAccess || workspaceId == null) return output
 
         Log.i(TAG, "maybeTruncateToolOutput: truncating tool $toolCallId output ($totalChars chars)")
 
         val fullText = textParts.joinToString("\n") { it.text }
         val preview = fullText.take(TOOL_OUTPUT_PREVIEW_CHARS)
-
-        val fileName = "${toolCallId}.txt"
-        val outputDir = File(context.filesDir, FileFolders.TOOL_OUTPUTS).apply { mkdirs() }
-        File(outputDir, fileName).writeText(fullText)
+        val safeId = toolCallId.replace(Regex("[^A-Za-z0-9._-]"), "_").take(120)
+        val relativePath = ".rikkahub/tool_outputs/$safeId.txt"
+        val saved = try {
+            workspaceRepository.writeText(
+                id = workspaceId,
+                path = relativePath,
+                text = fullText,
+                overwrite = true,
+            )
+        } catch (error: Throwable) {
+            Log.w(TAG, "Failed to save full tool output inside workspace", error)
+            return output
+        }
+        val absolutePath = "/workspace/${saved.path}"
 
         return listOf(
             UIMessagePart.Text(
                 buildString {
                     appendLine("[Tool output truncated: $totalChars characters total]")
-                    appendLine("Full output saved to: /tool_outputs/$fileName")
-                    appendLine("Use shell to read: `cat /tool_outputs/$fileName`")
-                    appendLine("Use shell to search: `grep \"pattern\" /tool_outputs/$fileName`")
+                    appendLine("Full output saved to: $absolutePath")
+                    appendLine("Use shell to read: `cat $absolutePath`")
+                    appendLine("Use shell to search: `grep \"pattern\" $absolutePath`")
                     appendLine()
                     append(preview)
                 }

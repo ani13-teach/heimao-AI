@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-RikkaHub is a native Android LLM chat client that supports switching between different AI providers
+黑猫ai is a native Android LLM chat client that supports switching between different AI providers
 for conversations.
 Built with Jetpack Compose, Kotlin, and follows Material Design 3 principles.
 

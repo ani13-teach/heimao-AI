@@ -5,9 +5,13 @@ import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.AlertDialog
@@ -39,6 +43,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -64,6 +69,7 @@ import me.rerere.hugeicons.stroke.Cancel01
 import me.rerere.hugeicons.stroke.LeftToRightListBullet
 import me.rerere.hugeicons.stroke.Menu03
 import me.rerere.hugeicons.stroke.MessageAdd01
+import me.rerere.hugeicons.stroke.NoteEdit
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.findProvider
@@ -96,6 +102,7 @@ import org.koin.androidx.compose.koinViewModel
 import org.koin.compose.koinInject
 import org.koin.core.parameter.parametersOf
 import java.io.File
+import java.time.ZoneId
 import kotlin.uuid.Uuid
 
 @Composable
@@ -111,6 +118,7 @@ fun ChatPage(id: Uuid, text: String?, files: List<Uri>, nodeId: Uuid? = null) {
 
     val setting by vm.settings.collectAsStateWithLifecycle()
     val conversation by vm.conversation.collectAsStateWithLifecycle()
+    val summarySources by vm.summarySources.collectAsStateWithLifecycle()
     val loadingJob by vm.conversationJob.collectAsStateWithLifecycle()
     val processingStatus by vm.processingStatus.collectAsStateWithLifecycle()
     val currentChatModel by vm.currentChatModel.collectAsStateWithLifecycle()
@@ -209,6 +217,7 @@ fun ChatPage(id: Uuid, text: String?, files: List<Uri>, nodeId: Uuid? = null) {
                     processingStatus = processingStatus,
                     setting = setting,
                     conversation = conversation,
+                    summarySources = summarySources,
                     drawerState = drawerState,
                     navController = navController,
                     vm = vm,
@@ -241,6 +250,7 @@ fun ChatPage(id: Uuid, text: String?, files: List<Uri>, nodeId: Uuid? = null) {
                     processingStatus = processingStatus,
                     setting = setting,
                     conversation = conversation,
+                    summarySources = summarySources,
                     drawerState = drawerState,
                     navController = navController,
                     vm = vm,
@@ -268,6 +278,7 @@ private fun ChatPageContent(
     setting: Settings,
     bigScreen: Boolean,
     conversation: Conversation,
+    summarySources: List<Conversation>,
     drawerState: DrawerState,
     navController: Navigator,
     vm: ChatVM,
@@ -325,7 +336,17 @@ private fun ChatPageContent(
                 )
             },
             bottomBar = {
-                ChatInput(
+                Column {
+                    if (conversation.summarySourceConversationIds.isNotEmpty()) {
+                        SummaryContextBar(
+                            sourceCount = conversation.summarySourceConversationIds.size,
+                            sources = summarySources,
+                            assistant = assistant,
+                            enabled = loadingJob == null,
+                            onClear = vm::clearSummaryContext,
+                        )
+                    }
+                    ChatInput(
                     state = inputState,
                     loading = loadingJob != null,
                     settings = setting,
@@ -424,6 +445,7 @@ private fun ChatPageContent(
                         showFilesSheet = true
                     },
                 )
+                }
             },
             containerColor = Color.Transparent,
         ) { innerPadding ->
@@ -513,6 +535,67 @@ private fun ChatPageContent(
                 vm = vm,
                 onDismiss = { showFilesSheet = false },
             )
+        }
+    }
+}
+
+@Composable
+private fun SummaryContextBar(
+    sourceCount: Int,
+    sources: List<Conversation>,
+    assistant: Assistant,
+    enabled: Boolean,
+    onClear: () -> Unit,
+) {
+    val zoneId = remember { ZoneId.systemDefault() }
+    val dates = remember(sources, zoneId) {
+        sources.map { it.createAt.atZone(zoneId).toLocalDate() }
+    }
+    val dateLabel = when {
+        dates.isEmpty() -> null
+        dates.min() == dates.max() -> dates.first().toString()
+        else -> "${dates.min()} - ${dates.max()}"
+    }
+    val defaultAssistantName = stringResource(R.string.assistant_page_default_assistant)
+    val assistantName = assistant.name.ifBlank { defaultAssistantName }
+
+    Surface(
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Icon(
+                imageVector = HugeIcons.NoteEdit,
+                contentDescription = null,
+                modifier = Modifier.size(20.dp),
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = stringResource(R.string.chat_page_summary_scope, sourceCount),
+                    style = MaterialTheme.typography.labelLarge,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = listOfNotNull(dateLabel, assistantName).joinToString(" · "),
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            IconButton(onClick = onClear, enabled = enabled) {
+                Icon(
+                    imageVector = HugeIcons.Cancel01,
+                    contentDescription = stringResource(R.string.chat_page_summary_clear),
+                )
+            }
         }
     }
 }

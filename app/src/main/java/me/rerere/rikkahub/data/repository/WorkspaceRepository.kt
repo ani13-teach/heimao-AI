@@ -16,6 +16,7 @@ import me.rerere.workspace.RootfsInstaller
 import me.rerere.workspace.WorkspaceCommandResult
 import me.rerere.workspace.WorkspaceFileEntry
 import me.rerere.workspace.WorkspaceManager
+import me.rerere.workspace.WorkspaceShellAccessMode
 import me.rerere.workspace.WorkspaceShellStatus
 import me.rerere.workspace.WorkspaceStorageArea
 import java.io.ByteArrayOutputStream
@@ -285,6 +286,27 @@ class WorkspaceRepository(
         return runInterruptible(Dispatchers.IO) {
             manager.ensureWorkspace(workspace.root)
             manager.executeCommand(workspace.root, command, cwd, timeoutMillis, stdin)
+        }
+    }
+
+    suspend fun executeAiCommand(
+        id: String,
+        command: String,
+        cwd: String = "",
+        timeoutMillis: Long = WorkspaceManager.DEFAULT_COMMAND_TIMEOUT_MS,
+        stdin: ByteArray? = null,
+    ): WorkspaceCommandResult {
+        val workspace = dao.getById(id) ?: error("Workspace not found: $id")
+        return runInterruptible(Dispatchers.IO) {
+            manager.ensureWorkspace(workspace.root)
+            manager.executeCommand(
+                root = workspace.root,
+                command = command,
+                cwd = cwd,
+                timeoutMillis = timeoutMillis,
+                stdin = stdin,
+                accessMode = WorkspaceShellAccessMode.WORKSPACE_ONLY,
+            )
         }
     }
 

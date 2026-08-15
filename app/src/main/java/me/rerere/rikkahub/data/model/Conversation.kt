@@ -31,6 +31,14 @@ data class Conversation(
     val workspaceCwd: String? = null,
     // 所属文件夹（助手内分组），null 表示未归入任何文件夹
     val folderId: Uuid? = null,
+    // 永久会话编号，用于历史选择；0 仅表示尚未持久化的新会话
+    val conversationNumber: Long = 0,
+    @Transient
+    val summarySourceAssistantId: Uuid? = null,
+    @Transient
+    val summarySourceConversationIds: List<Uuid> = emptyList(),
+    @Transient
+    val summaryContext: String = "",
     @Transient
     val newConversation: Boolean = false
 ) {

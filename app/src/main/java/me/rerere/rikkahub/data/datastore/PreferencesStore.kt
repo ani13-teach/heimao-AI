@@ -257,6 +257,9 @@ class SettingsStore(
                 val defaultProvider = DEFAULT_PROVIDERS.find { it.id == provider.id }
                 if (defaultProvider != null) {
                     provider.copyProvider(
+                        name = if (
+                            defaultProvider.id == DEFAULT_BRANDED_PROVIDER_ID && provider.name == "RikkaHub"
+                        ) defaultProvider.name else provider.name,
                         builtIn = defaultProvider.builtIn,
                         description = defaultProvider.description,
                         shortDescription = defaultProvider.shortDescription,

@@ -1,4 +1,4 @@
-name: Daily Build
+name: 黑猫ai Daily Build
 
 on:
   # 每天 UTC 18:00 触发（北京时间次日 02:00），可按需修改
@@ -98,7 +98,7 @@ jobs:
         if: success()
         with:
           tag_name: nightly            # 固定 tag，每晚覆盖同一个「最新每日构建」
-          name: Nightly Build
+          name: 黑猫ai Nightly Build
           prerelease: true
           body: |
             自动每日构建（commit `${{ github.sha }}`）
