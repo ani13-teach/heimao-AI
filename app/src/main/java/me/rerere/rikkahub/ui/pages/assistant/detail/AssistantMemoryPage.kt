@@ -45,6 +45,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.AssistantMemory
+import me.rerere.rikkahub.data.model.confidenceSummary
 import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.components.ui.CardGroup
 import me.rerere.rikkahub.ui.components.ui.RikkaConfirmDialog
@@ -182,6 +183,27 @@ private fun AssistantMemoryContent(
                                 )
                             )
                         }
+                    )
+                }
+            )
+            item(
+                headlineContent = { Text(stringResource(R.string.assistant_page_layered_memory)) },
+                supportingContent = {
+                    Text(
+                        text = stringResource(R.string.assistant_page_layered_memory_desc),
+                    )
+                },
+                trailingContent = {
+                    Switch(
+                        checked = assistant.useLayeredMemory,
+                        onCheckedChange = {
+                            onUpdateAssistant(
+                                assistant.copy(
+                                    useLayeredMemory = it
+                                )
+                            )
+                        },
+                        enabled = assistant.enableMemory
                     )
                 }
             )
@@ -331,7 +353,11 @@ private fun MemoryItem(
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 Text(
-                    text = "#${memory.id}",
+                    text = if (memory.title.isNotBlank()) {
+                        "${memory.title}  #${memory.id}"
+                    } else {
+                        "#${memory.id}"
+                    },
                     style = MaterialTheme.typography.titleMediumEmphasized,
                 )
                 Text(
@@ -341,6 +367,21 @@ private fun MemoryItem(
                     overflow = TextOverflow.Ellipsis,
                     style = MaterialTheme.typography.bodySmall,
                 )
+                val meta = listOf(
+                    memory.category,
+                    memory.updated,
+                    memory.confidenceSummary(),
+                    memory.product,
+                ).filter { it.isNotBlank() }.joinToString(" · ")
+                if (meta.isNotBlank()) {
+                    Text(
+                        text = meta,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
             IconButton(
                 onClick = { onEditMemory(memory) }

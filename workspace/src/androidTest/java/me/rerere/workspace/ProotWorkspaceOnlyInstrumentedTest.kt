@@ -35,11 +35,18 @@ class ProotWorkspaceOnlyInstrumentedTest {
                 WorkspaceShellContext(
                     root = "instrumented-test",
                     command = """
+                        set -e
                         cat /workspace/input.txt
+                        printf '\n--xargs--\n'
+                        printf '%s\n' /workspace/input.txt | xargs cat
                         printf '%s' written > /workspace/output.txt
                         [ ! -e /root/secret.txt ] || exit 91
                         [ ! -e /external/secret.txt ] || exit 92
                         [ ! -e /system/bin/content ] || exit 93
+                        [ ! -e /proc/self/exe ] || exit 94
+                        [ ! -e /bin/toybox ] || exit 95
+                        [ ! -e /bin/.rikkahub-applets/ps ] || exit 96
+                        [ ! -e /system/bin/toybox ] || exit 97
                     """.trimIndent(),
                     cwd = "",
                     filesDir = filesDir,
@@ -54,7 +61,10 @@ class ProotWorkspaceOnlyInstrumentedTest {
 
             assertEquals(result.stderr, 0, result.exitCode)
             assertFalse(result.timedOut)
-            assertTrue(result.stdout.contains("workspace-data"))
+            assertTrue(
+                "Expected direct and xargs workspace output; stdout=${result.stdout}; stderr=${result.stderr}",
+                result.stdout.contains("workspace-data\n--xargs--\nworkspace-data"),
+            )
             assertEquals("written", File(filesDir, "output.txt").readText())
             assertEquals("private-rootfs", File(linuxDir, "root/secret.txt").readText())
             assertEquals("external-bind", File(externalDir, "secret.txt").readText())

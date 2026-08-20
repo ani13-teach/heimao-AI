@@ -12,10 +12,6 @@ import me.rerere.rikkahub.service.ChatService
 import me.rerere.rikkahub.utils.EmojiData
 import me.rerere.rikkahub.utils.EmojiUtils
 import me.rerere.rikkahub.utils.JsonInstant
-import me.rerere.rikkahub.utils.SoundEffectPlayer
-import me.rerere.rikkahub.utils.UpdateChecker
-import me.rerere.rikkahub.web.WebServerManager
-import me.rerere.tts.provider.TTSManager
 import org.koin.dsl.module
 
 val appModule = module {
@@ -26,11 +22,7 @@ val appModule = module {
     }
 
     single {
-        LocalTools(get(), get(), get(), get())
-    }
-
-    single {
-        UpdateChecker(get())
+        LocalTools(get(), get())
     }
 
     single {
@@ -42,19 +34,11 @@ val appModule = module {
     }
 
     single {
-        TTSManager(get())
-    }
-
-    single {
         Firebase.crashlytics
     }
 
     single {
         Firebase.analytics
-    }
-
-    single {
-        SoundEffectPlayer(get())
     }
 
     // 生成通知与业务解耦：ChatService 只发事件，通知由这里消费；
@@ -85,18 +69,6 @@ val appModule = module {
             skillManager = get(),
             workspaceRepository = get(),
             folderRepository = get()
-        )
-    }
-
-    single {
-        WebServerManager(
-            context = get(),
-            appScope = get(),
-            chatService = get(),
-            conversationRepo = get(),
-            folderRepo = get(),
-            settingsStore = get(),
-            filesManager = get()
         )
     }
 }

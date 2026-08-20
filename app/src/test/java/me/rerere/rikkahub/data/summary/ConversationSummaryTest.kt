@@ -105,6 +105,37 @@ class ConversationSummaryTest {
     }
 
     @Test
+    fun `summary source accepts exact two million character boundary`() {
+        val assistantId = Uuid.parse("22222222-2222-2222-2222-222222222222")
+        fun conversationWithText(text: String) = Conversation(
+            assistantId = assistantId,
+            conversationNumber = 1,
+            messageNodes = listOf(
+                me.rerere.rikkahub.data.model.MessageNode.of(UIMessage.user(text))
+            ),
+        )
+
+        val oneCharacterSource = buildConversationSummarySource(listOf(conversationWithText("x")))
+        val formattingCharacters = oneCharacterSource.length - 1
+        val exactSource = buildConversationSummarySource(
+            conversations = listOf(conversationWithText("x".repeat(2_000_000 - formattingCharacters))),
+            maxCharacters = 2_000_000,
+        )
+
+        assertEquals(2_000_000, exactSource.length)
+        assertTrue(
+            runCatching {
+                buildConversationSummarySource(
+                    conversations = listOf(
+                        conversationWithText("x".repeat(2_000_001 - formattingCharacters))
+                    ),
+                    maxCharacters = 2_000_000,
+                )
+            }.isFailure
+        )
+    }
+
+    @Test
     fun `source splitter respects maximum size and preserves content`() {
         val source = "alpha\n" + "b".repeat(25) + "\nomega"
         val chunks = splitConversationSummarySource(source, maxCharacters = 10)

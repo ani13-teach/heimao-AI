@@ -64,18 +64,13 @@ import me.rerere.rikkahub.data.db.MigrationState
 import me.rerere.rikkahub.data.event.AppEvent
 import me.rerere.rikkahub.data.event.AppEventBus
 import me.rerere.rikkahub.ui.activity.SafeModeActivity
-import me.rerere.rikkahub.ui.components.ui.TTSController
-import me.rerere.rikkahub.ui.context.LocalASRState
 import me.rerere.rikkahub.ui.context.LocalNavController
 import me.rerere.rikkahub.ui.context.LocalSettings
 import me.rerere.rikkahub.ui.context.LocalSharedTransitionScope
-import me.rerere.rikkahub.ui.context.LocalTTSState
 import me.rerere.rikkahub.ui.context.LocalToaster
 import me.rerere.rikkahub.ui.context.Navigator
 import me.rerere.rikkahub.ui.hooks.readBooleanPreference
 import me.rerere.rikkahub.ui.hooks.readStringPreference
-import me.rerere.rikkahub.ui.hooks.rememberCustomAsrState
-import me.rerere.rikkahub.ui.hooks.rememberCustomTtsState
 import me.rerere.rikkahub.ui.pages.assistant.AssistantPage
 import me.rerere.rikkahub.ui.pages.assistant.detail.AssistantBasicPage
 import me.rerere.rikkahub.ui.pages.assistant.detail.AssistantDetailPage
@@ -90,7 +85,6 @@ import me.rerere.rikkahub.ui.pages.chat.ChatPage
 import me.rerere.rikkahub.ui.pages.debug.DebugPage
 import me.rerere.rikkahub.ui.pages.extensions.ExtensionsPage
 import me.rerere.rikkahub.ui.pages.extensions.PromptPage
-import me.rerere.rikkahub.ui.pages.extensions.QuickMessagesPage
 import me.rerere.rikkahub.ui.pages.extensions.skills.SkillDetailPage
 import me.rerere.rikkahub.ui.pages.extensions.skills.SkillsPage
 import me.rerere.rikkahub.ui.pages.extensions.workspace.WorkspacePage
@@ -101,16 +95,13 @@ import me.rerere.workspace.WorkspaceStorageArea
 import me.rerere.rikkahub.ui.pages.favorite.FavoritePage
 import me.rerere.rikkahub.ui.pages.history.HistoryPage
 import me.rerere.rikkahub.ui.pages.imggen.ImageGenPage
-import me.rerere.rikkahub.ui.pages.log.LogPage
 import me.rerere.rikkahub.ui.pages.search.SearchPage
-import me.rerere.rikkahub.ui.pages.setting.SettingAboutPage
 import me.rerere.rikkahub.ui.pages.setting.SettingPreferencesPage
 import me.rerere.rikkahub.ui.pages.setting.SettingPreferencesThemePage
 import me.rerere.rikkahub.ui.pages.setting.SettingPreferencesNotificationPage
 import me.rerere.rikkahub.ui.pages.setting.SettingPreferencesGeneralPage
 import me.rerere.rikkahub.ui.pages.setting.SettingPreferencesUIPage
 import me.rerere.rikkahub.ui.pages.setting.SettingThemePage
-import me.rerere.rikkahub.ui.pages.setting.SettingDonatePage
 import me.rerere.rikkahub.ui.pages.setting.SettingFilesPage
 import me.rerere.rikkahub.ui.pages.setting.SettingMcpPage
 import me.rerere.rikkahub.ui.pages.setting.SettingModelPage
@@ -119,8 +110,6 @@ import me.rerere.rikkahub.ui.pages.setting.SettingProviderDetailPage
 import me.rerere.rikkahub.ui.pages.setting.SettingProviderPage
 import me.rerere.rikkahub.ui.pages.setting.SettingSearchDetailPage
 import me.rerere.rikkahub.ui.pages.setting.SettingSearchPage
-import me.rerere.rikkahub.ui.pages.setting.SettingSpeechPage
-import me.rerere.rikkahub.ui.pages.setting.SettingWebPage
 import me.rerere.rikkahub.ui.pages.share.handler.ShareHandlerPage
 import me.rerere.rikkahub.ui.pages.stats.StatsPage
 import me.rerere.rikkahub.ui.pages.translator.TranslatorPage
@@ -238,13 +227,10 @@ class RouteActivity : ComponentActivity() {
     fun AppRoutes() {
         val toastState = rememberToasterState()
         val settings by settingsStore.settingsFlow.collectAsStateWithLifecycle()
-        val tts = rememberCustomTtsState()
-        val asr = rememberCustomAsrState()
         val eventBus = koinInject<AppEventBus>()
-        LaunchedEffect(tts) {
+        LaunchedEffect(eventBus) {
             eventBus.events.collect { event ->
                 when (event) {
-                    is AppEvent.Speak -> tts.speak(event.text)
                     is AppEvent.OpenUsageAccessSettings -> this@RouteActivity.openUsageAccessSettings()
                     is AppEvent.McpOAuthCallback -> Unit // 由 McpManager 消费
                     is AppEvent.ChatGenerationUpdate -> Unit // 由 ChatNotificationManager 消费
@@ -276,8 +262,6 @@ class RouteActivity : ComponentActivity() {
                 LocalSharedTransitionScope provides this,
                 LocalSettings provides settings,
                 LocalToaster provides toastState,
-                LocalTTSState provides tts,
-                LocalASRState provides asr,
             ) {
                 Toaster(
                     state = toastState,
@@ -286,7 +270,6 @@ class RouteActivity : ComponentActivity() {
                     alignment = Alignment.TopCenter,
                     showCloseButton = true,
                 )
-                TTSController()
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -437,10 +420,6 @@ class RouteActivity : ComponentActivity() {
                                 SettingModelPage()
                             }
 
-                            entry<Screen.SettingAbout> {
-                                SettingAboutPage()
-                            }
-
                             entry<Screen.SettingSearch> {
                                 SettingSearchPage()
                             }
@@ -450,40 +429,20 @@ class RouteActivity : ComponentActivity() {
                                 SettingSearchDetailPage(id)
                             }
 
-                            entry<Screen.SettingSpeech> {
-                                SettingSpeechPage()
-                            }
-
                             entry<Screen.SettingMcp> {
                                 SettingMcpPage()
-                            }
-
-                            entry<Screen.SettingDonate> {
-                                SettingDonatePage()
                             }
 
                             entry<Screen.SettingFiles> {
                                 SettingFilesPage()
                             }
 
-                            entry<Screen.SettingWeb> {
-                                SettingWebPage()
-                            }
-
                             entry<Screen.Debug> {
                                 DebugPage()
                             }
 
-                            entry<Screen.Log> {
-                                LogPage()
-                            }
-
                             entry<Screen.Extensions> {
                                 ExtensionsPage()
-                            }
-
-                            entry<Screen.QuickMessages> {
-                                QuickMessagesPage()
                             }
 
                             entry<Screen.Prompts> {
@@ -663,40 +622,22 @@ sealed interface Screen : NavKey {
     data object SettingModels : Screen
 
     @Serializable
-    data object SettingAbout : Screen
-
-    @Serializable
     data object SettingSearch : Screen
 
     @Serializable
     data class SettingSearchDetail(val serviceId: String) : Screen
 
     @Serializable
-    data object SettingSpeech : Screen
-
-    @Serializable
     data object SettingMcp : Screen
-
-    @Serializable
-    data object SettingDonate : Screen
 
     @Serializable
     data object SettingFiles : Screen
 
     @Serializable
-    data object SettingWeb : Screen
-
-    @Serializable
     data object Debug : Screen
 
     @Serializable
-    data object Log : Screen
-
-    @Serializable
     data object Extensions : Screen
-
-    @Serializable
-    data object QuickMessages : Screen
 
     @Serializable
     data object Prompts : Screen

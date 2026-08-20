@@ -7,6 +7,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import kotlinx.coroutines.runBlocking
 import me.rerere.rikkahub.data.db.AppDatabase
 import me.rerere.rikkahub.data.db.entity.ConversationEntity
+import me.rerere.rikkahub.data.db.entity.MessageNodeEntity
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -49,6 +50,28 @@ class ConversationSummaryDAOTest {
     }
 
     @Test
+    fun lightweightSummaryLookupIsAssistantScoped() = runBlocking {
+        dao.insert(
+            conversation(
+                id = "conversation-a",
+                assistantId = "assistant-a",
+                number = 1,
+                summaryContext = "x".repeat(100_000),
+            )
+        )
+        dao.insert(conversation(id = "conversation-b", assistantId = "assistant-b", number = 2))
+
+        val results = dao.getConversationSummariesByIdsOfAssistant(
+            assistantId = "assistant-a",
+            ids = listOf("conversation-b", "conversation-a"),
+        )
+
+        assertEquals(listOf("conversation-a"), results.map { it.id })
+        assertEquals(listOf(1L), results.map { it.conversationNumber })
+        assertEquals(listOf("conversation-a"), results.map { it.title })
+    }
+
+    @Test
     fun duplicateConversationNumberIsRejected() = runBlocking {
         dao.insert(conversation(id = "conversation-a", assistantId = "assistant-a", number = 1))
 
@@ -82,10 +105,58 @@ class ConversationSummaryDAOTest {
         assertEquals(1L, dao.getNextConversationNumber())
     }
 
+    @Test
+    fun messageNodeContentVersionTracksSerializedLengthSelectIndexAndNodeCount() = runBlocking {
+        dao.insert(conversation(id = "conversation-a", assistantId = "assistant-a", number = 1))
+        dao.insert(conversation(id = "conversation-b", assistantId = "assistant-b", number = 2))
+        val nodeDao = database.messageNodeDao()
+        nodeDao.insertAll(
+            listOf(
+                MessageNodeEntity(
+                    id = "node-a1",
+                    conversationId = "conversation-a",
+                    nodeIndex = 0,
+                    messages = "[\"m1\"]",
+                    selectIndex = 0,
+                ),
+                MessageNodeEntity(
+                    id = "node-a2",
+                    conversationId = "conversation-a",
+                    nodeIndex = 1,
+                    messages = "[\"m2\"]",
+                    selectIndex = 2,
+                ),
+                MessageNodeEntity(
+                    id = "node-b1",
+                    conversationId = "conversation-b",
+                    nodeIndex = 0,
+                    messages = "[\"m3\"]",
+                    selectIndex = 1,
+                ),
+            )
+        )
+
+        val versionA = nodeDao.getMessageNodeContentVersion(listOf("conversation-a"))
+        assertEquals(MessageNodeContentVersion(serializedLength = 12L, selectIndexSum = 2L, nodeCount = 2L), versionA)
+
+        val versionAB = nodeDao.getMessageNodeContentVersion(listOf("conversation-a", "conversation-b"))
+        assertEquals(MessageNodeContentVersion(serializedLength = 18L, selectIndexSum = 3L, nodeCount = 3L), versionAB)
+
+        // 分支切换只改 select_index：长度不变，版本必须变化
+        nodeDao.update(
+            nodeDao.getNodeByIdOfConversation("node-a2", "conversation-a")!!.copy(selectIndex = 0)
+        )
+        val versionASwitched = nodeDao.getMessageNodeContentVersion(listOf("conversation-a"))
+        assertEquals(MessageNodeContentVersion(serializedLength = 12L, selectIndexSum = 0L, nodeCount = 2L), versionASwitched)
+
+        assertEquals(MessageNodeContentVersion.EMPTY, nodeDao.getMessageNodeContentVersion(emptyList()))
+    }
+
     private fun conversation(
         id: String,
         assistantId: String,
         number: Long,
+        summaryContext: String = "",
     ) = ConversationEntity(
         id = id,
         assistantId = assistantId,
@@ -96,5 +167,6 @@ class ConversationSummaryDAOTest {
         chatSuggestions = "[]",
         isPinned = false,
         conversationNumber = number,
+        summaryContext = summaryContext,
     )
 }

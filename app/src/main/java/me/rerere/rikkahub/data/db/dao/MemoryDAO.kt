@@ -15,6 +15,9 @@ interface MemoryDAO {
     @Query("SELECT * FROM memoryentity WHERE assistant_id = :assistantId ORDER BY id DESC")
     suspend fun getMemoriesOfAssistant(assistantId: String): List<MemoryEntity>
 
+    @Query("SELECT * FROM memoryentity WHERE assistant_id = :assistantId ORDER BY id DESC LIMIT :limit")
+    suspend fun getMemoriesOfAssistantForPrompt(assistantId: String, limit: Int): List<MemoryEntity>
+
     @Query("SELECT * FROM memoryentity ORDER BY id DESC")
     fun getAllMemoriesFlow(): Flow<List<MemoryEntity>>
 
@@ -23,6 +26,57 @@ interface MemoryDAO {
 
     @Query("SELECT * FROM memoryentity WHERE id = :id")
     suspend fun getMemoryById(id: Int): MemoryEntity?
+
+    @Query(
+        """
+        SELECT * FROM memoryentity
+        WHERE assistant_id = :assistantId AND status = 'active'
+        ORDER BY updated DESC, id DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun getMemoriesForLayeredIndex(assistantId: String, limit: Int): List<MemoryEntity>
+
+    @Query(
+        """
+        SELECT * FROM memoryentity
+        WHERE assistant_id = :assistantId AND status = 'active' AND category = 'ACTIVE'
+        ORDER BY updated DESC, id DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun getActiveMemoriesForPrompt(assistantId: String, limit: Int): List<MemoryEntity>
+
+    @Query(
+        """
+        SELECT * FROM memoryentity
+        WHERE assistant_id = :assistantId AND status = :status
+          AND (:category IS NULL OR category = :category)
+          AND (:confidencePattern IS NULL OR confidence_flags LIKE :confidencePattern ESCAPE '\')
+          AND (:keyword = '' OR title LIKE '%' || :keyword || '%' ESCAPE '\'
+               OR tags LIKE '%' || :keyword || '%' ESCAPE '\'
+               OR content LIKE '%' || :keyword || '%' ESCAPE '\')
+        ORDER BY updated DESC, id DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun searchMemories(
+        assistantId: String,
+        keyword: String,
+        category: String?,
+        confidencePattern: String?,
+        status: String,
+        limit: Int,
+    ): List<MemoryEntity>
+
+    @Query(
+        """
+        SELECT * FROM memoryentity
+        WHERE assistant_id = :assistantId AND status = :status
+        ORDER BY id DESC
+        """
+    )
+    suspend fun getMemoriesByStatus(assistantId: String, status: String): List<MemoryEntity>
 
     @Insert
     suspend fun insertMemory(memory: MemoryEntity): Long

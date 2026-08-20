@@ -25,6 +25,20 @@ interface MessageNodeDAO {
         offset: Int
     ): List<MessageNodeEntity>
 
+    @Query("SELECT * FROM message_node WHERE id = :nodeId AND conversation_id = :conversationId LIMIT 1")
+    suspend fun getNodeByIdOfConversation(nodeId: String, conversationId: String): MessageNodeEntity?
+
+    @Query("SELECT COALESCE(SUM(length(messages)), 0) FROM message_node WHERE conversation_id IN (:conversationIds)")
+    suspend fun getSerializedLengthOfConversations(conversationIds: List<String>): Long
+
+    @Query(
+        "SELECT COALESCE(SUM(length(messages)), 0) AS serializedLength, " +
+            "COALESCE(SUM(select_index), 0) AS selectIndexSum, " +
+            "COUNT(*) AS nodeCount " +
+            "FROM message_node WHERE conversation_id IN (:conversationIds)"
+    )
+    suspend fun getMessageNodeContentVersion(conversationIds: List<String>): MessageNodeContentVersion
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertAll(nodes: List<MessageNodeEntity>)
 
@@ -54,6 +68,23 @@ data class MessageTokenStats(
     val completionTokens: Long = 0,
     val cachedTokens: Long = 0,
 )
+
+/**
+ * 消息节点内容版本指纹（SQL 聚合，不读取大消息正文）：
+ * - [serializedLength]：消息序列化总长度；
+ * - [selectIndexSum]：各节点当前选中分支 select_index 之和。分支切换（selectMessageNode）
+ *   只改写 select_index，消息长度与 conversation.update_at 都可能不变，必须纳入版本；
+ * - [nodeCount]：节点总数。
+ */
+data class MessageNodeContentVersion(
+    val serializedLength: Long,
+    val selectIndexSum: Long,
+    val nodeCount: Long,
+) {
+    companion object {
+        val EMPTY = MessageNodeContentVersion(0L, 0L, 0L)
+    }
+}
 
 data class MessageDayCount(val day: String, val count: Int)
 

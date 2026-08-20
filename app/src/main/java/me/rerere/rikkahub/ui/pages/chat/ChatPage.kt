@@ -309,8 +309,6 @@ private fun ChatPageContent(
         }.orEmpty()
     }
 
-    TTSAutoPlay(vm = vm, setting = setting, conversation = conversation)
-
     Surface(
         color = MaterialTheme.colorScheme.background,
         modifier = Modifier.fillMaxSize()

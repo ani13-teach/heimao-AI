@@ -28,10 +28,10 @@ data class Assistant(
     val streamOutput: Boolean = true,
     val enableMemory: Boolean = false,
     val useGlobalMemory: Boolean = false, // 使用全局共享记忆而非助手隔离记忆
+    val useLayeredMemory: Boolean = false, // 分层记忆：只注入索引+ACTIVE，正文按需用 memory_read 加载
     val enableRecentChatsReference: Boolean = false,
     val messageTemplate: String = "{{ message }}",
     val presetMessages: List<UIMessage> = emptyList(),
-    val quickMessageIds: Set<Uuid> = emptySet(),
     val regexes: List<AssistantRegex> = emptyList(),
     val reasoningLevel: ReasoningLevel = ReasoningLevel.AUTO,
     val maxTokens: Int? = null,
@@ -45,7 +45,6 @@ data class Assistant(
     val backgroundOpacity: Float = 1.0f, // 背景图不透明度(0~1)
     val useGradientBackground: Boolean = false, // 开启后聊天页使用动态渐变背景
     val modeInjectionIds: Set<Uuid> = emptySet(),      // 关联的模式注入 ID
-    val lorebookIds: Set<Uuid> = emptySet(),            // 关联的 Lorebook ID
     val enabledSkills: Set<String> = emptySet(),        // 启用的 skill 名称列表
     val enableTimeReminder: Boolean = false,            // 时间间隔提醒注入
     val allowConversationSystemPrompt: Boolean = false, // 允许对话单独重写 system prompt
@@ -53,17 +52,23 @@ data class Assistant(
 )
 
 @Serializable
-data class QuickMessage(
-    val id: Uuid = Uuid.random(),
-    val title: String = "",
-    val content: String = "",
-)
-
-@Serializable
 data class AssistantMemory(
     val id: Int,
     val content: String = "",
+    val title: String = "",
+    val category: String = "GENERAL",
+    val updated: String = "1970-01-01",
+    val confidenceFlags: List<String> = emptyList(),
+    val tags: List<String> = emptyList(),
+    val product: String = "",
+    val status: String = "active",
 )
+
+/**
+ * 置信度摘要：多个 flag 用 "/" 连接，空时显示 "—"。
+ */
+fun AssistantMemory.confidenceSummary(): String =
+    confidenceFlags.joinToString("/").ifBlank { "—" }
 
 @Serializable
 enum class AssistantAffectScope {
@@ -146,7 +151,6 @@ enum class InjectionPosition {
  * 提示词注入
  *
  * - ModeInjection: 基于模式开关的注入（如学习模式）
- * - RegexInjection: 基于正则匹配的注入（Lorebook）
  */
 @Serializable
 sealed class PromptInjection {
@@ -175,97 +179,4 @@ sealed class PromptInjection {
         override val role: MessageRole = MessageRole.USER,
     ) : PromptInjection()
 
-    /**
-     * 正则注入 - 基于内容匹配触发（世界书）
-     */
-    @Serializable
-    @SerialName("regex")
-    data class RegexInjection(
-        override val id: Uuid = Uuid.random(),
-        override val name: String = "",
-        override val enabled: Boolean = true,
-        override val priority: Int = 0,
-        override val position: InjectionPosition = InjectionPosition.AFTER_SYSTEM_PROMPT,
-        override val content: String = "",
-        override val injectDepth: Int = 4,
-        override val role: MessageRole = MessageRole.USER,
-        val keywords: List<String> = emptyList(),  // 触发关键词
-        val useRegex: Boolean = false,             // 是否使用正则匹配
-        val caseSensitive: Boolean = false,        // 大小写敏感
-        val scanDepth: Int = 4,                    // 扫描最近N条消息
-        val constantActive: Boolean = false,       // 常驻激活（无需匹配）
-    ) : PromptInjection()
-}
-
-/**
- * Lorebook - 组织管理多个 RegexInjection
- */
-@Serializable
-data class Lorebook(
-    val id: Uuid = Uuid.random(),
-    val name: String = "",
-    val description: String = "",
-    val enabled: Boolean = true,
-    val entries: List<PromptInjection.RegexInjection> = emptyList(),
-)
-
-/**
- * 检查 RegexInjection 是否被触发
- *
- * @param context 要扫描的上下文文本
- * @return 是否触发
- */
-fun PromptInjection.RegexInjection.isTriggered(context: String): Boolean {
-    if (!enabled) return false
-    if (constantActive) return true
-    if (keywords.isEmpty()) return false
-
-    return keywords.any { keyword ->
-        if (useRegex) {
-            try {
-                val options = if (caseSensitive) emptySet() else setOf(RegexOption.IGNORE_CASE)
-                Regex(keyword, options).containsMatchIn(context)
-            } catch (e: Exception) {
-                false
-            }
-        } else {
-            if (caseSensitive) {
-                context.contains(keyword)
-            } else {
-                context.contains(keyword, ignoreCase = true)
-            }
-        }
-    }
-}
-
-/**
- * 从消息列表中提取用于匹配的上下文文本
- *
- * @param messages 消息列表
- * @param scanDepth 扫描深度（最近N条消息）
- * @return 拼接的文本内容
- */
-fun extractContextForMatching(
-    messages: List<UIMessage>,
-    scanDepth: Int
-): String {
-    return messages
-        .takeLast(scanDepth)
-        .joinToString("\n") { it.toText() }
-}
-
-/**
- * 获取所有被触发的注入，按优先级排序
- *
- * @param injections 所有注入规则
- * @param context 上下文文本
- * @return 被触发的注入列表，按优先级降序排列
- */
-fun getTriggeredInjections(
-    injections: List<PromptInjection.RegexInjection>,
-    context: String
-): List<PromptInjection.RegexInjection> {
-    return injections
-        .filter { it.isTriggered(context) }
-        .sortedByDescending { it.priority }
 }

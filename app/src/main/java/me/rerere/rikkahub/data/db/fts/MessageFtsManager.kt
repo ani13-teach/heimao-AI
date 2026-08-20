@@ -1,31 +1,28 @@
 package me.rerere.rikkahub.data.db.fts
 
-import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.db.AppDatabase
 import me.rerere.rikkahub.data.model.Conversation
-import me.rerere.rikkahub.data.model.MessageNode
 import java.time.Instant
 
 data class MessageSearchResult(
     val nodeId: String,
     val messageId: String,
     val conversationId: String,
+    val conversationNumber: Long,
     val title: String,
     val updateAt: Instant,
     val snippet: String,
 )
 
 enum class MessageSearchSort(val orderBy: String) {
-    RELEVANCE("rank, update_at DESC"),
-    NEWEST_FIRST("update_at DESC, rank"),
-    OLDEST_FIRST("update_at ASC, rank"),
+    RELEVANCE("search_rank, update_at DESC"),
+    NEWEST_FIRST("update_at DESC, search_rank"),
+    OLDEST_FIRST("update_at ASC, search_rank"),
 }
-
-private const val TAG = "MessageFtsManager"
 
 class MessageFtsManager(private val database: AppDatabase) {
 
@@ -33,24 +30,35 @@ class MessageFtsManager(private val database: AppDatabase) {
 
     suspend fun indexConversation(conversation: Conversation) = withContext(Dispatchers.IO) {
         val conversationId = conversation.id.toString()
-        db.execSQL("DELETE FROM message_fts WHERE conversation_id = ?", arrayOf(conversationId))
-        conversation.messageNodes.forEach { node ->
-            node.messages.forEach { message ->
-                val text = message.extractFtsText()
-                if (text.isNotBlank()) {
-                    db.execSQL(
-                        "INSERT INTO message_fts(text, node_id, message_id, conversation_id, title, update_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        arrayOf(
-                            text,
-                            node.id.toString(),
-                            message.id.toString(),
-                            conversationId,
-                            conversation.title,
-                            conversation.updateAt.toEpochMilli().toString(),
-                        )
-                    )
+        db.beginTransaction()
+        try {
+            db.execSQL("DELETE FROM message_fts WHERE conversation_id = ?", arrayOf(conversationId))
+            val insert = db.compileStatement(
+                "INSERT INTO message_fts(text, node_id, message_id, conversation_id, title, update_at) " +
+                    "VALUES (?, ?, ?, ?, ?, ?)"
+            )
+            try {
+                conversation.messageNodes.forEach { node ->
+                    node.messages.forEach { message ->
+                        val text = message.extractFtsText()
+                        if (text.isNotBlank()) {
+                            insert.clearBindings()
+                            insert.bindString(1, text)
+                            insert.bindString(2, node.id.toString())
+                            insert.bindString(3, message.id.toString())
+                            insert.bindString(4, conversationId)
+                            insert.bindString(5, conversation.title)
+                            insert.bindLong(6, conversation.updateAt.toEpochMilli())
+                            insert.executeInsert()
+                        }
+                    }
                 }
+            } finally {
+                insert.close()
             }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
         }
     }
 
@@ -65,41 +73,58 @@ class MessageFtsManager(private val database: AppDatabase) {
     suspend fun search(
         keyword: String,
         sort: MessageSearchSort = MessageSearchSort.RELEVANCE,
-    ): List<MessageSearchResult> = searchInternal(keyword, sort, assistantId = null)
+        limit: Int = 50,
+    ): List<MessageSearchResult> = searchInternal(
+        keyword = keyword,
+        sort = sort,
+        assistantId = null,
+        excludeConversationId = null,
+        limit = limit,
+    )
 
     suspend fun searchForAssistant(
         assistantId: String,
         keyword: String,
         sort: MessageSearchSort = MessageSearchSort.RELEVANCE,
+        limit: Int = 50,
+        excludeConversationId: String? = null,
     ): List<MessageSearchResult> {
         require(assistantId.isNotBlank()) { "Assistant id is required" }
-        return searchInternal(keyword, sort, assistantId)
+        return searchInternal(keyword, sort, assistantId, excludeConversationId, limit)
     }
 
     private suspend fun searchInternal(
         keyword: String,
         sort: MessageSearchSort,
         assistantId: String?,
+        excludeConversationId: String?,
+        limit: Int,
     ): List<MessageSearchResult> = withContext(Dispatchers.IO) {
-        val results = mutableListOf<MessageSearchResult>()
-        val statement = buildMessageSearchStatement(keyword, sort, assistantId)
+        val statement = buildMessageSearchStatement(
+            keyword = keyword,
+            sort = sort,
+            assistantId = assistantId,
+            excludeConversationId = excludeConversationId,
+            limit = limit,
+        )
         val cursor = db.query(statement.sql, statement.args.toTypedArray())
-        Log.i(TAG, "search: $keyword, assistantId: ${assistantId ?: "all"}")
         cursor.use {
-            while (it.moveToNext()) {
-                results.add(
-                    MessageSearchResult(
-                        nodeId = it.getString(0),
-                        messageId = it.getString(1),
-                        conversationId = it.getString(2),
-                        title = it.getString(3),
-                        updateAt = Instant.ofEpochMilli(it.getLong(4)),
-                        snippet = it.getString(5),
+            buildList {
+                while (it.moveToNext()) {
+                    add(
+                        MessageSearchResult(
+                            nodeId = it.getString(0),
+                            messageId = it.getString(1),
+                            conversationId = it.getString(2),
+                            conversationNumber = it.getLong(3),
+                            title = it.getString(4),
+                            updateAt = Instant.ofEpochMilli(it.getLong(5)),
+                            snippet = it.getString(6),
+                        )
                     )
-                )
+                }
             }
         }
-        results
     }
 }
 
@@ -112,32 +137,70 @@ internal fun buildMessageSearchStatement(
     keyword: String,
     sort: MessageSearchSort,
     assistantId: String?,
+    excludeConversationId: String? = null,
+    limit: Int = 50,
 ): MessageSearchStatement {
-    val assistantFilter = if (assistantId == null) {
-        ""
+    val normalizedKeyword = keyword.trim()
+    require(normalizedKeyword.isNotEmpty()) { "Search query must not be blank" }
+    require(normalizedKeyword.length <= 200) { "Search query is too long" }
+    require(limit in 1..100) { "Search limit must be between 1 and 100" }
+    require(assistantId != null || excludeConversationId == null) {
+        "A global search cannot exclude a private assistant conversation"
+    }
+
+    val assistantFilter = if (assistantId == null) "" else "AND conversationentity.assistant_id = ?"
+    val exclusionFilter = if (excludeConversationId == null) "" else "AND message_fts.conversation_id != ?"
+    val baseSelect = """
+        SELECT message_fts.node_id AS node_id,
+               message_fts.message_id AS message_id,
+               message_fts.conversation_id AS conversation_id,
+               conversationentity.conversation_number AS conversation_number,
+               message_fts.title AS title,
+               message_fts.update_at AS update_at,
+               simple_snippet(message_fts, 0, '[', ']', '...', 30) AS snippet,
+               rank AS search_rank
+        FROM message_fts
+        INNER JOIN conversationentity
+                ON conversationentity.id = message_fts.conversation_id
+        WHERE message_fts.text MATCH jieba_query(?)
+        $assistantFilter
+        $exclusionFilter
+    """.trimIndent()
+
+    val sql = if (assistantId == null) {
+        """
+            $baseSelect
+            ORDER BY ${sort.orderBy}
+            LIMIT ?
+        """.trimIndent()
     } else {
         """
-        AND EXISTS (
-            SELECT 1
-            FROM conversationentity
-            WHERE conversationentity.id = message_fts.conversation_id
-              AND conversationentity.assistant_id = ?
-        )
+            WITH ranked_matches AS (
+                SELECT matched.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY conversation_id
+                           ORDER BY search_rank, update_at DESC
+                       ) AS conversation_row
+                FROM (
+                    $baseSelect
+                ) AS matched
+            )
+            SELECT node_id, message_id, conversation_id, conversation_number,
+                   title, update_at, snippet
+            FROM ranked_matches
+            WHERE conversation_row = 1
+            ORDER BY ${sort.orderBy}
+            LIMIT ?
         """.trimIndent()
     }
+
     return MessageSearchStatement(
-        sql = """
-            SELECT node_id, message_id, conversation_id, title, update_at,
-                   simple_snippet(message_fts, 0, '[', ']', '...', 30) AS snippet
-            FROM message_fts
-            WHERE text MATCH jieba_query(?)
-            $assistantFilter
-            ORDER BY ${sort.orderBy}
-            LIMIT 50
-        """.trimIndent(),
+        sql = sql,
         args = buildList {
-            add(keyword)
+            add(normalizedKeyword)
             if (assistantId != null) add(assistantId)
+            if (excludeConversationId != null) add(excludeConversationId)
+            add(limit)
         },
     )
 }

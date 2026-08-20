@@ -28,9 +28,7 @@ import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.Link01
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.files.SkillMetadata
-import me.rerere.rikkahub.data.model.Lorebook
 import me.rerere.rikkahub.data.model.PromptInjection
-import me.rerere.rikkahub.data.model.QuickMessage
 
 @Composable
 fun ModeInjectionsContent(
@@ -53,49 +51,6 @@ fun ModeInjectionsContent(
                     Switch(
                         checked = selectedIds.contains(injection.id),
                         onCheckedChange = { checked -> onToggle(injection.id, checked) }
-                    )
-                },
-                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-            )
-        }
-        if (onManage != null) {
-            item {
-                ManageButton(onClick = onManage)
-            }
-        }
-    }
-}
-
-@Composable
-fun LorebooksContent(
-    lorebooks: List<Lorebook>,
-    selectedIds: Set<kotlin.uuid.Uuid>,
-    onToggle: (kotlin.uuid.Uuid, Boolean) -> Unit,
-    modifier: Modifier = Modifier,
-    onManage: (() -> Unit)? = null,
-) {
-    LazyColumn(
-        modifier = modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(4.dp)
-    ) {
-        items(lorebooks) { lorebook ->
-            ListItem(
-                headlineContent = {
-                    Text(lorebook.name.ifBlank { stringResource(R.string.extension_content_unnamed_lorebook) })
-                },
-                supportingContent = if (lorebook.description.isNotBlank()) {
-                    {
-                        Text(
-                            text = lorebook.description,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
-                        )
-                    }
-                } else null,
-                trailingContent = {
-                    Switch(
-                        checked = selectedIds.contains(lorebook.id),
-                        onCheckedChange = { checked -> onToggle(lorebook.id, checked) }
                     )
                 },
                 colors = ListItemDefaults.colors(containerColor = Color.Transparent),
@@ -146,45 +101,6 @@ fun SkillsContent(
             item {
                 ManageButton(onClick = onManage)
             }
-        }
-    }
-}
-
-@Composable
-fun QuickMessagesContent(
-    quickMessages: List<QuickMessage>,
-    selectedIds: Set<kotlin.uuid.Uuid>,
-    onToggle: (kotlin.uuid.Uuid, Boolean) -> Unit,
-    modifier: Modifier = Modifier,
-    onManage: (() -> Unit)? = null,
-) {
-    LazyColumn(
-        modifier = modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(4.dp)
-    ) {
-        items(quickMessages, key = { it.id }) { quickMessage ->
-            ListItem(
-                headlineContent = {
-                    Text(quickMessage.title.ifBlank { stringResource(R.string.extension_content_unnamed) })
-                },
-                supportingContent = if (quickMessage.content.isNotBlank()) {
-                    {
-                        Text(
-                            text = quickMessage.content,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
-                            maxLines = 2,
-                        )
-                    }
-                } else null,
-                trailingContent = {
-                    Switch(
-                        checked = selectedIds.contains(quickMessage.id),
-                        onCheckedChange = { checked -> onToggle(quickMessage.id, checked) }
-                    )
-                },
-                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-            )
         }
     }
 }

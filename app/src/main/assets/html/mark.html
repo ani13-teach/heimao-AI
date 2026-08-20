@@ -171,6 +171,22 @@
 <body>
     <div id="content"></div>
 
+    <script>
+        // Always paint a safe offline fallback before optional CDN modules load.
+        (() => {
+            const content = document.getElementById('content');
+            try {
+                const binary = atob(`{{MARKDOWN_BASE64}}`);
+                const bytes = Uint8Array.from(binary, value => value.charCodeAt(0));
+                content.textContent = new TextDecoder('utf-8').decode(bytes);
+                content.style.whiteSpace = 'pre-wrap';
+            } catch (error) {
+                content.textContent = 'Unable to decode markdown content.';
+                console.error('Markdown fallback decode failed:', error);
+            }
+        })();
+    </script>
+
     <script type="module">
         // Import markdown-it and plugins using esm.sh
         import MarkdownIt from 'https://esm.sh/markdown-it@14.0.0';
@@ -257,7 +273,9 @@
             try {
                 // Process with markdown-it
                 const html = md.render(markdownContent);
-                document.getElementById('content').innerHTML = html;
+                const contentElement = document.getElementById('content');
+                contentElement.innerHTML = html;
+                contentElement.style.whiteSpace = 'normal';
 
                 // Render mermaid diagrams
                 const mermaidElements = document.querySelectorAll('.mermaid');

@@ -7,7 +7,6 @@ import androidx.datastore.preferences.SharedPreferencesMigration
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
-import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -31,16 +30,14 @@ import me.rerere.rikkahub.data.ai.prompts.DEFAULT_SUGGESTION_PROMPT
 import me.rerere.rikkahub.data.ai.prompts.DEFAULT_TITLE_PROMPT
 import me.rerere.rikkahub.data.ai.prompts.DEFAULT_TRANSLATION_PROMPT
 import me.rerere.rikkahub.data.ai.prompts.LEARNING_MODE_PROMPT
-import me.rerere.asr.ASRProviderSetting
 import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV1Migration
 import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV2Migration
-import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV3Migration
+import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV4Migration
+import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV5Migration
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.Avatar
 import me.rerere.rikkahub.data.model.InjectionPosition
-import me.rerere.rikkahub.data.model.Lorebook
 import me.rerere.rikkahub.data.model.PromptInjection
-import me.rerere.rikkahub.data.model.QuickMessage
 import me.rerere.rikkahub.data.model.Tag
 import me.rerere.rikkahub.data.sync.s3.S3Config
 import me.rerere.rikkahub.ui.theme.CustomTheme
@@ -49,7 +46,6 @@ import me.rerere.rikkahub.utils.JsonInstant
 import me.rerere.rikkahub.utils.toMutableStateFlow
 import me.rerere.search.SearchCommonOptions
 import me.rerere.search.SearchServiceOptions
-import me.rerere.tts.provider.TTSProviderSetting
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.get
 import kotlin.uuid.Uuid
@@ -62,7 +58,8 @@ private val Context.settingsStore by preferencesDataStore(
         listOf(
             PreferenceStoreV1Migration(),
             PreferenceStoreV2Migration(),
-            PreferenceStoreV3Migration()
+            PreferenceStoreV4Migration(),
+            PreferenceStoreV5Migration(),
         )
     }
 )
@@ -122,35 +119,14 @@ class SettingsStore(
         // S3
         val S3_CONFIG = stringPreferencesKey("s3_config")
 
-        // TTS
-        val TTS_PROVIDERS = stringPreferencesKey("tts_providers")
-        val SELECTED_TTS_PROVIDER = stringPreferencesKey("selected_tts_provider")
-        val DEFAULT_TTS_PLAYBACK_SPEED = floatPreferencesKey("default_tts_playback_speed")
-
-        // ASR
-        val ASR_PROVIDERS = stringPreferencesKey("asr_providers")
-        val SELECTED_ASR_PROVIDER = stringPreferencesKey("selected_asr_provider")
-
-        // Web Server
-        val WEB_SERVER_ENABLED = booleanPreferencesKey("web_server_enabled")
-        val WEB_SERVER_PORT = intPreferencesKey("web_server_port")
-        val WEB_SERVER_JWT_ENABLED = booleanPreferencesKey("web_server_jwt_enabled")
-        val WEB_SERVER_ACCESS_PASSWORD = stringPreferencesKey("web_server_access_password")
-        val WEB_SERVER_LOCALHOST_ONLY = booleanPreferencesKey("web_server_localhost_only")
-
         // 提示词注入
         val MODE_INJECTIONS = stringPreferencesKey("mode_injections")
-        val LOREBOOKS = stringPreferencesKey("lorebooks")
-        val QUICK_MESSAGES = stringPreferencesKey("quick_messages")
 
         // 备份提醒
         val BACKUP_REMINDER_CONFIG = stringPreferencesKey("backup_reminder_config")
 
         // 统计
         val LAUNCH_COUNT = intPreferencesKey("launch_count")
-
-        // 赞助提醒
-        val SPONSOR_ALERT_DISMISSED_AT = intPreferencesKey("sponsor_alert_dismissed_at")
     }
 
     private val dataStore = context.settingsStore
@@ -215,35 +191,13 @@ class SettingsStore(
                 s3Config = preferences[S3_CONFIG]?.let {
                     JsonInstant.decodeFromString(it)
                 } ?: S3Config(),
-                ttsProviders = preferences[TTS_PROVIDERS]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: emptyList(),
-                selectedTTSProviderId = preferences[SELECTED_TTS_PROVIDER]?.let { Uuid.parse(it) }
-                    ?: DEFAULT_SYSTEM_TTS_ID,
-                defaultTTSPlaybackSpeed = preferences[DEFAULT_TTS_PLAYBACK_SPEED]?.coerceIn(0.5f, 2.0f) ?: 1.0f,
-                asrProviders = preferences[ASR_PROVIDERS]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: emptyList(),
-                selectedASRProviderId = preferences[SELECTED_ASR_PROVIDER]?.let { Uuid.parse(it) },
                 modeInjections = preferences[MODE_INJECTIONS]?.let {
                     JsonInstant.decodeFromString(it)
                 } ?: emptyList(),
-                lorebooks = preferences[LOREBOOKS]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: emptyList(),
-                quickMessages = preferences[QUICK_MESSAGES]?.let {
-                    JsonInstant.decodeFromString(it)
-                } ?: emptyList(),
-                webServerEnabled = preferences[WEB_SERVER_ENABLED] == true,
-                webServerPort = preferences[WEB_SERVER_PORT] ?: 8080,
-                webServerJwtEnabled = preferences[WEB_SERVER_JWT_ENABLED] == true,
-                webServerAccessPassword = preferences[WEB_SERVER_ACCESS_PASSWORD] ?: "",
-                webServerLocalhostOnly = preferences[WEB_SERVER_LOCALHOST_ONLY] == true,
                 backupReminderConfig = preferences[BACKUP_REMINDER_CONFIG]?.let {
                     JsonInstant.decodeFromString(it)
                 } ?: BackupReminderConfig(),
                 launchCount = preferences[LAUNCH_COUNT] ?: 0,
-                sponsorAlertDismissedAt = preferences[SPONSOR_ALERT_DISMISSED_AT] ?: 0,
             )
         }
         .map {
@@ -272,25 +226,15 @@ class SettingsStore(
                     assistants.add(defaultAssistant.copy())
                 }
             }
-            val ttsProviders = it.ttsProviders.ifEmpty { DEFAULT_TTS_PROVIDERS }.toMutableList()
-            DEFAULT_TTS_PROVIDERS.forEach { defaultTTSProvider ->
-                if (ttsProviders.none { provider -> provider.id == defaultTTSProvider.id }) {
-                    ttsProviders.add(defaultTTSProvider.copyProvider())
-                }
-            }
             it.copy(
                 providers = providers,
                 assistants = assistants,
-                ttsProviders = ttsProviders,
             )
         }
         .map { settings ->
             // 去重并清理无效引用
             val validMcpServerIds = settings.mcpServers.map { it.id }.toSet()
             val validModeInjectionIds = settings.modeInjections.map { it.id }.toSet()
-            val validLorebookIds = settings.lorebooks.map { it.id }.toSet()
-            val validQuickMessageIds = settings.quickMessages.map { it.id }.toSet()
-            val asrProviders = settings.asrProviders.distinctBy { it.id }
             settings.copy(
                 providers = settings.providers.distinctBy { it.id }.map { provider ->
                     when (provider) {
@@ -317,27 +261,12 @@ class SettingsStore(
                         modeInjectionIds = assistant.modeInjectionIds.filter { id ->
                             id in validModeInjectionIds
                         }.toSet(),
-                        // 过滤掉不存在的 Lorebook ID
-                        lorebookIds = assistant.lorebookIds.filter { id ->
-                            id in validLorebookIds
-                        }.toSet(),
-                        // 过滤掉不存在的快捷消息 ID
-                        quickMessageIds = assistant.quickMessageIds.filter { id ->
-                            id in validQuickMessageIds
-                        }.toSet()
                     )
                 },
-                ttsProviders = settings.ttsProviders.distinctBy { it.id },
-                asrProviders = asrProviders,
-                selectedASRProviderId = settings.selectedASRProviderId
-                    ?.takeIf { id -> asrProviders.any { provider -> provider.id == id } }
-                    ?: asrProviders.firstOrNull()?.id,
                 favoriteModels = settings.favoriteModels.filter { uuid ->
                     settings.providers.flatMap { it.models }.any { it.id == uuid }
                 },
                 modeInjections = settings.modeInjections.distinctBy { it.id },
-                lorebooks = settings.lorebooks.distinctBy { it.id },
-                quickMessages = settings.quickMessages.distinctBy { it.id },
             )
         }
         .onEach {
@@ -395,26 +324,9 @@ class SettingsStore(
             preferences[MCP_SERVERS] = JsonInstant.encodeToString(settings.mcpServers)
             preferences[WEBDAV_CONFIG] = JsonInstant.encodeToString(settings.webDavConfig)
             preferences[S3_CONFIG] = JsonInstant.encodeToString(settings.s3Config)
-            preferences[TTS_PROVIDERS] = JsonInstant.encodeToString(settings.ttsProviders)
-            settings.selectedTTSProviderId?.let {
-                preferences[SELECTED_TTS_PROVIDER] = it.toString()
-            } ?: preferences.remove(SELECTED_TTS_PROVIDER)
-            preferences[DEFAULT_TTS_PLAYBACK_SPEED] = settings.defaultTTSPlaybackSpeed.coerceIn(0.5f, 2.0f)
-            preferences[ASR_PROVIDERS] = JsonInstant.encodeToString(settings.asrProviders)
-            settings.selectedASRProviderId?.let {
-                preferences[SELECTED_ASR_PROVIDER] = it.toString()
-            } ?: preferences.remove(SELECTED_ASR_PROVIDER)
             preferences[MODE_INJECTIONS] = JsonInstant.encodeToString(settings.modeInjections)
-            preferences[LOREBOOKS] = JsonInstant.encodeToString(settings.lorebooks)
-            preferences[QUICK_MESSAGES] = JsonInstant.encodeToString(settings.quickMessages)
-            preferences[WEB_SERVER_ENABLED] = settings.webServerEnabled
-            preferences[WEB_SERVER_PORT] = settings.webServerPort
-            preferences[WEB_SERVER_JWT_ENABLED] = settings.webServerJwtEnabled
-            preferences[WEB_SERVER_ACCESS_PASSWORD] = settings.webServerAccessPassword
-            preferences[WEB_SERVER_LOCALHOST_ONLY] = settings.webServerLocalhostOnly
             preferences[BACKUP_REMINDER_CONFIG] = JsonInstant.encodeToString(settings.backupReminderConfig)
             preferences[LAUNCH_COUNT] = settings.launchCount
-            preferences[SPONSOR_ALERT_DISMISSED_AT] = settings.sponsorAlertDismissedAt
         }
     }
 
@@ -487,8 +399,6 @@ class SettingsStore(
     suspend fun updateAssistantInjections(
         assistantId: Uuid,
         modeInjectionIds: Set<Uuid>,
-        lorebookIds: Set<Uuid>,
-        quickMessageIds: Set<Uuid> = emptySet(),
     ) {
         update { settings ->
             settings.copy(
@@ -496,8 +406,6 @@ class SettingsStore(
                     if (assistant.id == assistantId) {
                         assistant.copy(
                             modeInjectionIds = modeInjectionIds,
-                            lorebookIds = lorebookIds,
-                            quickMessageIds = quickMessageIds,
                         )
                     } else {
                         assistant
@@ -543,22 +451,9 @@ data class Settings(
     val mcpServers: List<McpServerConfig> = emptyList(),
     val webDavConfig: WebDavConfig = WebDavConfig(),
     val s3Config: S3Config = S3Config(),
-    val ttsProviders: List<TTSProviderSetting> = DEFAULT_TTS_PROVIDERS,
-    val selectedTTSProviderId: Uuid = DEFAULT_SYSTEM_TTS_ID,
-    val defaultTTSPlaybackSpeed: Float = 1.0f,
-    val asrProviders: List<ASRProviderSetting> = emptyList(),
-    val selectedASRProviderId: Uuid? = null,
     val modeInjections: List<PromptInjection.ModeInjection> = DEFAULT_MODE_INJECTIONS,
-    val lorebooks: List<Lorebook> = emptyList(),
-    val quickMessages: List<QuickMessage> = emptyList(),
-    val webServerEnabled: Boolean = false,
-    val webServerPort: Int = 8080,
-    val webServerJwtEnabled: Boolean = false,
-    val webServerAccessPassword: String = "",
-    val webServerLocalhostOnly: Boolean = false,
     val backupReminderConfig: BackupReminderConfig = BackupReminderConfig(),
     val launchCount: Int = 0,
-    val sponsorAlertDismissedAt: Int = 0,
 ) {
     companion object {
         // 构造一个用于初始化的settings, 但它不能用于保存，防止使用初始值存储
@@ -593,7 +488,6 @@ data class DisplaySetting(
     val showTokenUsage: Boolean = true,
     val showThinkingContent: Boolean = true,
     val autoCloseThinking: Boolean = true,
-    val updateCheckDisabledUntilEpochMillis: Long = 0L,
     val showMessageJumper: Boolean = true,
     val messageJumperOnLeft: Boolean = false,
     val fontSizeRatio: Float = 1.0f,
@@ -604,9 +498,6 @@ data class DisplaySetting(
     val codeBlockAutoWrap: Boolean = false,
     val codeBlockAutoCollapse: Boolean = false,
     val showLineNumbers: Boolean = false,
-    val ttsOnlyReadQuoted: Boolean = false,
-    val ttsOnlyReadOutsideBrackets: Boolean = false,
-    val autoPlayTTSAfterGeneration: Boolean = false,
     val pasteLongTextAsFile: Boolean = false,
     val pasteLongTextThreshold: Int = 1000,
     val sendOnEnter: Boolean = false,
@@ -676,21 +567,6 @@ fun Settings.getAssistantById(id: Uuid): Assistant? {
     return this.assistants.find { it.id == id }
 }
 
-fun Settings.getQuickMessagesOfAssistant(assistant: Assistant) =
-    quickMessages.filter { it.id in assistant.quickMessageIds }
-
-fun Settings.getSelectedTTSProvider(): TTSProviderSetting? {
-    return selectedTTSProviderId?.let { id ->
-        ttsProviders.find { it.id == id }
-    } ?: ttsProviders.firstOrNull()
-}
-
-fun Settings.getSelectedASRProvider(): ASRProviderSetting? {
-    return selectedASRProviderId?.let { id ->
-        asrProviders.find { it.id == id }
-    } ?: asrProviders.firstOrNull()
-}
-
 fun Model.findProvider(providers: List<ProviderSetting>, checkOverwrite: Boolean = true): ProviderSetting? {
     val provider = findModelProviderFromList(providers) ?: return null
     val providerOverwrite = this.providerOverwrite
@@ -737,21 +613,6 @@ internal val DEFAULT_ASSISTANTS = listOf(
             - Remember to use Markdown syntax for formatting, and use latex for mathematical expressions.
         """.trimIndent()
     ),
-)
-
-val DEFAULT_SYSTEM_TTS_ID = Uuid.parse("026a01a2-c3a0-4fd5-8075-80e03bdef200")
-private val DEFAULT_TTS_PROVIDERS = listOf(
-    TTSProviderSetting.SystemTTS(
-        id = DEFAULT_SYSTEM_TTS_ID,
-        name = "",
-    ),
-    TTSProviderSetting.OpenAI(
-        id = Uuid.parse("e36b22ef-ca82-40ab-9e70-60cad861911c"),
-        name = "AiHubMix",
-        baseUrl = "https://aihubmix.com/v1",
-        model = "gpt-4o-mini-tts",
-        voice = "alloy",
-    )
 )
 
 internal val DEFAULT_ASSISTANTS_IDS = DEFAULT_ASSISTANTS.map { it.id }

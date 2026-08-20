@@ -19,6 +19,15 @@ android {
             version = "3.22.1"
         }
     }
+
+    // Extract bundled native libraries (e.g. PRoot) to nativeLibraryDir so
+    // runtime lookups by absolute path work, matching the app module's config
+    // and the ProotShellRunner expectations in both app and instrumented tests.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
 }
 
 dependencies {

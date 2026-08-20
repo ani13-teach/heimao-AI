@@ -1,7 +1,6 @@
 package me.rerere.rikkahub.data.datastore.migration
 
 import android.util.Log
-import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import me.rerere.rikkahub.utils.JsonInstant
@@ -37,28 +36,26 @@ object SettingsJsonMigrator {
                 root["assistants"] = JsonInstant.parseToJsonElement(migrated)
             }
 
-            // V3: 将 assistants 中内嵌的 quickMessages 提取为全局 quickMessages
+            // V4: 删除已移除的快捷消息配置，保留助手的其他字段。
+            root.remove("quickMessages")
             root["assistants"]?.let { element ->
-                val (migratedAssistants, extractedQuickMessages) =
-                    migrateAssistantsQuickMessages(JsonInstant.encodeToString(element))
-                root["assistants"] = JsonInstant.parseToJsonElement(migratedAssistants)
+                val migrated = removeLegacyQuickMessageFields(JsonInstant.encodeToString(element))
+                root["assistants"] = JsonInstant.parseToJsonElement(migrated)
+            }
 
-                if (extractedQuickMessages.isNotEmpty()) {
-                    val existing = root["quickMessages"]
-                    val existingArray = existing?.let {
-                        runCatching { JsonInstant.parseToJsonElement(JsonInstant.encodeToString(it)) as? JsonArray }.getOrNull()
-                    } ?: JsonArray(emptyList())
-                    val existingIds = existingArray.mapNotNull {
-                        (it as? JsonObject)?.get("id")?.toString()?.trim('"')
-                    }.toSet()
-                    val merged = JsonArray(
-                        existingArray + extractedQuickMessages.filter { e ->
-                            val id = (e as? JsonObject)?.get("id")?.toString()?.trim('"')
-                            id != null && id !in existingIds
-                        }
-                    )
-                    root["quickMessages"] = merged
-                }
+            // V5: Remove retired voice configuration and local tool options.
+            root.remove("ttsProviders")
+            root.remove("selectedTTSProviderId")
+            root.remove("defaultTTSPlaybackSpeed")
+            root.remove("asrProviders")
+            root.remove("selectedASRProviderId")
+            root["displaySetting"]?.let { element ->
+                val migrated = removeLegacyVoiceDisplayFields(JsonInstant.encodeToString(element))
+                root["displaySetting"] = JsonInstant.parseToJsonElement(migrated)
+            }
+            root["assistants"]?.let { element ->
+                val migrated = removeLegacyTtsLocalTools(JsonInstant.encodeToString(element))
+                root["assistants"] = JsonInstant.parseToJsonElement(migrated)
             }
 
             JsonInstant.encodeToString(JsonObject(root))

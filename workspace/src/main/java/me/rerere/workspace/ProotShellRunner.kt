@@ -44,6 +44,7 @@ class ProotShellRunner(
         context.tempDir.mkdirs()
         if (context.accessMode == WorkspaceShellAccessMode.WORKSPACE_ONLY) {
             File(context.filesDir, AI_TEMP_DIR).mkdirs()
+            ensureCommandDispatchers(context.tempDir)
         }
         if (context.accessMode == WorkspaceShellAccessMode.FULL_ROOTFS) {
             patcher.patch(context.linuxDir)
@@ -88,6 +89,20 @@ class ProotShellRunner(
             AI_REQUIRED_RUNTIME_MOUNTS.forEach { (source, target) ->
                 command += "-b"
                 command += "$source:$target!"
+            }
+            AI_TOYBOX_COMMANDS.forEach { commandName ->
+                command += "-b"
+                command += "/system/bin/toybox:$AI_APPLET_DIR/$commandName!"
+                command += "-b"
+                command += "${commandDispatcher(context.tempDir, commandName).absolutePath}:/bin/$commandName!"
+            }
+            command += "-b"
+            command += "${commandDispatcher(context.tempDir, "env").absolutePath}:/usr/bin/env!"
+            if (File(AI_AWK_BINARY).isFile) {
+                command += "-b"
+                command += "$AI_AWK_BINARY:$AI_AWK_GUEST_BINARY!"
+                command += "-b"
+                command += "${commandDispatcher(context.tempDir, "awk").absolutePath}:/bin/awk!"
             }
             AI_OPTIONAL_RUNTIME_MOUNTS.forEach { (sourcePath, target) ->
                 val source = File(sourcePath)
@@ -160,6 +175,38 @@ class ProotShellRunner(
         return command
     }
 
+    private fun ensureCommandDispatchers(tempDir: File) {
+        AI_TOYBOX_COMMANDS.forEach { commandName ->
+            ensureCommandDispatcher(
+                file = commandDispatcher(tempDir, commandName),
+                command = "$AI_APPLET_DIR/$commandName",
+            )
+        }
+        if (File(AI_AWK_BINARY).isFile) {
+            ensureCommandDispatcher(
+                file = commandDispatcher(tempDir, "awk"),
+                command = AI_AWK_GUEST_BINARY,
+            )
+        }
+    }
+
+    private fun ensureCommandDispatcher(file: File, command: String) {
+        val content = "#!/bin/sh\nexec $command \"\$@\"\n"
+        synchronized(DISPATCHER_LOCK) {
+            file.parentFile?.mkdirs()
+            if (!file.isFile || file.readText() != content) {
+                file.setWritable(true, true)
+                file.writeText(content)
+            }
+            check(file.setReadable(true, true)) { "Unable to make dispatcher readable" }
+            check(file.setExecutable(true, true)) { "Unable to make dispatcher executable" }
+            file.setWritable(false, false)
+        }
+    }
+
+    private fun commandDispatcher(tempDir: File, commandName: String): File =
+        File(tempDir, "$AI_RUNTIME_DIR/$commandName.sh")
+
     private fun WorkspaceShellContext.prootCwd(): String {
         val normalized = cwd.trim().trim('/')
         return if (normalized.isBlank()) {
@@ -176,17 +223,17 @@ class ProotShellRunner(
         private const val PROOT_EXEC = "libproot_exec.so"
         private const val PROOT_LOADER = "libproot_loader.so"
         private const val AI_TEMP_DIR = ".rikkahub/tmp"
+        private const val AI_RUNTIME_DIR = "workspace-only-runtime"
+        private const val AI_AWK_BINARY = "/system/bin/awk"
+        private const val AI_APPLET_DIR = "/bin/.rikkahub-applets"
+        private const val AI_AWK_GUEST_BINARY = "$AI_APPLET_DIR/awk"
+        private val DISPATCHER_LOCK = Any()
 
-        // Android system partitions provide basic commands without exposing the mutable private Rootfs.
-        private val AI_REQUIRED_RUNTIME_MOUNTS by lazy {
-            buildList {
-                add("/system/bin/sh" to "/bin/sh")
-                AI_TOYBOX_COMMANDS.forEach { command ->
-                    add("/system/bin/toybox" to "/bin/$command")
-                }
-                add("/system/bin/toybox" to "/usr/bin/env")
-            }
-        }
+        // Bind only the shell directly. Each allowed toybox applet gets a distinct hidden
+        // absolute path, so Android's linker works without exposing /proc or a multicall entry.
+        private val AI_REQUIRED_RUNTIME_MOUNTS = listOf(
+            "/system/bin/sh" to "/bin/sh",
+        )
         private val AI_OPTIONAL_RUNTIME_MOUNTS = listOf(
             "/system/bin/linker" to "/system/bin/linker",
             "/system/bin/linker64" to "/system/bin/linker64",
@@ -199,7 +246,6 @@ class ProotShellRunner(
             "/linkerconfig" to "/linkerconfig",
         )
         private val AI_TOYBOX_COMMANDS = listOf(
-            "awk",
             "base64",
             "basename",
             "cat",
@@ -222,10 +268,8 @@ class ProotShellRunner(
             "false",
             "find",
             "fmt",
-            "fold",
             "grep",
             "head",
-            "hexdump",
             "id",
             "ln",
             "ls",

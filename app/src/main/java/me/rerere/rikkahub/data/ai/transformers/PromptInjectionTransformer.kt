@@ -6,15 +6,12 @@ import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.InjectionPosition
 import me.rerere.rikkahub.data.model.PromptInjection
-import me.rerere.rikkahub.data.model.Lorebook
-import me.rerere.rikkahub.data.model.extractContextForMatching
-import me.rerere.rikkahub.data.model.isTriggered
 import kotlin.uuid.Uuid
 
 /**
  * 提示词注入转换器
  *
- * 根据 Assistant 关联的 ModeInjection 和 Lorebook 进行提示词注入
+ * 根据 Assistant 关联的 ModeInjection 进行提示词注入
  */
 object PromptInjectionTransformer : InputMessageTransformer {
     override suspend fun transform(
@@ -25,9 +22,7 @@ object PromptInjectionTransformer : InputMessageTransformer {
             messages = messages,
             assistant = ctx.assistant,
             modeInjections = ctx.settings.modeInjections,
-            lorebooks = ctx.settings.lorebooks,
             conversationModeInjectionIds = ctx.conversationModeInjectionIds,
-            conversationLorebookIds = ctx.conversationLorebookIds,
         )
     }
 }
@@ -39,18 +34,13 @@ internal fun transformMessages(
     messages: List<UIMessage>,
     assistant: Assistant,
     modeInjections: List<PromptInjection.ModeInjection>,
-    lorebooks: List<Lorebook>,
     conversationModeInjectionIds: Set<Uuid> = emptySet(),
-    conversationLorebookIds: Set<Uuid> = emptySet(),
 ): List<UIMessage> {
     // 收集所有需要注入的内容
     val injections = collectInjections(
-        messages = messages,
         assistant = assistant,
         modeInjections = modeInjections,
-        lorebooks = lorebooks,
         conversationModeInjectionIds = conversationModeInjectionIds,
-        conversationLorebookIds = conversationLorebookIds,
     )
 
     if (injections.isEmpty()) {
@@ -70,12 +60,9 @@ internal fun transformMessages(
  * 收集需要注入的内容
  */
 internal fun collectInjections(
-    messages: List<UIMessage>,
     assistant: Assistant,
     modeInjections: List<PromptInjection.ModeInjection>,
-    lorebooks: List<Lorebook>,
     conversationModeInjectionIds: Set<Uuid> = emptySet(),
-    conversationLorebookIds: Set<Uuid> = emptySet(),
 ): List<PromptInjection> {
     val injections = mutableListOf<PromptInjection>()
     val effectiveModeInjectionIds = if (assistant.allowConversationPromptInjection) {
@@ -83,34 +70,11 @@ internal fun collectInjections(
     } else {
         assistant.modeInjectionIds
     }
-    val effectiveLorebookIds = if (assistant.allowConversationPromptInjection) {
-        conversationLorebookIds
-    } else {
-        assistant.lorebookIds
-    }
 
-    // 1. 获取关联的 ModeInjection
+    // 获取关联的 ModeInjection
     modeInjections
         .filter { it.enabled && effectiveModeInjectionIds.contains(it.id) }
         .forEach { injections.add(it) }
-
-    // 2. 获取关联的 Lorebook 中被触发的 RegexInjection
-    val enabledLorebooks = lorebooks.filter {
-        it.enabled && effectiveLorebookIds.contains(it.id)
-    }
-    if (enabledLorebooks.isNotEmpty()) {
-        // 提取上下文用于匹配（只取非 SYSTEM 消息）
-        val nonSystemMessages = messages.filter { it.role != MessageRole.SYSTEM }
-
-        enabledLorebooks.forEach { lorebook ->
-            lorebook.entries
-                .filter { entry ->
-                    val context = extractContextForMatching(nonSystemMessages, entry.scanDepth)
-                    entry.isTriggered(context)
-                }
-                .forEach { injections.add(it) }
-        }
-    }
 
     return injections
 }

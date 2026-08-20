@@ -255,50 +255,6 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
                     }
                 }
             }
-
-            item {
-                CardGroup(
-                    modifier = Modifier.padding(horizontal = 8.dp),
-                    title = { Text(stringResource(R.string.setting_page_tts_settings)) },
-                ) {
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_display_page_tts_only_read_quoted_title)) },
-                        supportingContent = { Text(stringResource(R.string.setting_display_page_tts_only_read_quoted_desc)) },
-                        trailingContent = {
-                            Switch(
-                                checked = displaySetting.ttsOnlyReadQuoted,
-                                onCheckedChange = {
-                                    updateDisplaySetting(displaySetting.copy(ttsOnlyReadQuoted = it))
-                                }
-                            )
-                        },
-                    )
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_display_page_tts_read_outside_brackets_title)) },
-                        supportingContent = { Text(stringResource(R.string.setting_display_page_tts_read_outside_brackets_desc)) },
-                        trailingContent = {
-                            Switch(
-                                checked = displaySetting.ttsOnlyReadOutsideBrackets,
-                                onCheckedChange = {
-                                    updateDisplaySetting(displaySetting.copy(ttsOnlyReadOutsideBrackets = it))
-                                }
-                            )
-                        },
-                    )
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_display_page_auto_play_tts_title)) },
-                        supportingContent = { Text(stringResource(R.string.setting_display_page_auto_play_tts_desc)) },
-                        trailingContent = {
-                            Switch(
-                                checked = displaySetting.autoPlayTTSAfterGeneration,
-                                onCheckedChange = {
-                                    updateDisplaySetting(displaySetting.copy(autoPlayTTSAfterGeneration = it))
-                                }
-                            )
-                        },
-                    )
-                }
-            }
         }
     }
 }

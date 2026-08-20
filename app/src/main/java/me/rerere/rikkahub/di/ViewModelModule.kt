@@ -12,7 +12,6 @@ import me.rerere.rikkahub.ui.pages.history.HistoryVM
 import me.rerere.rikkahub.ui.pages.stats.StatsVM
 import me.rerere.rikkahub.ui.pages.imggen.ImgGenVM
 import me.rerere.rikkahub.ui.pages.extensions.PromptVM
-import me.rerere.rikkahub.ui.pages.extensions.QuickMessagesVM
 import me.rerere.rikkahub.ui.pages.extensions.skills.SkillDetailVM
 import me.rerere.rikkahub.ui.pages.extensions.skills.SkillsVM
 import me.rerere.rikkahub.ui.pages.extensions.workspace.WorkspaceDetailVM
@@ -32,7 +31,6 @@ val viewModelModule = module {
             settingsStore = get(),
             conversationRepo = get(),
             chatService = get(),
-            updateChecker = get(),
             analytics = get(),
             filesManager = get(),
             favoriteRepository = get(),
@@ -63,7 +61,6 @@ val viewModelModule = module {
     viewModelOf(::BackupVM)
     viewModelOf(::ImgGenVM)
     viewModelOf(::PromptVM)
-    viewModelOf(::QuickMessagesVM)
     viewModelOf(::SkillsVM)
     viewModelOf(::SkillDetailVM)
     viewModelOf(::WorkspaceVM)

@@ -41,12 +41,24 @@ class WorkspaceShellAccessTest {
         val binds = command.bindValues()
         val rootIndex = command.indexOf("-r")
 
+        val catDispatcher = File(
+            context.tempDir,
+            "workspace-only-runtime/cat.sh",
+        ).absolutePath
+        val envDispatcher = File(
+            context.tempDir,
+            "workspace-only-runtime/env.sh",
+        ).absolutePath
+
         assertEquals(context.filesDir.absolutePath, command[rootIndex + 1])
         assertTrue(binds.contains("${context.filesDir.absolutePath}:/workspace"))
         assertTrue(binds.contains("${File(context.filesDir, ".rikkahub/tmp").absolutePath}:/tmp!"))
         assertTrue(binds.contains("/system/bin/sh:/bin/sh!"))
-        assertTrue(binds.contains("/system/bin/toybox:/bin/cat!"))
-        assertTrue(binds.contains("/system/bin/toybox:/usr/bin/env!"))
+        assertTrue(binds.contains("/system/bin/toybox:/bin/.rikkahub-applets/cat!"))
+        assertTrue(binds.contains("$catDispatcher:/bin/cat!"))
+        assertTrue(binds.contains("$envDispatcher:/usr/bin/env!"))
+        assertFalse(binds.contains("/system/bin/toybox:/bin/toybox!"))
+        assertFalse(binds.contains("/system/bin/toybox:/bin/cat!"))
         assertFalse(binds.contains("/system:/system!"))
         assertFalse(binds.contains("/system/bin:/bin!"))
         assertFalse(binds.any { it.startsWith("${context.linuxDir.absolutePath}:") })

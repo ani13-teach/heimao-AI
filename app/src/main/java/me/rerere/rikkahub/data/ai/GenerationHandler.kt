@@ -37,12 +37,14 @@ import me.rerere.rikkahub.data.ai.transformers.OutputMessageTransformer
 import me.rerere.rikkahub.data.ai.transformers.onGenerationFinish
 import me.rerere.rikkahub.data.ai.transformers.transforms
 import me.rerere.rikkahub.data.ai.transformers.visualTransforms
+import me.rerere.rikkahub.data.ai.tools.buildLayeredMemoryTools
 import me.rerere.rikkahub.data.ai.tools.buildMemoryTools
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.datastore.findProvider
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.AssistantMemory
+import me.rerere.rikkahub.data.repository.LayeredMemoryContext
 import me.rerere.rikkahub.data.repository.MemoryRepository
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
 import me.rerere.rikkahub.utils.applyPlaceholders
@@ -91,8 +93,8 @@ class GenerationHandler(
         processingStatus: MutableStateFlow<String?> = MutableStateFlow(null),
         conversationSystemPrompt: String? = null,
         conversationModeInjectionIds: Set<Uuid> = emptySet(),
-        conversationLorebookIds: Set<Uuid> = emptySet(),
         workspaceCwd: String? = null,
+        useLayeredMemory: Boolean = false,
     ): Flow<GenerationChunk> = flow {
         val provider = model.findProvider(settings.providers) ?: error("Provider not found")
         val providerImpl = providerManager.getProviderByType(provider)
@@ -102,28 +104,75 @@ class GenerationHandler(
         for (stepIndex in 0 until maxSteps) {
             Log.i(TAG, "streamText: start step #$stepIndex (${model.id})")
 
+            val memoryAssistantId = if (assistant?.enableMemory == true) {
+                if (assistant.useGlobalMemory) {
+                    MemoryRepository.GLOBAL_MEMORY_ID
+                } else {
+                    assistant.id.toString()
+                }
+            } else {
+                null
+            }
+
+            // 分层记忆：每次生成前重建索引 + ACTIVE 上下文（只记统计，不打印正文）
+            val layeredMemoryContext = if (useLayeredMemory) {
+                memoryAssistantId?.let { memoryRepo.getLayeredMemoryContext(it) }
+            } else {
+                null
+            }
+            layeredMemoryContext?.let { ctx ->
+                Log.i(
+                    TAG,
+                    "generateText: layered memory index=${ctx.indexCount} " +
+                        "active=${ctx.activeCount} " +
+                        "chars=${ctx.indexText.length + ctx.activeMemories.sumOf { it.content.length }}"
+                )
+            }
+
             val toolsInternal = buildList {
                 Log.i(TAG, "generateInternal: build tools($assistant)")
-                if (assistant?.enableMemory == true) {
-                    val memoryAssistantId = if (assistant.useGlobalMemory) {
-                        MemoryRepository.GLOBAL_MEMORY_ID
+                // 内置记忆工具名（仅记忆开启时受保护）；外部同名工具被过滤并告警，
+                // 保证内置工具的 scope/权限约束不被外部同名工具绕过。
+                val protectedNames = if (assistant?.enableMemory == true) {
+                    if (useLayeredMemory) {
+                        setOf("memory_read", "memory_write", "memory_consolidate")
                     } else {
-                        assistant.id.toString()
+                        setOf("memory_tool")
                     }
-                    buildMemoryTools(
-                        json = json,
-                        onCreation = { content ->
-                            memoryRepo.addMemory(memoryAssistantId, content)
-                        },
-                        onUpdate = { id, content ->
-                            memoryRepo.updateContent(id, content)
-                        },
-                        onDelete = { id ->
-                            memoryRepo.deleteMemory(id)
-                        }
-                    ).let(this::addAll)
+                } else {
+                    emptySet()
                 }
-                addAll(tools)
+                if (assistant?.enableMemory == true) {
+                    val memoryTools = if (useLayeredMemory) {
+                        buildLayeredMemoryTools(
+                            json = json,
+                            scopeId = memoryAssistantId!!,
+                            repo = memoryRepo,
+                        )
+                    } else {
+                        buildMemoryTools(
+                            json = json,
+                            onCreation = { content ->
+                                memoryRepo.addMemory(memoryAssistantId!!, content)
+                            },
+                            onUpdate = { id, content ->
+                                memoryRepo.updateContent(id, content)
+                            },
+                            onDelete = { id ->
+                                memoryRepo.deleteMemory(id)
+                            }
+                        )
+                    }
+                    tools.filter { it.name in protectedNames }.forEach { clash ->
+                        Log.w(
+                            TAG,
+                            "generateText: external tool ${clash.name} conflicts with the built-in " +
+                                "memory tool; the external one is dropped"
+                        )
+                    }
+                    addAll(memoryTools)
+                }
+                addAll(tools.filterNot { it.name in protectedNames })
             }
 
             // Check if we have tool calls ready to continue after user interaction.
@@ -165,12 +214,12 @@ class GenerationHandler(
                     providerImpl = providerImpl,
                     provider = provider,
                     tools = toolsInternal,
-                    memories = memories ?: emptyList(),
+                    memories = if (useLayeredMemory) emptyList() else memories ?: emptyList(),
+                    layeredMemoryContext = layeredMemoryContext,
                     stream = assistant.streamOutput,
                     processingStatus = processingStatus,
                     conversationSystemPrompt = conversationSystemPrompt,
                     conversationModeInjectionIds = conversationModeInjectionIds,
-                    conversationLorebookIds = conversationLorebookIds,
                     workspaceCwd = workspaceCwd,
                 )
                 messages = messages.visualTransforms(
@@ -375,8 +424,8 @@ class GenerationHandler(
         processingStatus: MutableStateFlow<String?> = MutableStateFlow(null),
         conversationSystemPrompt: String? = null,
         conversationModeInjectionIds: Set<Uuid> = emptySet(),
-        conversationLorebookIds: Set<Uuid> = emptySet(),
         workspaceCwd: String? = null,
+        layeredMemoryContext: LayeredMemoryContext? = null,
     ) {
         val internalMessages = buildList {
             val system = buildString {
@@ -393,7 +442,11 @@ class GenerationHandler(
                 // 记忆
                 if (assistant.enableMemory) {
                     appendLine()
-                    append(buildMemoryPrompt(memories = memories))
+                    if (layeredMemoryContext != null) {
+                        append(buildLayeredMemoryPrompt(layeredMemoryContext))
+                    } else {
+                        append(buildMemoryPrompt(memories = memories))
+                    }
                 }
                 // 工具prompt
                 tools.forEach { tool ->
@@ -410,7 +463,6 @@ class GenerationHandler(
             assistant = assistant,
             settings = settings,
             conversationModeInjectionIds = conversationModeInjectionIds,
-            conversationLorebookIds = conversationLorebookIds,
             processingStatus = processingStatus,
             workspaceCwd = workspaceCwd,
         ).withAdditionalContextMessages(additionalContextMessages)

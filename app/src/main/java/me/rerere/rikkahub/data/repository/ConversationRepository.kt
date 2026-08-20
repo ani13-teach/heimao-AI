@@ -16,6 +16,7 @@ import me.rerere.rikkahub.data.db.fts.MessageFtsManager
 import me.rerere.rikkahub.data.db.fts.MessageSearchSort
 import me.rerere.rikkahub.data.db.dao.ConversationDAO
 import me.rerere.rikkahub.data.db.dao.FavoriteDAO
+import me.rerere.rikkahub.data.db.dao.MessageNodeContentVersion
 import me.rerere.rikkahub.data.db.dao.MessageNodeDAO
 import me.rerere.rikkahub.data.db.entity.ConversationEntity
 import me.rerere.rikkahub.data.db.entity.MessageNodeEntity
@@ -38,28 +39,18 @@ class ConversationRepository(
         private const val PAGE_SIZE = 20
         private const val INITIAL_LOAD_SIZE = 40
         private const val SUMMARY_QUERY_BATCH_SIZE = 500
+        private const val SUMMARY_MAX_SERIALIZED_SOURCE_CHARACTERS = 16_000_000L
     }
 
-    suspend fun getRecentConversations(assistantId: Uuid, limit: Int = 10): List<Conversation> {
-        return conversationDAO.getRecentConversationsOfAssistant(
+    suspend fun getRecentConversations(assistantId: Uuid, limit: Int = 10): List<Conversation> =
+        conversationDAO.getRecentConversationsOfAssistant(
             assistantId = assistantId.toString(),
-            limit = limit
-        ).map { entity ->
-            val nodes = loadMessageNodes(entity.id)
-            conversationEntityToConversation(entity, nodes)
-        }
-    }
+            limit = limit,
+        ).map(::conversationSummaryToConversation)
 
-    fun getConversationsOfAssistant(assistantId: Uuid): Flow<List<Conversation>> {
-        return conversationDAO
-            .getConversationsOfAssistant(assistantId.toString())
-            .map { flow ->
-                flow.map { entity ->
-                    // 列表视图不需要完整的 nodes，使用空列表
-                    conversationEntityToConversation(entity, emptyList())
-                }
-            }
-    }
+    fun getConversationsOfAssistant(assistantId: Uuid): Flow<List<Conversation>> =
+        conversationDAO.getConversationSummariesOfAssistant(assistantId.toString())
+            .map { entities -> entities.map(::conversationSummaryToConversation) }
 
     fun getConversationsOfAssistantPaging(assistantId: Uuid): Flow<PagingData<Conversation>> = Pager(
         config = PagingConfig(
@@ -281,32 +272,72 @@ class ConversationRepository(
         conversationIds: List<Uuid>,
     ): List<Conversation> {
         if (conversationIds.isEmpty()) return emptyList()
-        val entities = getConversationEntitiesByIdsOfAssistant(
+        val summaries = getLightConversationEntitiesByIdsOfAssistant(
             assistantId = assistantId,
             conversationIds = conversationIds,
         ).associateBy { it.id }
         return conversationIds.mapNotNull { id ->
-            entities[id.toString()]?.let { entity ->
-                conversationEntityToConversation(entity, emptyList())
-            }
+            summaries[id.toString()]?.let(::conversationSummaryToConversation)
         }
     }
 
     suspend fun getFullConversationsOfAssistantByIds(
         assistantId: Uuid,
         conversationIds: List<Uuid>,
+        maxSerializedCharacters: Long = SUMMARY_MAX_SERIALIZED_SOURCE_CHARACTERS,
     ): List<Conversation> {
         if (conversationIds.isEmpty()) return emptyList()
+        require(maxSerializedCharacters > 0) { "maxSerializedCharacters must be positive" }
         val entities = getConversationEntitiesByIdsOfAssistant(
             assistantId = assistantId,
             conversationIds = conversationIds,
         ).associateBy { it.id }
-        return conversationIds.mapNotNull { id ->
-            entities[id.toString()]?.let { entity ->
-                conversationEntityToConversation(entity, loadMessageNodes(entity.id))
+        val orderedEntities = conversationIds.mapNotNull { entities[it.toString()] }
+        if (orderedEntities.size == conversationIds.size) {
+            val serializedLength = messageNodeDAO.getSerializedLengthOfConversations(
+                orderedEntities.map { it.id }
+            )
+            require(serializedLength <= maxSerializedCharacters) {
+                "Conversation summary source exceeds the serialized size limit"
             }
         }
+        return orderedEntities.map { entity ->
+            conversationEntityToConversation(entity, loadMessageNodes(entity.id))
+        }
     }
+
+    /**
+     * 轻量内容版本字段：指定会话消息节点的序列化总长度（SQL 聚合，不读取大内容）。
+     * 用于 summaryContext 缓存写入前的一致性校验；等长内容替换无法区分，不作为内容指纹。
+     */
+    suspend fun getSerializedLengthOfConversations(conversationIds: List<Uuid>): Long {
+        if (conversationIds.isEmpty()) return 0L
+        return messageNodeDAO.getSerializedLengthOfConversations(conversationIds.map { it.toString() })
+    }
+
+    /**
+     * 轻量内容版本指纹：指定会话消息节点的 [MessageNodeContentVersion]（SQL 聚合，不读取大内容）。
+     * 除序列化总长度外还包含 select_index 之和与节点数：分支切换只改 select_index，
+     * 长度与 update_at 都可能不变，必须纳入版本用于 summaryContext 缓存写入前的一致性校验；
+     * 等长内容替换无法区分，不作为内容指纹。
+     */
+    suspend fun getMessageNodeContentVersion(conversationIds: List<Uuid>): MessageNodeContentVersion {
+        if (conversationIds.isEmpty()) return MessageNodeContentVersion.EMPTY
+        return messageNodeDAO.getMessageNodeContentVersion(conversationIds.map { it.toString() })
+    }
+
+    private suspend fun getLightConversationEntitiesByIdsOfAssistant(
+        assistantId: Uuid,
+        conversationIds: List<Uuid>,
+    ): List<LightConversationEntity> = conversationIds
+        .distinct()
+        .chunked(SUMMARY_QUERY_BATCH_SIZE)
+        .flatMap { batch ->
+            conversationDAO.getConversationSummariesByIdsOfAssistant(
+                assistantId = assistantId.toString(),
+                ids = batch.map { it.toString() },
+            )
+        }
 
     private suspend fun getConversationEntitiesByIdsOfAssistant(
         assistantId: Uuid,
@@ -427,13 +458,47 @@ class ConversationRepository(
     suspend fun searchMessages(
         keyword: String,
         sort: MessageSearchSort = MessageSearchSort.RELEVANCE,
-    ) = messageFtsManager.search(keyword, sort)
+        limit: Int = 50,
+    ) = messageFtsManager.search(keyword, sort, limit)
 
     suspend fun searchMessagesOfAssistant(
         assistantId: Uuid,
         keyword: String,
         sort: MessageSearchSort = MessageSearchSort.RELEVANCE,
-    ) = messageFtsManager.searchForAssistant(assistantId.toString(), keyword, sort)
+        limit: Int = 50,
+        excludeConversationId: Uuid? = null,
+    ) = messageFtsManager.searchForAssistant(
+        assistantId = assistantId.toString(),
+        keyword = keyword,
+        sort = sort,
+        limit = limit,
+        excludeConversationId = excludeConversationId?.toString(),
+    )
+
+    suspend fun readConversationMessageWindow(
+        assistantId: Uuid,
+        conversationId: Uuid,
+        nodeId: Uuid,
+        messageId: Uuid,
+        radius: Int,
+    ): List<UIMessage> {
+        require(radius in 0..5) { "radius must be between 0 and 5" }
+        val conversation = conversationDAO.getConversationById(conversationId.toString())
+            ?: error("Conversation not found")
+        require(conversation.assistantId == assistantId.toString()) {
+            "Conversation does not belong to the current assistant"
+        }
+        val node = messageNodeDAO.getNodeByIdOfConversation(
+            nodeId = nodeId.toString(),
+            conversationId = conversationId.toString(),
+        ) ?: error("Conversation message node not found")
+        val messages = JsonInstant.decodeFromString<List<UIMessage>>(node.messages)
+        val index = messages.indexOfFirst { it.id == messageId }
+        require(index >= 0) { "Conversation message not found" }
+        val start = (index - radius).coerceAtLeast(0)
+        val endExclusive = (index + radius + 1).coerceAtMost(messages.size)
+        return messages.subList(start, endExclusive)
+    }
 
     suspend fun rebuildAllIndexes(onProgress: (current: Int, total: Int) -> Unit = { _, _ -> }) {
         messageFtsManager.deleteAll()
@@ -467,7 +532,6 @@ class ConversationRepository(
             isPinned = conversation.isPinned,
             customSystemPrompt = conversation.customSystemPrompt ?: "",
             modeInjectionIds = JsonInstant.encodeToString(conversation.modeInjectionIds),
-            lorebookIds = JsonInstant.encodeToString(conversation.lorebookIds),
             workspaceCwd = conversation.workspaceCwd ?: "",
             folderId = conversation.folderId?.toString() ?: "",
             conversationNumber = conversation.conversationNumber,
@@ -494,7 +558,6 @@ class ConversationRepository(
             isPinned = conversationEntity.isPinned,
             customSystemPrompt = conversationEntity.customSystemPrompt.ifEmpty { null },
             modeInjectionIds = JsonInstant.decodeFromString(conversationEntity.modeInjectionIds),
-            lorebookIds = JsonInstant.decodeFromString(conversationEntity.lorebookIds),
             workspaceCwd = conversationEntity.workspaceCwd.ifEmpty { null },
             folderId = conversationEntity.folderId.ifEmpty { null }?.let { Uuid.parse(it) },
             conversationNumber = conversationEntity.conversationNumber,
@@ -514,7 +577,7 @@ class ConversationRepository(
             .getPinnedConversations()
             .map { flow ->
                 flow.map { entity ->
-                    conversationEntityToConversation(entity, emptyList())
+                    conversationSummaryToConversation(entity)
                 }
             }
     }

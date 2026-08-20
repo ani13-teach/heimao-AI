@@ -1,10 +1,5 @@
 package me.rerere.rikkahub.ui.components.ai
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -40,7 +35,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.input.TextFieldLineLimits
 import androidx.compose.material3.BasicAlertDialog
-import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -51,7 +45,6 @@ import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -62,9 +55,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalFocusManager
-import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
@@ -84,34 +75,25 @@ import kotlinx.coroutines.flow.collectLatest
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.ModelType
-import me.rerere.asr.ASRStatus
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.Add01
 import me.rerere.hugeicons.stroke.ArrowUp02
 import me.rerere.hugeicons.stroke.Cancel01
 import me.rerere.hugeicons.stroke.FullScreen
-import me.rerere.hugeicons.stroke.Zap
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.getCurrentAssistant
 import me.rerere.rikkahub.data.datastore.getCurrentChatModel
-import me.rerere.rikkahub.data.datastore.getQuickMessagesOfAssistant
 import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.model.Assistant
-import me.rerere.rikkahub.data.model.QuickMessage
 import me.rerere.rikkahub.ui.components.ai.completion.ChatCompletionContext
 import me.rerere.rikkahub.ui.components.ai.completion.ChatCompletionItem
 import me.rerere.rikkahub.ui.components.ai.completion.ChatCompletionList
 import me.rerere.rikkahub.ui.components.ai.completion.ChatCompletionProvider
 import me.rerere.rikkahub.ui.components.ui.KeepScreenOn
-import me.rerere.rikkahub.ui.components.ui.permission.PermissionManager
-import me.rerere.rikkahub.ui.components.ui.permission.PermissionRecordAudio
-import me.rerere.rikkahub.ui.components.ui.permission.rememberPermissionState
-import me.rerere.rikkahub.ui.context.LocalASRState
 import me.rerere.rikkahub.ui.context.LocalSettings
 import me.rerere.rikkahub.ui.context.LocalToaster
 import me.rerere.rikkahub.ui.hooks.ChatInputState
-import me.rerere.rikkahub.utils.SoundEffectPlayer
 import org.koin.compose.koinInject
 import kotlin.time.Duration.Companion.seconds
 
@@ -164,37 +146,6 @@ fun ChatInput(
         focusManager.clearFocus(force = true)
         keyboardController?.hide()
         if (loading) onCancelClick() else onLongSendClick()
-    }
-
-    val asr = LocalASRState.current
-    val asrState by asr.state.collectAsState()
-    val hapticFeedback = LocalHapticFeedback.current
-    val soundEffectPlayer: SoundEffectPlayer = koinInject()
-    LaunchedEffect(Unit) {
-        soundEffectPlayer.preload(R.raw.asr_start, R.raw.asr_stop)
-    }
-    val asrPermission = rememberPermissionState(PermissionRecordAudio)
-    PermissionManager(permissionState = asrPermission)
-    var asrBaseText by remember { mutableStateOf("") }
-    LaunchedEffect(asrState.status) {
-        when (asrState.status) {
-            ASRStatus.Listening -> {
-                hapticFeedback.performHapticFeedback(HapticFeedbackType.GestureThresholdActivate)
-                soundEffectPlayer.play(R.raw.asr_start)
-            }
-
-            ASRStatus.Stopping -> {
-                hapticFeedback.performHapticFeedback(HapticFeedbackType.GestureEnd)
-                soundEffectPlayer.play(R.raw.asr_stop)
-            }
-
-            else -> {}
-        }
-    }
-    LaunchedEffect(asrState.errorMessage) {
-        asrState.errorMessage?.takeIf { it.isNotBlank() }?.let { message ->
-            toaster.show(message = message, type = ToastType.Error)
-        }
     }
 
     Surface(
@@ -310,82 +261,51 @@ fun ChatInput(
                             )
                         }
 
-                        if (asrState.isAvailable || asrState.isRecording) {
-                            AsrButton(
-                                state = asrState,
-                                onClick = {
-                                    when (asrState.status) {
-                                        ASRStatus.Listening -> asr.stop()
-                                        ASRStatus.Idle, ASRStatus.Error -> {
-                                            if (!asrPermission.allRequiredPermissionsGranted) {
-                                                asrPermission.requestPermissions()
-                                            } else {
-                                                asrBaseText = state.textContent.text.toString()
-                                                asr.start { transcript ->
-                                                    val spacer =
-                                                        if (asrBaseText.isBlank() || transcript.isBlank()) "" else " "
-                                                    state.setMessageText(asrBaseText + spacer + transcript)
-                                                }
-                                            }
-                                        }
-
-                                        ASRStatus.Connecting, ASRStatus.Stopping -> {}
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .size(30.dp)
+                                .testTag("chat_send_button")
+                                .clip(CircleShape)
+                                .combinedClickable(
+                                    enabled = loading || !state.isEmpty(),
+                                    onClick = {
+                                        sendMessage()
+                                    }, onLongClick = {
+                                        sendMessageWithoutAnswer()
                                     }
-                                }
-                            )
-                        }
-
-                        AnimatedVisibility(
-                            visible = !asrState.isRecording,
-                            enter = fadeIn() + scaleIn(),
-                            exit = fadeOut() + scaleOut(),
+                                )
                         ) {
-                            Box(
-                                contentAlignment = Alignment.Center,
-                                modifier = Modifier
-                                    .size(30.dp)
-                                    .testTag("chat_send_button")
-                                    .clip(CircleShape)
-                                    .combinedClickable(
-                                        enabled = loading || !state.isEmpty(),
-                                        onClick = {
-                                            sendMessage()
-                                        }, onLongClick = {
-                                            sendMessageWithoutAnswer()
-                                        }
-                                    )
-                            ) {
-                                val containerColor = when {
-                                    loading -> MaterialTheme.colorScheme.errorContainer
-                                    state.isEmpty() -> MaterialTheme.colorScheme.surfaceContainerHigh
-                                    else -> MaterialTheme.colorScheme.primary
-                                }
-                                val contentColor = when {
-                                    loading -> MaterialTheme.colorScheme.onErrorContainer
-                                    state.isEmpty() -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
-                                    else -> MaterialTheme.colorScheme.onPrimary
-                                }
-                                Surface(
-                                    modifier = Modifier.fillMaxSize(),
-                                    shape = CircleShape,
-                                    color = containerColor,
-                                    content = {})
-                                if (loading) {
-                                    KeepScreenOn()
-                                    Icon(
-                                        imageVector = HugeIcons.Cancel01,
-                                        contentDescription = stringResource(R.string.stop),
-                                        tint = contentColor,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                } else {
-                                    Icon(
-                                        imageVector = HugeIcons.ArrowUp02,
-                                        contentDescription = stringResource(R.string.send),
-                                        tint = contentColor,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                }
+                            val containerColor = when {
+                                loading -> MaterialTheme.colorScheme.errorContainer
+                                state.isEmpty() -> MaterialTheme.colorScheme.surfaceContainerHigh
+                                else -> MaterialTheme.colorScheme.primary
+                            }
+                            val contentColor = when {
+                                loading -> MaterialTheme.colorScheme.onErrorContainer
+                                state.isEmpty() -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                                else -> MaterialTheme.colorScheme.onPrimary
+                            }
+                            Surface(
+                                modifier = Modifier.fillMaxSize(),
+                                shape = CircleShape,
+                                color = containerColor,
+                                content = {})
+                            if (loading) {
+                                KeepScreenOn()
+                                Icon(
+                                    imageVector = HugeIcons.Cancel01,
+                                    contentDescription = stringResource(R.string.stop),
+                                    tint = contentColor,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            } else {
+                                Icon(
+                                    imageVector = HugeIcons.ArrowUp02,
+                                    contentDescription = stringResource(R.string.send),
+                                    tint = contentColor,
+                                    modifier = Modifier.size(18.dp)
+                                )
                             }
                         }
                     }
@@ -424,11 +344,6 @@ private fun TextInputRow(
 ) {
     val settings = LocalSettings.current
     val filesManager: FilesManager = koinInject()
-    val assistant = settings.getCurrentAssistant()
-    val quickMessages = remember(settings.quickMessages, assistant.quickMessageIds) {
-        settings.getQuickMessagesOfAssistant(assistant)
-    }
-
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(4.dp)
@@ -582,11 +497,6 @@ private fun TextInputRow(
                     }
                 }
             },
-            leadingIcon = if (quickMessages.isNotEmpty()) {
-                {
-                    QuickMessageButton(quickMessages = quickMessages, state = state)
-                }
-            } else null,
         )
         if (isFullScreen) {
             FullScreenEditor(state = state) {
@@ -674,54 +584,6 @@ private fun ChatInputState.applyCompletion(
     textContent.edit {
         replace(start, end, item.insertText)
         selection = TextRange(start + item.insertText.length)
-    }
-}
-
-@Composable
-private fun QuickMessageButton(
-    quickMessages: List<QuickMessage>,
-    state: ChatInputState,
-) {
-    var expanded by remember { mutableStateOf(false) }
-    IconButton(
-        onClick = {
-            expanded = !expanded
-        }) {
-        Icon(HugeIcons.Zap, null)
-        DropdownMenu(
-            expanded = expanded,
-            onDismissRequest = { expanded = false },
-            modifier = Modifier
-                .widthIn(min = 200.dp, max = 360.dp)
-        ) {
-            quickMessages.forEach { quickMessage ->
-                Surface(
-                    onClick = {
-                        state.appendText(quickMessage.content)
-                        expanded = false
-                    },
-                    color = Color.Transparent,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Column(
-                        modifier = Modifier.padding(8.dp)
-                    ) {
-                        Text(
-                            text = quickMessage.title,
-                            style = MaterialTheme.typography.titleMedium,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Text(
-                            text = quickMessage.content,
-                            style = MaterialTheme.typography.bodySmall,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                }
-            }
-        }
     }
 }
 
