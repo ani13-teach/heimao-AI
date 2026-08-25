@@ -26,7 +26,9 @@ data class Conversation(
     val updateAt: Instant = Instant.now(),
     val customSystemPrompt: String? = null,
     val modeInjectionIds: Set<Uuid> = emptySet(),
-    // Absolute path inside the workspace rootfs
+    // Persisted workspace identity; null means this conversation has no recorded workspace.
+    val workspaceId: Uuid? = null,
+    // Absolute path inside the persisted workspace rootfs
     val workspaceCwd: String? = null,
     // 所属文件夹（助手内分组），null 表示未归入任何文件夹
     val folderId: Uuid? = null,
@@ -61,6 +63,17 @@ data class Conversation(
 
     fun getMessageNodeByMessageId(messageId: Uuid): MessageNode? {
         return messageNodes.firstOrNull { node -> node.messages.any { it.id == messageId } }
+    }
+
+    /**
+     * Changes the conversation workspace without carrying a directory from the old workspace.
+     */
+    fun withWorkspaceId(workspaceId: Uuid?): Conversation {
+        return if (this.workspaceId == workspaceId) {
+            this
+        } else {
+            copy(workspaceId = workspaceId, workspaceCwd = null)
+        }
     }
 
     fun updateCurrentMessages(messages: List<UIMessage>): Conversation {
@@ -102,11 +115,13 @@ data class Conversation(
             id: Uuid,
             assistantId: Uuid = DEFAULT_ASSISTANT_ID,
             messages: List<MessageNode> = emptyList(),
-            newConversation: Boolean = false
+            newConversation: Boolean = false,
+            workspaceId: Uuid? = null,
         ) = Conversation(
             id = id,
             assistantId = assistantId,
             messageNodes = messages,
+            workspaceId = workspaceId,
             newConversation = newConversation,
         )
     }

@@ -7,10 +7,12 @@ import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.ai.core.InputSchema
 import me.rerere.ai.core.Tool
 import me.rerere.ai.provider.ClaudePromptCacheTtl
+import me.rerere.ai.provider.LogicalPrompt
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.provider.TextGenerationParams
+import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.UIMessage
 import okhttp3.OkHttpClient
 import org.junit.Assert.assertEquals
@@ -91,7 +93,7 @@ class ClaudePromptCacheRequestTest {
     }
 
     @Test
-    fun `promptCaching=true should add cache_control to last system block and last tool`() {
+    fun `promptCaching=true should add one history boundary to the end of stable prefix`() {
         val providerSetting = ProviderSetting.Claude(promptCaching = true)
         val messages = listOf(
             UIMessage.system("system prompt"),
@@ -104,19 +106,54 @@ class ClaudePromptCacheRequestTest {
 
         val request = buildRequest(providerSetting, messages, params)
 
-        // system should have cache_control
+        assertNull(request["cache_control"])
+
+        // With no history or memory, the single HISTORY_END fallback is the final system block.
         val system = request["system"]!!.jsonArray
         val systemCacheControl = system.last().jsonObject["cache_control"]!!.jsonObject
         assertEquals("ephemeral", systemCacheControl["type"]!!.jsonPrimitive.content)
         assertNull(systemCacheControl["ttl"])
 
-        // tools should have cache_control
+        // The first phase has only one explicit boundary; tools are part of the same prefix,
+        // not a second boundary. MEMORY_END is absent when memory is absent.
         val tools = request["tools"]!!.jsonArray
-        val toolsCacheControl = tools.last().jsonObject["cache_control"]!!.jsonObject
-        assertEquals("ephemeral", toolsCacheControl["type"]!!.jsonPrimitive.content)
-        assertNull(toolsCacheControl["ttl"])
+        assertNull(tools.last().jsonObject["cache_control"])
+        assertEquals(
+            1,
+            request["system"]!!.jsonArray.count { it.jsonObject.containsKey("cache_control") } +
+                tools.count { it.jsonObject.containsKey("cache_control") },
+        )
     }
 
+    @Test
+    fun `dynamic system memory must not move cache breakpoint past stable prefix`() {
+        val providerSetting = ProviderSetting.Claude(promptCaching = true)
+        val messages = listOf(
+            UIMessage.system("stable instructions and tools"),
+            UIMessage.system("dynamic memories"),
+            UIMessage.user("hello")
+        )
+        val params = TextGenerationParams(
+            model = Model(modelId = "claude-test", abilities = emptyList()),
+            tools = emptyList()
+        )
+
+        val system = buildRequest(providerSetting, messages, params)["system"]!!.jsonArray
+        assertEquals(1, system.size)
+        assertNull(system[0].jsonObject["cache_control"])
+
+        val history = buildRequest(providerSetting, messages, params)["messages"]!!.jsonArray
+        val dynamic = history.first { message ->
+            message.jsonObject["content"]?.jsonArray?.any {
+                it.jsonObject["type"]?.jsonPrimitive?.content == "text" &&
+                    it.jsonObject["text"]?.jsonPrimitive?.content == "dynamic memories"
+            } == true
+        }
+        assertNotNull(dynamic)
+        assertNotNull(
+            dynamic.jsonObject["content"]!!.jsonArray.first().jsonObject["cache_control"]
+        )
+    }
     @Test
     fun `promptCaching=true without system should add cache_control to last tool`() {
         val providerSetting = ProviderSetting.Claude(promptCaching = true)
@@ -155,29 +192,39 @@ class ClaudePromptCacheRequestTest {
 
         val request = buildRequest(providerSetting, messages, params)
 
-        val systemCacheControl = request["system"]!!.jsonArray.last().jsonObject["cache_control"]!!.jsonObject
-        assertEquals("ephemeral", systemCacheControl["type"]!!.jsonPrimitive.content)
-        assertEquals("1h", systemCacheControl["ttl"]!!.jsonPrimitive.content)
-
-        val toolCacheControl = request["tools"]!!.jsonArray.last().jsonObject["cache_control"]!!.jsonObject
-        assertEquals("ephemeral", toolCacheControl["type"]!!.jsonPrimitive.content)
-        assertEquals("1h", toolCacheControl["ttl"]!!.jsonPrimitive.content)
+        // History exists, so HISTORY_END moves after the historical assistant response.
+        assertNull(request["system"]!!.jsonArray.last().jsonObject["cache_control"])
+        assertNull(request["tools"]!!.jsonArray.last().jsonObject["cache_control"])
 
         val messagesJson = request["messages"]!!.jsonArray
-        val firstUserMessage = messagesJson.first { msg ->
-            msg.jsonObject["role"]?.jsonPrimitive?.content == "user"
+        val historicalAssistant = messagesJson.first { msg ->
+            msg.jsonObject["role"]?.jsonPrimitive?.content == "assistant" &&
+                msg.jsonObject["content"]?.jsonArray?.any {
+                    it.jsonObject["type"]?.jsonPrimitive?.content == "text" &&
+                        it.jsonObject["text"]?.jsonPrimitive?.content == "first answer"
+                } == true
         }.jsonObject
-        val messageCacheControl = firstUserMessage["content"]!!
+        val messageCacheControl = historicalAssistant["content"]!!
             .jsonArray
-            .last()
+            .last { it.jsonObject["type"]?.jsonPrimitive?.content == "text" }
             .jsonObject["cache_control"]!!
             .jsonObject
         assertEquals("ephemeral", messageCacheControl["type"]!!.jsonPrimitive.content)
         assertEquals("1h", messageCacheControl["ttl"]!!.jsonPrimitive.content)
+
+        // No memory section was supplied, so there is no second explicit breakpoint.
+        assertEquals(
+            1,
+            messagesJson.sumOf { message ->
+                message.jsonObject["content"]?.jsonArray?.count {
+                    it.jsonObject.containsKey("cache_control")
+                } ?: 0
+            },
+        )
     }
 
     @Test
-    fun `promptCaching=true should add cache_control to second-to-last real user message`() {
+    fun `promptCaching=true should add cache_control after historical timeline`() {
         val providerSetting = ProviderSetting.Claude(promptCaching = true)
         val messages = listOf(
             UIMessage.system("system prompt"),
@@ -195,36 +242,197 @@ class ClaudePromptCacheRequestTest {
         val request = buildRequest(providerSetting, messages, params)
         val msgs = request["messages"]!!.jsonArray
 
-        // Find all real user messages (not tool_result)
-        val userMsgIndices = msgs.mapIndexedNotNull { index, msg ->
-            val obj = msg.jsonObject
-            if (obj["role"]?.jsonPrimitive?.content == "user") {
-                val content = obj["content"]?.jsonArray
-                val isToolResult = content?.any {
-                    it.jsonObject["type"]?.jsonPrimitive?.content == "tool_result"
+        // HISTORY_END is after all historical messages, not before the latest user turn.
+        val historicalAssistant = msgs.first { msg ->
+            msg.jsonObject["role"]?.jsonPrimitive?.content == "assistant" &&
+                msg.jsonObject["content"]?.jsonArray?.any {
+                    it.jsonObject["text"]?.jsonPrimitive?.content == "second answer"
                 } == true
-                if (!isToolResult) index else null
-            } else null
+        }.jsonObject
+        assertNotNull(
+            historicalAssistant["content"]!!.jsonArray.last().jsonObject["cache_control"]
+        )
+
+        val latestUser = msgs.last { it.jsonObject["role"]?.jsonPrimitive?.content == "user" }
+            .jsonObject
+        assertNull(latestUser["content"]!!.jsonArray.last().jsonObject["cache_control"])
+
+        val firstUser = msgs.first { it.jsonObject["role"]?.jsonPrimitive?.content == "user" }
+            .jsonObject
+        assertNull(firstUser["content"]!!.jsonArray.last().jsonObject["cache_control"])
+    }
+
+    @Test
+    fun `global prompt cache switch disables Claude boundaries`() {
+        val request = buildRequest(
+            providerSetting = ProviderSetting.Claude(promptCaching = true),
+            messages = listOf(
+                UIMessage.system("stable"),
+                UIMessage.user("old"),
+                UIMessage.assistant("answer"),
+                UIMessage.user("latest"),
+            ),
+            params = TextGenerationParams(
+                model = Model(modelId = "claude-test"),
+                promptCacheEnabled = false,
+            ),
+        )
+
+        val controls = buildList {
+            request["system"]?.jsonArray?.forEach { add(it.jsonObject) }
+            request["tools"]?.jsonArray?.forEach { add(it.jsonObject) }
+            request["messages"]?.jsonArray?.forEach { message ->
+                message.jsonObject["content"]?.jsonArray?.forEach { add(it.jsonObject) }
+            }
         }
+        assertTrue(controls.isNotEmpty())
+        controls.forEach { assertNull(it["cache_control"]) }
+    }
 
-        // Should have 3 real user messages
-        assertEquals(3, userMsgIndices.size)
+    @Test
+    fun `transient context and memory stay between history and latest user`() {
+        val prompt = LogicalPrompt(
+            system = listOf(UIMessage.system("stable")),
+            history = listOf(
+                UIMessage.user("old question"),
+                UIMessage.assistant("old answer"),
+            ),
+            transientContext = listOf(UIMessage.user("retrieved evidence")),
+            memory = listOf(UIMessage.system("memory")),
+            latestUser = UIMessage.user("latest question"),
+        )
+        val request = buildRequest(
+            providerSetting = ProviderSetting.Claude(promptCaching = true),
+            messages = prompt.toMessages(),
+            params = TextGenerationParams(
+                model = Model(modelId = "claude-test"),
+                logicalPrompt = prompt,
+            ),
+        )
 
-        // Second-to-last (index 1 in userMsgIndices) should have cache_control
-        val targetMsg = msgs[userMsgIndices[1]].jsonObject
-        val content = targetMsg["content"]!!.jsonArray
-        val cacheControl = content.last().jsonObject["cache_control"]!!.jsonObject
-        assertEquals("ephemeral", cacheControl["type"]!!.jsonPrimitive.content)
+        val messages = request["messages"]!!.jsonArray
+        val textOrder = messages.flatMap { message ->
+            message.jsonObject["content"]!!.jsonArray.mapNotNull { block ->
+                block.jsonObject["text"]?.jsonPrimitive?.content
+            }
+        }
+        assertEquals(
+            listOf("old question", "old answer", "retrieved evidence", "memory", "latest question"),
+            textOrder,
+        )
 
-        // Last user message should NOT have cache_control
-        val lastMsg = msgs[userMsgIndices[2]].jsonObject
-        val lastContent = lastMsg["content"]!!.jsonArray
-        assertNull(lastContent.last().jsonObject["cache_control"])
+        val cachedBlocks = buildList {
+            request["system"]?.jsonArray?.forEach { addAll(it.jsonObject["content"]?.jsonArray.orEmpty()) }
+            messages.forEach { addAll(it.jsonObject["content"]?.jsonArray.orEmpty()) }
+        }.filter { it.jsonObject.containsKey("cache_control") }
+        assertEquals("old answer", cachedBlocks[0].jsonObject["text"]?.jsonPrimitive?.content)
+        assertEquals("memory", cachedBlocks[1].jsonObject["text"]?.jsonPrimitive?.content)
+        assertNull(messages.last().jsonObject["content"]!!.jsonArray.last().jsonObject["cache_control"])
+    }
 
-        // First user message should NOT have cache_control
-        val firstMsg = msgs[userMsgIndices[0]].jsonObject
-        val firstContent = firstMsg["content"]!!.jsonArray
-        assertNull(firstContent.last().jsonObject["cache_control"])
+    @Test
+    fun `memory empty skips MEMORY_END and thinking is skipped for HISTORY_END`() {
+        val thinkingHistory = UIMessage(
+            role = me.rerere.ai.core.MessageRole.ASSISTANT,
+            parts = listOf(
+                UIMessagePart.Text("cacheable history"),
+                UIMessagePart.Reasoning("do not cache this block"),
+            ),
+        )
+        val prompt = LogicalPrompt(
+            history = listOf(thinkingHistory),
+            latestUser = UIMessage.user("latest"),
+        )
+        val request = buildRequest(
+            providerSetting = ProviderSetting.Claude(promptCaching = true),
+            messages = prompt.toMessages(),
+            params = TextGenerationParams(
+                model = Model(modelId = "claude-test"),
+                logicalPrompt = prompt,
+            ),
+        )
+        val blocks = request["messages"]!!.jsonArray.flatMap {
+            it.jsonObject["content"]!!.jsonArray
+        }
+        assertNotNull(blocks.first { it.jsonObject["text"]?.jsonPrimitive?.content == "cacheable history" }
+            .jsonObject["cache_control"])
+        assertNull(blocks.first { it.jsonObject["type"]?.jsonPrimitive?.content == "thinking" }
+            .jsonObject["cache_control"])
+        assertEquals(1, blocks.count { it.jsonObject.containsKey("cache_control") })
+    }
+
+    @Test
+    fun `region with only thinking blocks skips boundary without changing request`() {
+        val prompt = LogicalPrompt(
+            history = listOf(
+                UIMessage(
+                    role = me.rerere.ai.core.MessageRole.ASSISTANT,
+                    parts = listOf(UIMessagePart.Reasoning("thinking only")),
+                ),
+            ),
+            latestUser = UIMessage.user("latest"),
+        )
+        val request = buildRequest(
+            providerSetting = ProviderSetting.Claude(promptCaching = true),
+            messages = prompt.toMessages(),
+            params = TextGenerationParams(
+                model = Model(modelId = "claude-test"),
+                logicalPrompt = prompt,
+            ),
+        )
+        val blocks = request["messages"]!!.jsonArray.flatMap {
+            it.jsonObject["content"]!!.jsonArray
+        }
+        assertEquals(0, blocks.count { it.jsonObject.containsKey("cache_control") })
+        assertEquals(
+            "thinking only",
+            blocks.first { it.jsonObject["type"]?.jsonPrimitive?.content == "thinking" }
+                .jsonObject["thinking"]?.jsonPrimitive?.content,
+        )
+    }
+
+    @Test
+    fun `historical tool call and result stay adjacent and in order`() {
+        val tool = Tool(
+            toolCallId = "call-1",
+            toolName = "lookup",
+            input = "{}",
+            output = listOf(UIMessagePart.Text("result")),
+        )
+        val prompt = LogicalPrompt(
+            history = listOf(
+                UIMessage.user("find it"),
+                UIMessage(
+                    role = me.rerere.ai.core.MessageRole.ASSISTANT,
+                    parts = listOf(UIMessagePart.Text("calling"), tool),
+                ),
+            ),
+            latestUser = UIMessage.user("next"),
+        )
+        val request = buildRequest(
+            providerSetting = ProviderSetting.Claude(promptCaching = true),
+            messages = prompt.toMessages(),
+            params = TextGenerationParams(
+                model = Model(modelId = "claude-test"),
+                logicalPrompt = prompt,
+            ),
+        )
+        val messages = request["messages"]!!.jsonArray
+        val assistantIndex = messages.indexOfFirst { message ->
+            message.jsonObject["content"]?.jsonArray?.any {
+                it.jsonObject["type"]?.jsonPrimitive?.content == "tool_use"
+            } == true
+        }
+        assertTrue(assistantIndex >= 0)
+        assertEquals("assistant", messages[assistantIndex].jsonObject["role"]?.jsonPrimitive?.content)
+        assertEquals("user", messages[assistantIndex + 1].jsonObject["role"]?.jsonPrimitive?.content)
+        assertEquals(
+            "tool_result",
+            messages[assistantIndex + 1].jsonObject["content"]!!.jsonArray.single()
+                .jsonObject["type"]?.jsonPrimitive?.content,
+        )
+        assertEquals("next", messages.last().jsonObject["content"]!!.jsonArray.single()
+            .jsonObject["text"]?.jsonPrimitive?.content)
     }
 
     @Test

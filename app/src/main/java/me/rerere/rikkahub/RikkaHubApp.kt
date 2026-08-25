@@ -17,6 +17,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
 import me.rerere.common.android.appTempFolder
 import com.whl.quickjs.android.QuickJSLoader
 import me.rerere.rikkahub.di.appModule
@@ -28,6 +29,10 @@ import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.utils.CrashHandler
 import me.rerere.rikkahub.utils.DatabaseUtil
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.rikkahub.data.workspace.WorkspaceArchiveCleanup
+import me.rerere.rikkahub.data.workspace.WorkspaceArchiveRecovery
+import me.rerere.rikkahub.data.workspace.WorkspaceSnapshotRecovery
+import me.rerere.rikkahub.data.workspace.WorkspaceSnapshotService
 import me.rerere.workspace.WorkspaceManager
 import org.koin.android.ext.android.get
 import org.koin.android.ext.koin.androidContext
@@ -43,12 +48,34 @@ const val CHAT_LIVE_UPDATE_NOTIFICATION_CHANNEL_ID = "chat_live_update"
 class RikkaHubApp : Application() {
     override fun onCreate() {
         super.onCreate()
+
+        // Recover the database and workspace root before Koin can open a half-restored Room
+        // graph. A failure is intentionally allowed to escape and stop normal startup.
+        val recoveryOutcome = WorkspaceArchiveRecovery.recoverBeforeKoin(this)
+        // Snapshot recovery is a separate local transaction. Its filesystem half is repaired
+        // before Room opens, while the Room status half is repaired immediately after Koin.
+        WorkspaceSnapshotRecovery.recoverBeforeKoin(this)
+        if (recoveryOutcome.settingsNeedsCompensation) {
+            // This is deliberately the only pre-Koin DataStore/journal phase. It restores the
+            // exact old settings file before eager SettingsStore/ChatNotificationManager creation.
+            runBlocking(Dispatchers.IO) {
+                WorkspaceArchiveRecovery.compensatePendingSettingsBeforeKoin(this@RikkaHubApp)
+            }
+        }
+
         startKoin {
             androidLogger()
             androidContext(this@RikkaHubApp)
             workManagerFactory()
             modules(appModule, viewModelModule, dataSourceModule, repositoryModule)
         }
+
+        // Do this synchronously and before checkWorkspaceIntegrity: integrity must observe only
+        // READY/FAILED snapshot rows and a directory exchange whose journal is already settled.
+        runBlocking(Dispatchers.IO) {
+            get<WorkspaceSnapshotService>().recoverPendingTransaction()
+        }
+
         this.createNotificationChannel()
 
         // set cursor window size to 32MB
@@ -59,6 +86,10 @@ class RikkaHubApp : Application() {
 
         // Init QuickJS native library
         QuickJSLoader.init()
+
+        // Restore closes Room and exits before it can remove large recovery/staging trees. The
+        // next process owns that cleanup after the new Room graph has been created.
+        cleanupPendingArchiveArtifacts()
 
         // delete temp files
         deleteTempFiles()
@@ -90,6 +121,16 @@ class RikkaHubApp : Application() {
                 Log.i(TAG, "incrementLaunchCount: ${store.settingsFlowRaw.first().launchCount}")
             }.onFailure {
                 Log.e(TAG, "incrementLaunchCount failed", it)
+            }
+        }
+    }
+
+    private fun cleanupPendingArchiveArtifacts() {
+        get<AppScope>().launch(Dispatchers.IO) {
+            runCatching {
+                WorkspaceArchiveCleanup.cleanupPending(this@RikkaHubApp)
+            }.onFailure {
+                Log.e(TAG, "cleanupPendingArchiveArtifacts failed", it)
             }
         }
     }

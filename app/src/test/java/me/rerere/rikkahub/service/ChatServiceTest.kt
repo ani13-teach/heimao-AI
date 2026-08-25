@@ -12,6 +12,7 @@ import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.Conversation
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.Instant
@@ -34,6 +35,47 @@ class ChatServiceTest {
         assertEquals(ReasoningLevel.AUTO, params.reasoningLevel)
         assertEquals(headers, params.customHeaders)
         assertEquals(bodies, params.customBody)
+    }
+
+    @Test
+    fun `new conversation captures assistant workspace during initialization`() {
+        val conversationId = Uuid.parse("11111111-1111-1111-1111-111111111111")
+        val assistantId = Uuid.parse("22222222-2222-2222-2222-222222222222")
+        val workspaceId = Uuid.parse("33333333-3333-3333-3333-333333333333")
+        val assistant = Assistant(id = assistantId, workspaceId = workspaceId)
+
+        val initialized = resolveConversationForInitialization(
+            conversationId = conversationId,
+            persistedConversation = null,
+            assistant = assistant,
+        )
+
+        assertEquals(conversationId, initialized.id)
+        assertEquals(assistantId, initialized.assistantId)
+        assertEquals(workspaceId, initialized.workspaceId)
+        assertTrue(initialized.newConversation)
+    }
+
+    @Test
+    fun `existing conversation does not inherit current assistant workspace`() {
+        val conversationId = Uuid.parse("11111111-1111-1111-1111-111111111111")
+        val assistantId = Uuid.parse("22222222-2222-2222-2222-222222222222")
+        val workspaceId = Uuid.parse("33333333-3333-3333-3333-333333333333")
+        val persisted = Conversation(
+            id = conversationId,
+            assistantId = assistantId,
+            messageNodes = emptyList(),
+            workspaceId = null,
+        )
+
+        val initialized = resolveConversationForInitialization(
+            conversationId = conversationId,
+            persistedConversation = persisted,
+            assistant = Assistant(id = assistantId, workspaceId = workspaceId),
+        )
+
+        assertEquals(persisted, initialized)
+        assertNull(initialized.workspaceId)
     }
 
     @Test

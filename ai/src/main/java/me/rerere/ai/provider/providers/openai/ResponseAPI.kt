@@ -25,7 +25,9 @@ import kotlinx.serialization.json.putJsonArray
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.core.TokenUsage
+import me.rerere.ai.core.UsageNormalizer
 import me.rerere.ai.provider.BuiltInTools
+import me.rerere.ai.provider.LogicalPrompt
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.ProviderSetting
@@ -219,16 +221,22 @@ class ResponseAPI(
             }
             if (params.maxTokens != null) put("max_output_tokens", params.maxTokens)
 
-            // system instructions
-            if (messages.any { it.role == MessageRole.SYSTEM }) {
-                val parts = messages.first { it.role == MessageRole.SYSTEM }.parts
-                put(
-                    "instructions",
-                    parts.filterIsInstance<UIMessagePart.Text>().joinToString("\n") { it.text })
+            val prompt = params.logicalPrompt ?: LogicalPrompt.fromMessages(messages, params.tools)
+
+            // Responses has no explicit breakpoint mapping in this phase. Its stable
+            // session key lets OpenAI perform implicit caching without exposing an ID.
+            val systemParts = prompt.system.flatMap { message ->
+                message.parts.filterIsInstance<UIMessagePart.Text>()
+            }
+            if (systemParts.isNotEmpty()) {
+                put("instructions", systemParts.joinToString("\n") { it.text })
+            }
+            if (params.promptCacheEnabled && !params.promptCacheKey.isNullOrBlank()) {
+                put("prompt_cache_key", params.promptCacheKey)
             }
 
             // messages
-            put("input", buildMessages(messages))
+            put("input", buildMessages(prompt.toProviderMessages(includeSystem = false)))
 
             // reasoning
             if (params.model.abilities.contains(ModelAbility.REASONING)) {
@@ -641,18 +649,27 @@ class ResponseAPI(
                 parts = parts,
             ),
             finishReason = jsonObject["status"]?.jsonPrimitive?.contentOrNull,
-            usage = parseTokenUsage(jsonObject["usage"]?.jsonObject)
+            usage = parseTokenUsage(
+                jsonObject["usage"]?.jsonObject,
+                model = jsonObject["model"]?.jsonPrimitive?.contentOrNull,
+            )
         )
     }
 
-    private fun parseTokenUsage(jsonObject: JsonObject?): TokenUsage? {
+    private fun parseTokenUsage(jsonObject: JsonObject?): TokenUsage? =
+        parseTokenUsage(jsonObject, model = null)
+
+    private fun parseTokenUsage(jsonObject: JsonObject?, model: String?): TokenUsage? {
         if (jsonObject == null) return null
-        return TokenUsage(
-            promptTokens = jsonObject["input_tokens"]?.jsonPrimitive?.intOrNull ?: 0,
-            completionTokens = jsonObject["output_tokens"]?.jsonPrimitive?.intOrNull ?: 0,
-            totalTokens = jsonObject["total_tokens"]?.jsonPrimitive?.intOrNull ?: 0,
-            cachedTokens = jsonObject["input_tokens_details"]?.jsonObjectOrNull?.get("cached_tokens")?.jsonPrimitive?.intOrNull
-                ?: 0
+        val cachedTokens = jsonObject["input_tokens_details"]?.jsonObjectOrNull
+            ?.get("cached_tokens")?.jsonPrimitive?.intOrNull ?: 0
+        return UsageNormalizer.normalize(
+            totalInputTokens = jsonObject["input_tokens"]?.jsonPrimitive?.intOrNull,
+            completionTokens = jsonObject["output_tokens"]?.jsonPrimitive?.intOrNull,
+            totalTokens = jsonObject["total_tokens"]?.jsonPrimitive?.intOrNull,
+            cacheReadTokens = cachedTokens,
+            provider = "openai",
+            model = model,
         )
     }
 }

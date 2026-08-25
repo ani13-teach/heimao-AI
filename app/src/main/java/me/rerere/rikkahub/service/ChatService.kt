@@ -35,6 +35,7 @@ import me.rerere.ai.core.Tool
 import me.rerere.ai.provider.BuiltInTools
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
+import me.rerere.ai.provider.PromptCacheKey
 import me.rerere.ai.provider.ProviderManager
 import me.rerere.ai.provider.TextGenerationParams
 import me.rerere.ai.ui.ToolApprovalState
@@ -133,6 +134,24 @@ internal fun summaryContextMessage(summaryContext: String): UIMessage = UIMessag
  * 保证数量校验、来源加载与缓存检查基于同一列表，重复来源不会被重复拼接。
  */
 internal fun normalizeSummarySourceIds(ids: List<Uuid>): List<Uuid> = ids.distinct()
+
+/**
+ * Resolve the first in-memory state without allowing a persisted conversation to inherit
+ * the currently selected assistant's workspace. Only a genuinely new conversation captures
+ * the assistant default.
+ */
+internal fun resolveConversationForInitialization(
+    conversationId: Uuid,
+    persistedConversation: Conversation?,
+    assistant: Assistant,
+): Conversation {
+    return persistedConversation ?: Conversation.ofId(
+        id = conversationId,
+        assistantId = assistant.id,
+        newConversation = true,
+        workspaceId = assistant.workspaceId,
+    ).updateCurrentMessages(assistant.presetMessages)
+}
 
 /**
  * 筛选不符合工具命名要求（非空且仅含 ASCII 字母数字）的 MCP 服务器名。
@@ -344,21 +363,28 @@ class ChatService(
     // ---- 初始化对话 ----
 
     suspend fun initializeConversation(conversationId: Uuid) {
-        getOrCreateSession(conversationId) // 确保 session 存在
-        val conversation = conversationRepo.getConversationById(conversationId)
-        if (conversation != null) {
-            updateConversation(conversationId, conversation)
-            settingsStore.updateAssistant(conversation.assistantId)
-        } else {
-            // 新建对话, 并添加预设消息
-            val currentSettings = settingsStore.settingsFlowRaw.first()
-            val assistant = currentSettings.getCurrentAssistant()
-            val newConversation = Conversation.ofId(
-                id = conversationId,
-                assistantId = assistant.id,
-                newConversation = true
-            ).updateCurrentMessages(assistant.presetMessages)
-            updateConversation(conversationId, newConversation)
+        val session = getOrCreateSession(conversationId) // 确保 session 存在
+        try {
+            val persistedConversation = conversationRepo.getConversationById(conversationId)
+            // 只有真正的新会话捕获助手默认 workspace；旧会话直接使用持久化值，
+            // 即使当前助手有绑定，旧会话的 null workspaceId 也不会回退到该绑定。
+            val initializedConversation = persistedConversation ?: run {
+                val assistant = settingsStore.settingsFlowRaw.first().getCurrentAssistant()
+                resolveConversationForInitialization(
+                    conversationId = conversationId,
+                    persistedConversation = null,
+                    assistant = assistant,
+                )
+            }
+            updateConversation(conversationId, initializedConversation)
+            if (persistedConversation != null) {
+                settingsStore.updateAssistant(initializedConversation.assistantId)
+            }
+            // Complete only after the persisted/new-conversation decision and state update.
+            session.completeInitialization()
+        } catch (error: Throwable) {
+            session.failInitialization(error)
+            throw error
         }
     }
 
@@ -373,6 +399,9 @@ class ChatService(
 
         val job = appScope.launch {
             try {
+                // ChatVM starts initialization asynchronously. Do not inspect or persist the
+                // temporary session state until the new-vs-existing decision is complete.
+                session.awaitInitialized()
                 runCatching { previousJob?.join() }
                 finishInterruptedPendingTools(conversationId)
 
@@ -802,9 +831,11 @@ class ChatService(
                     ?.let { listOf(summaryContextMessage(it)) }
                     .orEmpty(),
                 assistant = assistant,
+                promptCacheKey = PromptCacheKey.forSession(conversationId.toString()),
                 conversationSystemPrompt = conversation.customSystemPrompt,
                 conversationModeInjectionIds = conversation.modeInjectionIds,
-                workspaceCwd = conversation.workspaceCwd,
+                workspaceId = conversation.workspaceId?.toString(),
+                workspaceCwd = conversation.workspaceId?.let { conversation.workspaceCwd },
                 memories = if (!assistant.enableMemory || assistant.useLayeredMemory) {
                     emptyList()
                 } else if (assistant.useGlobalMemory) {
@@ -827,7 +858,14 @@ class ChatService(
                     if (assistant.enableRecentChatsReference) {
                         addAll(createConversationTools(conversationRepo, assistant.id, conversationId))
                     }
-                    addAll(createWorkspaceToolsIfReady(assistant.workspaceId?.toString(), conversation.workspaceCwd))
+                    addAll(
+                        createWorkspaceToolsIfReady(
+                            workspaceId = conversation.workspaceId?.toString(),
+                            cwd = conversation.workspaceCwd,
+                            assistantId = assistant.id.toString(),
+                            conversationId = conversationId.toString(),
+                        )
+                    )
                     if (assistant.enabledSkills.isNotEmpty()) {
                         addAll(
                             createSkillTools(
@@ -930,7 +968,12 @@ class ChatService(
         }
     }
 
-    private suspend fun createWorkspaceToolsIfReady(workspaceId: String?, cwd: String? = null): List<Tool> {
+    private suspend fun createWorkspaceToolsIfReady(
+        workspaceId: String?,
+        cwd: String? = null,
+        assistantId: String?,
+        conversationId: String?,
+    ): List<Tool> {
         if (workspaceId.isNullOrBlank()) return emptyList()
         val workspace = workspaceRepository.getById(workspaceId) ?: return emptyList()
         if (workspace.shellStatus != WorkspaceShellStatus.READY.name) {
@@ -940,7 +983,13 @@ class ChatService(
             )
             return emptyList()
         }
-        return createWorkspaceTools(workspaceId, workspaceRepository, cwd)
+        return createWorkspaceTools(
+            workspaceId = workspaceId,
+            workspaceRepository = workspaceRepository,
+            cwd = cwd,
+            assistantId = assistantId,
+            conversationId = conversationId,
+        )
     }
 
     // ---- 检查无效消息 ----
@@ -1427,6 +1476,8 @@ class ChatService(
             messageNodes = copiedNodes,
             customSystemPrompt = currentConversation.customSystemPrompt,
             modeInjectionIds = currentConversation.modeInjectionIds,
+            workspaceId = currentConversation.workspaceId,
+            workspaceCwd = currentConversation.workspaceCwd,
         )
 
         saveConversation(forkConversation.id, forkConversation)

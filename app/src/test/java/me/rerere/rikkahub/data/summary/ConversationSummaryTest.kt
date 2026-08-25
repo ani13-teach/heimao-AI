@@ -7,6 +7,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.time.Instant
 import kotlin.uuid.Uuid
 
 class ConversationSummaryTest {
@@ -110,6 +111,7 @@ class ConversationSummaryTest {
         fun conversationWithText(text: String) = Conversation(
             assistantId = assistantId,
             conversationNumber = 1,
+            createAt = Instant.parse("2024-01-02T03:04:05.123Z"),
             messageNodes = listOf(
                 me.rerere.rikkahub.data.model.MessageNode.of(UIMessage.user(text))
             ),

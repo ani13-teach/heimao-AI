@@ -57,10 +57,14 @@ import com.dokar.sonner.ToastType
 import kotlinx.coroutines.launch
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.sync.S3BackupItem
+import me.rerere.rikkahub.data.workspace.BackupPasswordSlot
+import me.rerere.rikkahub.data.workspace.LegacyWorkspaceArchiveRequiresConfirmationException
 import me.rerere.rikkahub.data.sync.s3.S3Config
 import me.rerere.rikkahub.ui.components.ui.CardGroup
 import me.rerere.rikkahub.ui.context.LocalToaster
 import me.rerere.rikkahub.ui.pages.backup.BackupVM
+import me.rerere.rikkahub.ui.pages.backup.components.BackupPasswordDialog
+import me.rerere.rikkahub.ui.pages.backup.components.LegacyBackupConfirmationDialog
 import me.rerere.rikkahub.utils.UiState
 import me.rerere.rikkahub.utils.fileSizeToString
 import me.rerere.rikkahub.utils.onError
@@ -70,10 +74,7 @@ import me.rerere.rikkahub.utils.toLocalDateTime
 import java.time.Instant
 
 @Composable
-fun S3Tab(
-    vm: BackupVM,
-    onShowRestartDialog: () -> Unit
-) {
+fun S3Tab(vm: BackupVM) {
     val settings by vm.settings.collectAsStateWithLifecycle()
     val s3Config = settings.s3Config
     val backupItemsState by vm.s3BackupItems.collectAsStateWithLifecycle()
@@ -83,6 +84,79 @@ fun S3Tab(
     var showBackupFiles by remember { mutableStateOf(false) }
     var restoringItemId by remember { mutableStateOf<String?>(null) }
     var isBackingUp by remember { mutableStateOf(false) }
+    var passwordAction by remember { mutableStateOf<S3PasswordAction?>(null) }
+    var passwordInitial by remember { mutableStateOf("") }
+    var pendingLegacyRestore by remember { mutableStateOf<PendingS3LegacyRestore?>(null) }
+    var showLegacyConfirmation by remember { mutableStateOf(false) }
+
+    fun requestPassword(action: S3PasswordAction) {
+        val stored = vm.storedBackupPassword(BackupPasswordSlot.S3)
+        passwordInitial = stored?.concatToString().orEmpty()
+        stored?.fill('\u0000')
+        passwordAction = action
+    }
+
+    fun startBackup(password: CharArray, rememberPassword: Boolean) {
+        scope.launch {
+            isBackingUp = true
+            try {
+                vm.backupToS3(password)
+                if (rememberPassword) vm.rememberBackupPassword(BackupPasswordSlot.S3, password)
+                vm.loadS3BackupFileItems()
+                toaster.show(
+                    context.getString(R.string.backup_page_backup_success),
+                    type = ToastType.Success,
+                )
+            } catch (error: Throwable) {
+                error.printStackTrace()
+                toaster.show(
+                    error.message ?: context.getString(R.string.backup_page_unknown_error),
+                    type = ToastType.Error,
+                )
+            } finally {
+                password.fill('\u0000')
+                isBackingUp = false
+            }
+        }
+    }
+
+    fun startRestore(
+        item: S3BackupItem,
+        password: CharArray,
+        rememberPassword: Boolean,
+        allowLegacy: Boolean,
+    ) {
+        scope.launch {
+            restoringItemId = item.displayName
+            var waitingForLegacyConfirmation = false
+            try {
+                vm.restoreFromS3(item, password, allowLegacy)
+                if (rememberPassword) vm.rememberBackupPassword(BackupPasswordSlot.S3, password)
+                vm.restoreWarnings.value.takeIf { it.isNotEmpty() }?.let { warnings ->
+                    toaster.show(warnings.joinToString("; "), type = ToastType.Warning)
+                }
+                toaster.show(
+                    context.getString(R.string.backup_page_restore_success),
+                    type = ToastType.Success,
+                )
+                showBackupFiles = false
+            } catch (legacy: LegacyWorkspaceArchiveRequiresConfirmationException) {
+                if (allowLegacy) throw legacy
+                waitingForLegacyConfirmation = true
+                pendingLegacyRestore = PendingS3LegacyRestore(item, password, rememberPassword)
+                showLegacyConfirmation = true
+            } catch (error: Throwable) {
+                error.printStackTrace()
+                toaster.show(
+                    context.getString(R.string.backup_page_restore_failed, error.message ?: ""),
+                    type = ToastType.Error,
+                )
+            } finally {
+                if (!waitingForLegacyConfirmation) password.fill('\u0000')
+                restoringItemId = null
+            }
+        }
+    }
 
     fun updateS3Config(newConfig: S3Config) {
         vm.updateSettings(settings.copy(s3Config = newConfig))
@@ -101,6 +175,53 @@ fun S3Tab(
         UiState.Loading -> "${stringResource(R.string.backup_page_files)}: ..."
         UiState.Idle -> "${stringResource(R.string.backup_page_files)}: -"
         is UiState.Error -> "${stringResource(R.string.backup_page_files)}: -"
+    }
+
+    passwordAction?.let { action ->
+        BackupPasswordDialog(
+            initialPassword = passwordInitial,
+            allowRemember = true,
+            rememberByDefault = passwordInitial.isNotEmpty(),
+            onDismiss = {
+                passwordAction = null
+                passwordInitial = ""
+            },
+            onConfirm = { password, rememberPassword ->
+                passwordAction = null
+                passwordInitial = ""
+                if (!rememberPassword) vm.forgetBackupPassword(BackupPasswordSlot.S3)
+                when (action) {
+                    S3PasswordAction.Backup -> startBackup(password.toCharArray(), rememberPassword)
+                    is S3PasswordAction.Restore -> startRestore(
+                        item = action.item,
+                        password = password.toCharArray(),
+                        rememberPassword = rememberPassword,
+                        allowLegacy = false,
+                    )
+                }
+            },
+        )
+    }
+
+    if (showLegacyConfirmation) {
+        LegacyBackupConfirmationDialog(
+            onDismiss = {
+                pendingLegacyRestore?.password?.fill('\u0000')
+                pendingLegacyRestore = null
+                showLegacyConfirmation = false
+            },
+            onConfirm = {
+                val pending = pendingLegacyRestore ?: return@LegacyBackupConfirmationDialog
+                pendingLegacyRestore = null
+                showLegacyConfirmation = false
+                startRestore(
+                    item = pending.item,
+                    password = pending.password,
+                    rememberPassword = pending.rememberPassword,
+                    allowLegacy = true,
+                )
+            },
+        )
     }
 
     Column(
@@ -282,26 +403,8 @@ fun S3Tab(
             }
 
             Button(
-                onClick = {
-                    scope.launch {
-                        isBackingUp = true
-                        runCatching {
-                            vm.backupToS3()
-                            vm.loadS3BackupFileItems()
-                            toaster.show(
-                                context.getString(R.string.backup_page_backup_success),
-                                type = ToastType.Success
-                            )
-                        }.onFailure {
-                            it.printStackTrace()
-                            toaster.show(
-                                it.message ?: context.getString(R.string.backup_page_unknown_error),
-                                type = ToastType.Error
-                            )
-                        }
-                        isBackingUp = false
-                    }
-                },
+                onClick = { requestPassword(S3PasswordAction.Backup) },
+
                 enabled = !isBackingUp
             ) {
                 if (isBackingUp) {
@@ -374,28 +477,7 @@ fun S3Tab(
                                     }
                                 },
                                 onRestore = { restoreItem ->
-                                    scope.launch {
-                                        restoringItemId = restoreItem.displayName
-                                        runCatching {
-                                            vm.restoreFromS3(item = restoreItem)
-                                            toaster.show(
-                                                context.getString(R.string.backup_page_restore_success),
-                                                type = ToastType.Success
-                                            )
-                                            showBackupFiles = false
-                                            onShowRestartDialog()
-                                        }.onFailure { err ->
-                                            err.printStackTrace()
-                                            toaster.show(
-                                                context.getString(
-                                                    R.string.backup_page_restore_failed,
-                                                    err.message ?: ""
-                                                ),
-                                                type = ToastType.Error
-                                            )
-                                        }
-                                        restoringItemId = null
-                                    }
+                                    requestPassword(S3PasswordAction.Restore(restoreItem))
                                 },
                             )
                         }
@@ -422,6 +504,17 @@ fun S3Tab(
         }
     }
 }
+
+private sealed interface S3PasswordAction {
+    data object Backup : S3PasswordAction
+    data class Restore(val item: S3BackupItem) : S3PasswordAction
+}
+
+private data class PendingS3LegacyRestore(
+    val item: S3BackupItem,
+    val password: CharArray,
+    val rememberPassword: Boolean,
+)
 
 @Composable
 private fun BackupStatusCard(
@@ -468,7 +561,11 @@ private fun S3BackupItemCard(
         item(
             headlineContent = {
                 Text(
-                    text = item.displayName,
+                    text = if (item.displayName.endsWith(".zip") && !item.displayName.endsWith(".zip.enc")) {
+                        stringResource(R.string.backup_page_legacy_label, item.displayName)
+                    } else {
+                        item.displayName
+                    },
                     style = MaterialTheme.typography.titleMedium
                 )
             },

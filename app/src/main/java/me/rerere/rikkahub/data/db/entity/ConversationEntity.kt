@@ -29,6 +29,8 @@ data class ConversationEntity(
     val customSystemPrompt: String = "",
     @ColumnInfo("mode_injection_ids", defaultValue = "[]")
     val modeInjectionIds: String = "[]",
+    @ColumnInfo("workspace_id")
+    val workspaceId: String? = null,
     @ColumnInfo("workspace_cwd", defaultValue = "")
     val workspaceCwd: String = "",
     @ColumnInfo("folder_id", defaultValue = "")

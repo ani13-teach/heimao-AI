@@ -28,6 +28,19 @@ class ProotWorkspaceOnlyInstrumentedTest {
             mkdirs()
             resolve("secret.txt").writeText("external-bind")
         }
+        val sharedMarker = "shared-${UUID.randomUUID()}"
+        val sharedDirs = listOf(
+            "skills" to File(testRoot, "shared-skills"),
+            "upload" to File(testRoot, "shared-upload"),
+            "tool_outputs" to File(testRoot, "shared-tool-outputs"),
+        ).onEach { (target, source) ->
+            source.mkdirs()
+            File(source, sharedMarker).writeText("shared-marker")
+            File(linuxDir, target).apply {
+                mkdirs()
+                resolve(sharedMarker).writeText("private-rootfs-marker")
+            }
+        }
         File(filesDir, "input.txt").writeText("workspace-data")
 
         try {
@@ -47,6 +60,13 @@ class ProotWorkspaceOnlyInstrumentedTest {
                         [ ! -e /bin/toybox ] || exit 95
                         [ ! -e /bin/.rikkahub-applets/ps ] || exit 96
                         [ ! -e /system/bin/toybox ] || exit 97
+                        [ ! -e /usr/bin/apt ] || exit 98
+                        [ ! -e /usr/bin/apt-get ] || exit 99
+                        [ ! -e /usr/bin/python3 ] || exit 100
+                        [ ! -e /usr/bin/pip3 ] || exit 101
+                        [ ! -e /skills/$sharedMarker ] || exit 102
+                        [ ! -e /upload/$sharedMarker ] || exit 103
+                        [ ! -e /tool_outputs/$sharedMarker ] || exit 104
                     """.trimIndent(),
                     cwd = "",
                     filesDir = filesDir,
@@ -55,7 +75,9 @@ class ProotWorkspaceOnlyInstrumentedTest {
                     workingDir = filesDir,
                     timeoutMillis = 30_000,
                     accessMode = WorkspaceShellAccessMode.WORKSPACE_ONLY,
-                    bindMounts = listOf(WorkspaceBindMount(externalDir, "/external")),
+                    bindMounts = sharedDirs.map { (target, source) ->
+                        WorkspaceBindMount(source, "/$target")
+                    } + WorkspaceBindMount(externalDir, "/external"),
                 )
             )
 

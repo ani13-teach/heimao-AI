@@ -36,7 +36,6 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -56,6 +55,7 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.launch
 import me.rerere.hugeicons.HugeIcons
+import me.rerere.hugeicons.stroke.Add01
 import me.rerere.hugeicons.stroke.ArrowTurnBackward
 import me.rerere.hugeicons.stroke.Bash
 import me.rerere.hugeicons.stroke.ComputerTerminal01
@@ -68,8 +68,14 @@ import me.rerere.hugeicons.stroke.Refresh01
 import me.rerere.hugeicons.stroke.Settings03
 import me.rerere.hugeicons.stroke.Share08
 import me.rerere.rikkahub.Screen
-import me.rerere.rikkahub.data.ai.tools.resolveWorkspaceToolApproval
+import me.rerere.rikkahub.data.db.entity.WorkspaceAuditEvent
 import me.rerere.rikkahub.data.db.entity.WorkspaceEntity
+import me.rerere.rikkahub.data.db.entity.WorkspaceSnapshotEntity
+import me.rerere.rikkahub.data.db.entity.WorkspaceSnapshotReason
+import me.rerere.rikkahub.data.model.redactWorkspaceUrl
+import me.rerere.rikkahub.data.workspace.WorkspaceSnapshotLimitUiState
+import me.rerere.rikkahub.data.workspace.WorkspaceStorageStats
+import me.rerere.rikkahub.utils.toLocalDateTime
 import androidx.compose.ui.res.stringResource
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.ui.components.nav.BackButton
@@ -86,6 +92,8 @@ import me.rerere.workspace.WorkspaceShellStatus
 import me.rerere.workspace.WorkspaceStorageArea
 import org.koin.androidx.compose.koinViewModel
 import org.koin.core.parameter.parametersOf
+import java.time.Instant
+import java.util.concurrent.TimeUnit
 
 @Composable
 fun WorkspaceDetailPage(id: String) {
@@ -99,6 +107,8 @@ fun WorkspaceDetailPage(id: String) {
     var deleteTarget by remember { mutableStateOf<WorkspaceFileEntry?>(null) }
     var showInstallDialog by remember { mutableStateOf(false) }
     var previewImageUri by remember { mutableStateOf<String?>(null) }
+    var restoreTarget by remember { mutableStateOf<WorkspaceSnapshotEntity?>(null) }
+    var deleteSnapshotTarget by remember { mutableStateOf<WorkspaceSnapshotEntity?>(null) }
     val context = LocalContext.current
     val filePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
@@ -186,9 +196,16 @@ fun WorkspaceDetailPage(id: String) {
             when (page) {
                 0 -> WorkspaceBasicPage(
                     workspace = state.workspace,
+                    auditEvents = state.auditEvents,
+                    snapshots = state.snapshots,
+                    storageStats = state.storageStats,
+                    snapshotBusy = state.snapshotBusy,
+                    snapshotLimitExceeded = state.snapshotLimitExceeded,
                     installProgress = installProgress,
                     onInstallRootfs = { showInstallDialog = true },
-                    onToolApprovalChange = vm::setToolApproval,
+                    onCreateSnapshot = vm::createSnapshot,
+                    onRestoreSnapshot = { restoreTarget = it },
+                    onDeleteSnapshot = { deleteSnapshotTarget = it },
                 )
 
                 1 -> WorkspaceFilesPage(
@@ -282,6 +299,77 @@ fun WorkspaceDetailPage(id: String) {
         )
     }
 
+    state.snapshotError?.let { message ->
+        AlertDialog(
+            onDismissRequest = vm::dismissSnapshotError,
+            title = { Text(stringResource(R.string.workspace_detail_snapshot_error)) },
+            text = { Text(message) },
+            confirmButton = {
+                TextButton(onClick = vm::dismissSnapshotError) {
+                    Text(stringResource(R.string.common_confirm))
+                }
+            },
+        )
+    }
+
+    state.snapshotLimitExceeded?.let { limit ->
+        AlertDialog(
+            onDismissRequest = vm::dismissSnapshotLimit,
+            title = { Text(stringResource(R.string.workspace_detail_snapshot_limit_title)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        stringResource(
+                            R.string.workspace_detail_snapshot_limit_current,
+                            limit.currentCount,
+                            limit.maxCount,
+                            limit.currentBytes.fileSizeToString(),
+                            limit.maxBytes.fileSizeToString(),
+                        )
+                    )
+                    Text(stringResource(R.string.workspace_detail_snapshot_limit_instruction))
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = vm::dismissSnapshotLimit) {
+                    Text(stringResource(R.string.workspace_detail_snapshot_limit_open_list))
+                }
+            },
+        )
+    }
+
+    restoreTarget?.let { snapshot ->
+        RikkaConfirmDialog(
+            show = true,
+            title = stringResource(R.string.workspace_detail_snapshot_restore),
+            confirmText = stringResource(R.string.workspace_detail_snapshot_restore),
+            dismissText = stringResource(R.string.common_cancel),
+            onConfirm = {
+                vm.restoreSnapshot(snapshot.id)
+                restoreTarget = null
+            },
+            onDismiss = { restoreTarget = null },
+        ) {
+            Text(stringResource(R.string.workspace_detail_snapshot_restore_confirm))
+        }
+    }
+
+    deleteSnapshotTarget?.let { snapshot ->
+        RikkaConfirmDialog(
+            show = true,
+            title = stringResource(R.string.workspace_detail_snapshot_delete),
+            confirmText = stringResource(R.string.common_delete),
+            dismissText = stringResource(R.string.common_cancel),
+            onConfirm = {
+                vm.deleteSnapshot(snapshot.id)
+                deleteSnapshotTarget = null
+            },
+            onDismiss = { deleteSnapshotTarget = null },
+        ) {
+            Text(stringResource(R.string.workspace_detail_snapshot_delete_confirm))
+        }
+    }
+
     previewImageUri?.let { uri ->
         ImagePreviewDialog(
             images = listOf(uri),
@@ -309,9 +397,16 @@ fun WorkspaceDetailPage(id: String) {
 @Composable
 private fun WorkspaceBasicPage(
     workspace: WorkspaceEntity?,
+    auditEvents: List<WorkspaceAuditEvent>,
+    snapshots: List<WorkspaceSnapshotEntity>,
+    storageStats: WorkspaceStorageStats?,
+    snapshotBusy: Boolean,
+    snapshotLimitExceeded: WorkspaceSnapshotLimitUiState?,
     installProgress: RootfsInstallProgress?,
     onInstallRootfs: () -> Unit,
-    onToolApprovalChange: (String, Boolean) -> Unit,
+    onCreateSnapshot: () -> Unit,
+    onRestoreSnapshot: (WorkspaceSnapshotEntity) -> Unit,
+    onDeleteSnapshot: (WorkspaceSnapshotEntity) -> Unit,
 ) {
     val shellStatus = workspace?.shellStatus
     val installing = installProgress != null || shellStatus == WorkspaceShellStatus.INSTALLING.name
@@ -346,6 +441,29 @@ private fun WorkspaceBasicPage(
                     WorkspaceInfoRow(stringResource(R.string.workspace_detail_shell_status), workspace?.shellStatus?.toShellStatusLabel() ?: "-")
                 }
             }
+        }
+
+        item {
+            WorkspaceRuntimeMetadataCard(workspace?.runtimeMetadataOrDefault())
+        }
+
+        item {
+            WorkspaceStorageCard(storageStats)
+        }
+
+        item {
+            WorkspaceSnapshotsCard(
+                snapshots = snapshots,
+                busy = snapshotBusy,
+                limitExceeded = snapshotLimitExceeded,
+                onCreate = onCreateSnapshot,
+                onRestore = onRestoreSnapshot,
+                onDelete = onDeleteSnapshot,
+            )
+        }
+
+        item {
+            WorkspaceAuditCard(auditEvents)
         }
 
         item {
@@ -387,22 +505,260 @@ private fun WorkspaceBasicPage(
                 }
             }
         }
+    }
+}
 
-        item {
-            WorkspaceToolApprovalCard(
-                workspace = workspace,
-                onToolApprovalChange = onToolApprovalChange,
+@Composable
+private fun WorkspaceAuditCard(events: List<WorkspaceAuditEvent>) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CustomColors.cardColorsOnSurfaceContainer,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = stringResource(R.string.workspace_detail_audit_title),
+                style = MaterialTheme.typography.titleMedium,
             )
+            Text(
+                text = stringResource(R.string.workspace_detail_audit_app_side),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (events.isEmpty()) {
+                Text(
+                    text = stringResource(R.string.workspace_detail_audit_empty),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            } else {
+                events.take(20).forEach { event ->
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            text = "${event.operation} · ${event.target}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        val timestamp = Instant.ofEpochMilli(event.startedAt).toLocalDateTime()
+                        val status = buildString {
+                            append(event.result)
+                            append(" · ")
+                            append(event.actor)
+                            append(" · ")
+                            append(timestamp)
+                            event.exitCode?.let {
+                                append(" · exit=")
+                                append(it)
+                            }
+                            if (event.timedOut) append(" · timeout")
+                        }
+                        Text(
+                            text = status,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+            }
         }
     }
 }
 
 @Composable
-private fun WorkspaceToolApprovalCard(
-    workspace: WorkspaceEntity?,
-    onToolApprovalChange: (String, Boolean) -> Unit,
+private fun WorkspaceStorageCard(stats: WorkspaceStorageStats?) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CustomColors.cardColorsOnSurfaceContainer,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = stringResource(R.string.workspace_detail_storage_title),
+                style = MaterialTheme.typography.titleMedium,
+            )
+            if (stats == null) {
+                Text(stringResource(R.string.workspace_detail_loading))
+            } else {
+                WorkspaceInfoRow(
+                    stringResource(R.string.workspace_detail_storage_files),
+                    stats.filesBytes.fileSizeToString(),
+                )
+                WorkspaceInfoRow(
+                    stringResource(R.string.workspace_detail_storage_linux),
+                    stats.linuxBytes.fileSizeToString(),
+                )
+                WorkspaceInfoRow(
+                    stringResource(R.string.workspace_detail_storage_snapshots),
+                    "${stats.snapshotsBytes.fileSizeToString()} · ${stats.snapshotCount}/${stats.maxSnapshotsPerWorkspace}",
+                )
+                WorkspaceInfoRow(
+                    stringResource(R.string.workspace_detail_storage_shell_timeout),
+                    stringResource(
+                        R.string.workspace_detail_storage_seconds,
+                        TimeUnit.MILLISECONDS.toSeconds(stats.shellMaxTimeoutMillis),
+                    ),
+                )
+                Text(
+                    text = stringResource(
+                        R.string.workspace_detail_snapshot_soft_limit,
+                        stats.maxSnapshotsPerWorkspace,
+                        stats.maxSnapshotTotalBytes.fileSizeToString(),
+                    ),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = stringResource(R.string.workspace_detail_snapshot_app_side),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun WorkspaceSnapshotsCard(
+    snapshots: List<WorkspaceSnapshotEntity>,
+    busy: Boolean,
+    limitExceeded: WorkspaceSnapshotLimitUiState?,
+    onCreate: () -> Unit,
+    onRestore: (WorkspaceSnapshotEntity) -> Unit,
+    onDelete: (WorkspaceSnapshotEntity) -> Unit,
 ) {
-    val overrides = workspace?.toolApprovalOverrides().orEmpty()
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CustomColors.cardColorsOnSurfaceContainer,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = stringResource(R.string.workspace_detail_snapshots_title),
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f),
+                )
+                IconButton(onClick = onCreate, enabled = !busy) {
+                    Icon(
+                        HugeIcons.Add01,
+                        contentDescription = stringResource(R.string.workspace_detail_snapshot_create),
+                    )
+                }
+            }
+            Text(
+                text = stringResource(R.string.workspace_detail_snapshot_scope),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            limitExceeded?.let { limit ->
+                Text(
+                    text = stringResource(
+                        R.string.workspace_detail_snapshot_limit_current,
+                        limit.currentCount,
+                        limit.maxCount,
+                        limit.currentBytes.fileSizeToString(),
+                        limit.maxBytes.fileSizeToString(),
+                    ) + " " + stringResource(R.string.workspace_detail_snapshot_limit_instruction),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+            if (snapshots.isEmpty()) {
+                Text(
+                    text = stringResource(R.string.workspace_detail_snapshot_empty),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            } else {
+                snapshots.forEach { snapshot ->
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        val reason = if (snapshot.snapshotReason() == WorkspaceSnapshotReason.PRE_RESTORE) {
+                            stringResource(R.string.workspace_detail_snapshot_reason_pre_restore)
+                        } else {
+                            stringResource(R.string.workspace_detail_snapshot_reason_manual)
+                        }
+                        Text(
+                            text = "$reason · ${Instant.ofEpochMilli(snapshot.createdAt).toLocalDateTime()}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            text = "${snapshot.size.fileSizeToString()} · ${snapshot.manifestHash.take(12)}…",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            TextButton(
+                                onClick = { onRestore(snapshot) },
+                                enabled = !busy,
+                            ) {
+                                Icon(HugeIcons.ArrowTurnBackward, contentDescription = null)
+                                Text(
+                                    text = stringResource(R.string.workspace_detail_snapshot_restore),
+                                    modifier = Modifier.padding(start = 4.dp),
+                                )
+                            }
+                            TextButton(
+                                onClick = { onDelete(snapshot) },
+                                enabled = !busy,
+                            ) {
+                                Icon(HugeIcons.Delete01, contentDescription = null)
+                                Text(
+                                    text = stringResource(R.string.workspace_detail_snapshot_delete),
+                                    modifier = Modifier.padding(start = 4.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun WorkspaceRuntimeMetadataCard(
+    metadata: me.rerere.rikkahub.data.model.WorkspaceRuntimeMetadata?,
+) {
+    val source = metadata?.sourceUrl?.let(::redactWorkspaceUrl).orEmpty().ifBlank { "-" }
+    val digest = metadata?.archiveSha256.orEmpty().ifBlank { "-" }
+    val archiveSize = metadata?.archiveSize?.takeIf { it > 0 }?.fileSizeToString() ?: "-"
+    val architecture = listOfNotNull(
+        metadata?.expectedArchitecture?.takeIf { it.isNotBlank() }?.let { "expected=$it" },
+        metadata?.detectedArchitecture?.takeIf { it.isNotBlank() }?.let { "detected=$it" },
+    ).joinToString(" / ").ifBlank { "-" }
+    val supportedAbis = metadata?.supportedAbis.orEmpty().joinToString(", ").ifBlank { "-" }
+    val distro = listOfNotNull(
+        metadata?.distroId?.takeIf { it.isNotBlank() },
+        metadata?.distroVersion?.takeIf { it.isNotBlank() },
+    ).joinToString(" ").ifBlank { "-" }
+    val installedAt = metadata?.installedAt
+        ?.let { Instant.ofEpochMilli(it).toLocalDateTime() }
+        ?: "-"
+    val tools = metadata?.toolVersions
+        ?.toSortedMap()
+        ?.entries
+        ?.joinToString(" · ") { "${it.key} ${it.value}" }
+        ?.ifBlank { "-" }
+        ?: "-"
+    val warnings = metadata?.warnings.orEmpty().joinToString(" · ").ifBlank { "-" }
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -412,65 +768,30 @@ private fun WorkspaceToolApprovalCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(
-                    text = stringResource(R.string.workspace_detail_tool_approval),
-                    style = MaterialTheme.typography.titleMedium,
-                )
-                Text(
-                    text = stringResource(R.string.workspace_detail_tool_approval_desc),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-
-            workspaceToolApprovalItems().forEach { (toolName, label) ->
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(
-                        modifier = Modifier.weight(1f),
-                        verticalArrangement = Arrangement.spacedBy(2.dp),
-                    ) {
-                        Text(
-                            text = label,
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
-                        Text(
-                            text = toolName,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                    Switch(
-                        checked = resolveWorkspaceToolApproval(toolName, overrides),
-                        onCheckedChange = { onToolApprovalChange(toolName, it) },
-                        enabled = workspace != null,
-                    )
-                }
-            }
+            Text(
+                text = stringResource(R.string.workspace_detail_runtime_metadata),
+                style = MaterialTheme.typography.titleMedium,
+            )
+            WorkspaceInfoRow(stringResource(R.string.workspace_detail_runtime_source), source, maxLines = 2)
+            WorkspaceInfoRow(stringResource(R.string.workspace_detail_runtime_digest), digest, maxLines = 2)
+            WorkspaceInfoRow(stringResource(R.string.workspace_detail_runtime_archive_size), archiveSize)
+            WorkspaceInfoRow(stringResource(R.string.workspace_detail_runtime_architecture), architecture)
+            WorkspaceInfoRow(stringResource(R.string.workspace_detail_runtime_supported_abis), supportedAbis)
+            WorkspaceInfoRow(stringResource(R.string.workspace_detail_runtime_distro), distro)
+            WorkspaceInfoRow(stringResource(R.string.workspace_detail_runtime_installed_at), installedAt)
+            WorkspaceInfoRow(stringResource(R.string.workspace_detail_runtime_tools), tools, maxLines = 3)
+            WorkspaceInfoRow(stringResource(R.string.workspace_detail_runtime_warnings), warnings, maxLines = 3)
         }
     }
 }
 
 @Composable
-private fun workspaceToolApprovalItems() = listOf(
-    "workspace_read_file" to stringResource(R.string.workspace_detail_tool_read_file),
-    "workspace_write_file" to stringResource(R.string.workspace_detail_tool_write_file),
-    "workspace_edit_file" to stringResource(R.string.workspace_detail_tool_edit_file),
-    "workspace_shell" to stringResource(R.string.workspace_detail_tool_shell),
-)
-
-@Composable
 private fun WorkspaceInfoRow(
     label: String,
     value: String,
+    maxLines: Int = 1,
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -489,7 +810,7 @@ private fun WorkspaceInfoRow(
             text = value,
             modifier = Modifier.weight(0.65f),
             style = MaterialTheme.typography.bodyMedium,
-            maxLines = 1,
+            maxLines = maxLines,
             overflow = TextOverflow.Ellipsis,
         )
     }

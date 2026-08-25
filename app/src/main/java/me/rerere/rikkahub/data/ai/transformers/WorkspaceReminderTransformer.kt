@@ -10,7 +10,7 @@ import me.rerere.workspace.WorkspaceShellStatus
 /**
  * Workspace 系统提示注入转换器
  *
- * 当助手绑定了一个 shell 已就绪的 workspace 时, 在系统提示词中追加一段引导,
+ * 当会话记录了一个 shell 已就绪的 workspace 时, 在系统提示词中追加一段引导,
  * 让模型了解 workspace 环境与 workspace_* 工具的使用方式。
  */
 class WorkspaceReminderTransformer(
@@ -20,7 +20,7 @@ class WorkspaceReminderTransformer(
         ctx: TransformerContext,
         messages: List<UIMessage>,
     ): List<UIMessage> {
-        val workspaceId = ctx.assistant.workspaceId?.toString() ?: return messages
+        val workspaceId = ctx.workspaceId ?: return messages
         val workspace = workspaceRepository.getById(workspaceId) ?: return messages
         // 与 ChatService.createWorkspaceToolsIfReady 保持一致: 仅在 shell 就绪时注入
         if (workspace.shellStatus != WorkspaceShellStatus.READY.name) return messages
@@ -44,11 +44,14 @@ private fun buildWorkspacePrompt(workspace: WorkspaceEntity, cwd: String? = null
     appendLine("You have access to a persistent Linux workspace named \"${workspace.name}\".")
     appendLine("- Your file access is confined to `/workspace`; files written there persist across turns of this conversation.")
     appendLine("- Every path passed to a workspace file tool must be absolute and start with `/workspace` (for example `/workspace/notes.md`).")
-    appendLine("- AI shell commands do not receive the private Linux Rootfs, shared app directories, or host pseudo-filesystems. A basic read-only Android command runtime is available at `/bin` and `/usr/bin`. Keep all user-file operations under `/workspace`.")
+    appendLine("- `workspace_shell` runs in this workspace's private Linux Rootfs. Its working directory is always `/workspace` or a subdirectory, and apt, pip, npm, Go, Cargo, and other CLI tools installed there persist across turns.")
+    appendLine("- The AI workspace channel does not mount or expose `/skills`, `/upload`, `/tool_outputs`, `/proc`, `/sys`, or external app directories. The PRoot guest root is not Android host root.")
+    appendLine("- Workspace file and shell tools are internal workspace operations and do not require per-call approval.")
+    appendLine("- Keep all user-file operations under `/workspace`.")
     appendLine("- Available tools:")
     appendLine("  - `workspace_read_file`: read file contents.")
     appendLine("  - `workspace_write_file` / `workspace_edit_file`: create files, or make precise edits to existing files.")
-    appendLine("  - `workspace_shell`: run shell commands with `/workspace` as the working files area.")
+    appendLine("  - `workspace_shell`: run commands and install persistent workspace-local tools; pass `cwd` as a relative path or an absolute path under `/workspace`.")
     appendLine("- Prefer `workspace_shell` for tasks that standard Unix tools handle well, and prefer `workspace_edit_file` for targeted edits over rewriting whole files.")
     if (!cwd.isNullOrBlank()) {
         appendLine("- Current working directory: `$cwd`. Use this as the default context for file operations and shell commands.")

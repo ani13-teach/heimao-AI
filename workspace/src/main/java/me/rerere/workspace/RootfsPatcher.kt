@@ -2,32 +2,50 @@ package me.rerere.workspace
 
 import java.io.File
 import java.nio.file.Files
+import java.nio.file.LinkOption
 
 class RootfsPatcher {
     fun patch(
         linuxDir: File,
         options: RootfsPatchOptions = RootfsPatchOptions(),
     ) {
-        val etcDir = File(linuxDir, "etc")
-        if (!etcDir.isDirectory) return
+        val rootfsDir = RootfsPathSafety.ensureRootDirectory(linuxDir)
+        // /tmp and /var/tmp are required by apt, Python packaging tools, and ordinary
+        // shell commands. Keep preparing them even for a partial rootfs so a later
+        // capability check can report the actual missing executable instead of a
+        // misleading temporary-directory failure. These paths are created and checked
+        // component-by-component without following symlinks.
+        ensureTempDirs(rootfsDir)
 
-        ensureRootfsDns(etcDir, options.nameservers)
-        ensureHosts(etcDir, options.hostname)
-        ensureHostname(etcDir, options.hostname)
-        ensureLocale(etcDir, options.locale)
-        ensureGroupNames(etcDir, options.groupIds.ifEmpty { currentSupplementaryGroupIds() })
-        ensureTempDirs(linuxDir)
+        val etcDir = rootfsDir.resolveRootfsPathNoFollow("etc")
+        if (!Files.isDirectory(etcDir.toPath(), LinkOption.NOFOLLOW_LINKS)) return
+
+        ensureRootfsDns(rootfsDir, options.nameservers)
+        ensureHosts(rootfsDir, options.hostname)
+        ensureHostname(rootfsDir, options.hostname)
+        ensureLocale(rootfsDir, options.locale)
+        ensureGroupNames(rootfsDir, options.groupIds.ifEmpty { currentSupplementaryGroupIds() })
     }
 
     private fun ensureRootfsDns(
-        etcDir: File,
+        rootfsDir: File,
         nameservers: List<String>,
     ) {
-        val resolvConf = File(etcDir, "resolv.conf")
+        // resolv.conf is intentionally special: ordinary Linux rootfs archives commonly
+        // contain a symlink here. Replace the link itself, never its target, so DNS setup
+        // remains compatible without allowing a write outside the rootfs.
+        val resolvConf = rootfsDir.resolveRootfsPathNoFollow(
+            "etc/resolv.conf",
+            allowFinalSymlink = true,
+        )
+        val isSymlink = Files.isSymbolicLink(resolvConf.toPath())
+        val exists = Files.exists(resolvConf.toPath(), LinkOption.NOFOLLOW_LINKS)
         val shouldWrite = when {
-            Files.isSymbolicLink(resolvConf.toPath()) -> true
-            !resolvConf.exists() -> true
-            !resolvConf.isFile -> true
+            isSymlink -> true
+            !exists -> true
+            !Files.isRegularFile(resolvConf.toPath(), LinkOption.NOFOLLOW_LINKS) -> {
+                error("Rootfs patch target is not a regular file: ${resolvConf.path}")
+            }
             else -> resolvConf.readText()
                 .lineSequence()
                 .filter { it.trimStart().startsWith("nameserver ") }
@@ -38,8 +56,8 @@ class RootfsPatcher {
         }
         if (!shouldWrite) return
 
-        if (resolvConf.exists() || Files.isSymbolicLink(resolvConf.toPath())) {
-            resolvConf.delete()
+        if (exists || isSymlink) {
+            Files.deleteIfExists(resolvConf.toPath())
         }
 
         val servers = nameservers
@@ -57,9 +75,14 @@ class RootfsPatcher {
         )
     }
 
-    private fun ensureHosts(etcDir: File, hostname: String) {
-        val hosts = File(etcDir, "hosts")
-        val lines = if (hosts.isFile) hosts.readLines() else emptyList()
+    private fun ensureHosts(rootfsDir: File, hostname: String) {
+        val hosts = rootfsDir.resolveRootfsPathNoFollow("etc/hosts")
+        requireRegularFileOrMissing(hosts)
+        val lines = if (Files.isRegularFile(hosts.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+            hosts.readLines()
+        } else {
+            emptyList()
+        }
         val hasIpv4Localhost = lines.any { line ->
             val normalized = line.substringBefore('#').trim().split(WHITESPACE_REGEX)
             normalized.firstOrNull() == "127.0.0.1" && "localhost" in normalized.drop(1)
@@ -70,10 +93,12 @@ class RootfsPatcher {
         }
         if (hasIpv4Localhost && hasIpv6Localhost) return
 
-        hosts.parentFile?.mkdirs()
         hosts.appendText(
             buildString {
-                if (hosts.exists() && hosts.length() > 0 && !hosts.readText().endsWith('\n')) {
+                if (Files.exists(hosts.toPath(), LinkOption.NOFOLLOW_LINKS) &&
+                    hosts.length() > 0 &&
+                    !hosts.readText().endsWith('\n')
+                ) {
                     appendLine()
                 }
                 if (!hasIpv4Localhost) {
@@ -91,24 +116,33 @@ class RootfsPatcher {
         )
     }
 
-    private fun ensureHostname(etcDir: File, hostname: String) {
-        val target = File(etcDir, "hostname")
-        if (target.isFile && target.readText().trim().isNotBlank()) return
+    private fun ensureHostname(rootfsDir: File, hostname: String) {
+        val target = rootfsDir.resolveRootfsPathNoFollow("etc/hostname")
+        requireRegularFileOrMissing(target)
+        if (Files.isRegularFile(target.toPath(), LinkOption.NOFOLLOW_LINKS) &&
+            target.readText().trim().isNotBlank()
+        ) return
         target.writeText("${hostname.ifBlank { DEFAULT_HOSTNAME }}\n")
     }
 
-    private fun ensureLocale(etcDir: File, locale: String) {
-        val defaultDir = File(etcDir, "default").apply { mkdirs() }
-        val target = File(defaultDir, "locale")
-        val lines = if (target.isFile) target.readLines().toMutableList() else mutableListOf()
+    private fun ensureLocale(rootfsDir: File, locale: String) {
+        rootfsDir.ensureRootfsDirectory("etc/default")
+        val target = rootfsDir.resolveRootfsPathNoFollow("etc/default/locale")
+        requireRegularFileOrMissing(target)
+        val lines = if (Files.isRegularFile(target.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+            target.readLines().toMutableList()
+        } else {
+            mutableListOf()
+        }
         if (lines.any { it.trim().startsWith("LANG=") }) return
         lines += "LANG=$locale"
         target.writeText(lines.joinToString(separator = "\n", postfix = "\n"))
     }
 
-    private fun ensureGroupNames(etcDir: File, groupIds: List<Long>) {
-        val target = File(etcDir, "group")
-        if (!target.exists()) {
+    private fun ensureGroupNames(rootfsDir: File, groupIds: List<Long>) {
+        val target = rootfsDir.resolveRootfsPathNoFollow("etc/group")
+        requireRegularFileOrMissing(target)
+        if (!Files.exists(target.toPath(), LinkOption.NOFOLLOW_LINKS)) {
             target.writeText("root:x:0:\n")
         }
         val lines = target.readLines().toMutableList()
@@ -138,19 +172,32 @@ class RootfsPatcher {
         )
     }
 
-    private fun ensureTempDirs(linuxDir: File) {
-        listOf("tmp", "var/tmp", "root").forEach { path ->
-            File(linuxDir, path).mkdirs()
-        }
-        listOf(File(linuxDir, "tmp"), File(linuxDir, "var/tmp")).forEach { dir ->
+    private fun ensureTempDirs(rootfsDir: File) {
+        val tempDirs = listOf(
+            rootfsDir.ensureRootfsDirectory("tmp"),
+            rootfsDir.ensureRootfsDirectory("var/tmp"),
+        )
+        tempDirs.forEach { dir ->
             dir.setReadable(true, false)
             dir.setWritable(true, false)
             dir.setExecutable(true, false)
         }
-        File(linuxDir, "root").apply {
+        rootfsDir.ensureRootfsDirectory("root").apply {
             setReadable(true, true)
             setWritable(true, true)
             setExecutable(true, true)
+        }
+    }
+
+    private fun requireRegularFileOrMissing(target: File) {
+        val path = target.toPath()
+        require(!Files.isSymbolicLink(path)) {
+            "Unsafe symbolic link in rootfs patch target: ${target.path}"
+        }
+        if (Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
+            require(Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+                "Rootfs patch target is not a regular file: ${target.path}"
+            }
         }
     }
 

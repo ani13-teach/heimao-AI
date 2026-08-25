@@ -18,8 +18,17 @@ enum class WorkspaceShellStatus {
 }
 
 enum class WorkspaceShellAccessMode {
+    /** The user terminal: the complete rootfs plus its configured external mounts. */
     FULL_ROOTFS,
+
+    /** Internal files-only channel retained for limited callers and boundary tests; not model-facing. */
     WORKSPACE_ONLY,
+
+    /**
+     * An AI package-development shell rooted at this workspace's private Linux rootfs.
+     * PRoot's root is guest root only; this mode never grants Android host-root access.
+     */
+    WORKSPACE_PACKAGE,
 }
 
 enum class WorkspaceStorageArea {

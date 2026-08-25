@@ -124,7 +124,10 @@ class WorkspaceDocumentsProvider : DocumentsProvider() {
     ): String {
         val parent = parseDocId(parentDocumentId)
         require(!parent.isRoot) { "Cannot create document at root" }
-        manager().ensureWorkspace(parent.root)
+        require(allWorkspaces().any { it.root == parent.root }) {
+            "Workspace no longer exists: ${parent.root}"
+        }
+        manager().ensureWorkspaceFiles(parent.root)
         val parentDir = resolveFile(parent.root, parent.relPath)
         require(parentDir.isDirectory) { "Parent is not a directory" }
         val target = uniqueChild(parentDir, displayName)

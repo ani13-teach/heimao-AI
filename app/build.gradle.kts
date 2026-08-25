@@ -238,8 +238,9 @@ dependencies {
     implementation(libs.androidx.paging.runtime)
     implementation(libs.androidx.paging.compose)
 
-    // Apache Commons Text
+    // Apache Commons Text / streaming TAR archive support
     implementation(libs.commons.text)
+    implementation(libs.commons.compress)
 
     // Toast (Sonner)
     implementation(libs.sonner)

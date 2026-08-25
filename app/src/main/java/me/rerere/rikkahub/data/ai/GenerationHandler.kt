@@ -19,6 +19,7 @@ import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.core.Tool
 import me.rerere.ai.provider.CustomBody
+import me.rerere.ai.provider.LogicalPrompt
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.Provider
 import me.rerere.ai.provider.ProviderManager
@@ -88,11 +89,13 @@ class GenerationHandler(
         outputTransformers: List<OutputMessageTransformer> = emptyList(),
         assistant: Assistant,
         memories: List<AssistantMemory>? = null,
+        promptCacheKey: String? = null,
         tools: List<Tool> = emptyList(),
         maxSteps: Int = 256,
         processingStatus: MutableStateFlow<String?> = MutableStateFlow(null),
         conversationSystemPrompt: String? = null,
         conversationModeInjectionIds: Set<Uuid> = emptySet(),
+        workspaceId: String? = null,
         workspaceCwd: String? = null,
         useLayeredMemory: Boolean = false,
     ): Flow<GenerationChunk> = flow {
@@ -220,6 +223,8 @@ class GenerationHandler(
                     processingStatus = processingStatus,
                     conversationSystemPrompt = conversationSystemPrompt,
                     conversationModeInjectionIds = conversationModeInjectionIds,
+                    promptCacheKey = promptCacheKey,
+                    workspaceId = workspaceId,
                     workspaceCwd = workspaceCwd,
                 )
                 messages = messages.visualTransforms(
@@ -351,7 +356,7 @@ class GenerationHandler(
                                     toolCallId = tool.toolCallId,
                                     output = result,
                                     hasShellAccess = hasShellAccess,
-                                    workspaceId = assistant.workspaceId?.toString(),
+                                    workspaceId = workspaceId,
                                 )
                             )
                         }.onFailure {
@@ -424,38 +429,50 @@ class GenerationHandler(
         processingStatus: MutableStateFlow<String?> = MutableStateFlow(null),
         conversationSystemPrompt: String? = null,
         conversationModeInjectionIds: Set<Uuid> = emptySet(),
+        promptCacheKey: String? = null,
+        workspaceId: String? = null,
         workspaceCwd: String? = null,
         layeredMemoryContext: LayeredMemoryContext? = null,
     ) {
-        val internalMessages = buildList {
-            val system = buildString {
-                val effectiveSystemPrompt =
-                    if (assistant.allowConversationSystemPrompt && !conversationSystemPrompt.isNullOrBlank()) {
-                        conversationSystemPrompt
-                    } else {
-                        assistant.systemPrompt
-                    }
-                if (effectiveSystemPrompt.isNotBlank()) {
-                    append(effectiveSystemPrompt)
-                }
-
-                // 记忆
-                if (assistant.enableMemory) {
-                    appendLine()
-                    if (layeredMemoryContext != null) {
-                        append(buildLayeredMemoryPrompt(layeredMemoryContext))
-                    } else {
-                        append(buildMemoryPrompt(memories = memories))
-                    }
-                }
-                // 工具prompt
-                tools.forEach { tool ->
-                    appendLine()
-                    append(tool.systemPrompt(model, messages))
-                }
+        val effectiveSystemPrompt =
+            if (assistant.allowConversationSystemPrompt && !conversationSystemPrompt.isNullOrBlank()) {
+                conversationSystemPrompt
+            } else {
+                assistant.systemPrompt
             }
-            if (system.isNotBlank()) add(UIMessage.system(prompt = system))
-            addAll(messages.limitContext(assistant.contextMessageLimit))
+        val stableSystemPrompt = buildString {
+            if (!effectiveSystemPrompt.isNullOrBlank()) append(effectiveSystemPrompt)
+            // Tool definitions and their prompt text are stable prefix material.
+            tools.forEach { tool ->
+                appendLine()
+                append(tool.systemPrompt(model, messages))
+            }
+        }
+        val limitedMessages = messages.limitContext(assistant.contextMessageLimit)
+        val memoryPrompt = if (assistant.enableMemory) {
+            if (layeredMemoryContext != null) {
+                buildLayeredMemoryPrompt(layeredMemoryContext)
+            } else {
+                buildMemoryPrompt(memories = memories)
+            }
+        } else {
+            ""
+        }
+        val hasMemoryContent = if (!assistant.enableMemory) {
+            false
+        } else if (layeredMemoryContext != null) {
+            layeredMemoryContext.indexCount > 0 || layeredMemoryContext.activeCount > 0
+        } else {
+            memories.any { it.content.isNotBlank() }
+        }
+
+        // Transformers still see the same stable prompt, memory and conversation material,
+        // but the final logical prompt is assembled only after transformation so every
+        // provider receives the same history/transient/memory/latest-user order.
+        val transformed = buildList {
+            add(UIMessage.system(prompt = stableSystemPrompt))
+            addAll(limitedMessages)
+            if (hasMemoryContent) add(UIMessage.system(prompt = memoryPrompt))
         }.transforms(
             transformers = transformers,
             context = context,
@@ -464,8 +481,32 @@ class GenerationHandler(
             settings = settings,
             conversationModeInjectionIds = conversationModeInjectionIds,
             processingStatus = processingStatus,
+            workspaceId = workspaceId,
             workspaceCwd = workspaceCwd,
-        ).withAdditionalContextMessages(additionalContextMessages)
+        )
+        val systemMessages = transformed.filter { it.role == MessageRole.SYSTEM }
+        val stableSystem = systemMessages.firstOrNull() ?: UIMessage.system(stableSystemPrompt)
+        val memoryMessages = if (hasMemoryContent) systemMessages.drop(1) else emptyList()
+        val conversationMessages = transformed.filter { it.role != MessageRole.SYSTEM }
+        val latestUserIndex = conversationMessages.indexOfLast { it.role == MessageRole.USER }
+        val logicalPrompt = LogicalPrompt(
+            tools = tools,
+            system = listOf(stableSystem),
+            history = if (latestUserIndex >= 0) {
+                conversationMessages.take(latestUserIndex)
+            } else {
+                conversationMessages
+            },
+            transientContext = additionalContextMessages,
+            memory = memoryMessages,
+            latestUser = conversationMessages.getOrNull(latestUserIndex),
+            currentToolLoop = if (latestUserIndex >= 0) {
+                conversationMessages.drop(latestUserIndex + 1)
+            } else {
+                emptyList()
+            },
+        )
+        val internalMessages = logicalPrompt.toMessages()
 
         var messages: List<UIMessage> = messages
         val params = TextGenerationParams(
@@ -482,7 +523,10 @@ class GenerationHandler(
             customBody = buildList {
                 addAll(assistant.customBodies)
                 addAll(model.customBodies)
-            }
+            },
+            promptCacheEnabled = settings.promptCacheEnabled,
+            promptCacheKey = promptCacheKey,
+            logicalPrompt = logicalPrompt,
         )
         if (stream) {
             val streamChunkHandler = StreamChunkHandler(model)

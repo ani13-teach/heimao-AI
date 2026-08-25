@@ -172,7 +172,7 @@ class WorkspaceFileSystem(
         }
 
     private fun resolvePath(root: File, path: String): File {
-        root.mkdirs()
+        require(root.isDirectory) { "Workspace root does not exist: ${root.path}" }
         val normalized = path
             .replace('\\', '/')
             .trim()

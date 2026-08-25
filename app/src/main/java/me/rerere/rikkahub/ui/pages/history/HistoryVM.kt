@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.SettingsStore
+import me.rerere.rikkahub.data.datastore.getAssistantById
 import me.rerere.rikkahub.data.datastore.getCurrentAssistant
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.repository.ConversationRepository
@@ -76,6 +77,7 @@ class HistoryVM(
             summarizerAssistantId = summarizerAssistantId,
             sourceConversationIds = sourceConversationIds,
             title = title,
+            workspaceId = settings.value.getAssistantById(summarizerAssistantId)?.workspaceId,
         )
     }
 

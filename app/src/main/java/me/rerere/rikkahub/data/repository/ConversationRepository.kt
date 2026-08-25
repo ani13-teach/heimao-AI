@@ -357,6 +357,7 @@ class ConversationRepository(
         summarizerAssistantId: Uuid,
         sourceConversationIds: List<Uuid>,
         title: String,
+        workspaceId: Uuid? = null,
     ): Conversation {
         val normalizedIds = sourceConversationIds.distinct()
         require(normalizedIds.isNotEmpty()) { "At least one source conversation is required" }
@@ -369,6 +370,7 @@ class ConversationRepository(
             assistantId = summarizerAssistantId,
             title = title,
             messageNodes = emptyList(),
+            workspaceId = workspaceId,
             summarySourceAssistantId = sourceAssistantId,
             summarySourceConversationIds = normalizedIds,
         )
@@ -387,7 +389,7 @@ class ConversationRepository(
 
     suspend fun insertConversation(conversation: Conversation): Conversation {
         val persistedConversation = database.withTransaction {
-            val numberedConversation = assignConversationNumber(conversation)
+            val numberedConversation = assignConversationNumber(conversation.normalizeWorkspaceState())
             conversationDAO.insert(
                 conversationToConversationEntity(numberedConversation)
             )
@@ -401,10 +403,18 @@ class ConversationRepository(
     suspend fun updateConversation(conversation: Conversation): Conversation {
         val persistedConversation = database.withTransaction {
             val existing = conversationDAO.getConversationById(conversation.id.toString())
-            val numberedConversation = if (existing != null) {
-                conversation.copy(conversationNumber = existing.conversationNumber)
+            val workspaceSafeConversation = (if (
+                existing != null &&
+                parsePersistedWorkspaceId(existing.workspaceId) != conversation.workspaceId
+            ) {
+                conversation.copy(workspaceCwd = null)
             } else {
-                assignConversationNumber(conversation)
+                conversation
+            }).normalizeWorkspaceState()
+            val numberedConversation = if (existing != null) {
+                workspaceSafeConversation.copy(conversationNumber = existing.conversationNumber)
+            } else {
+                assignConversationNumber(workspaceSafeConversation)
             }
             conversationDAO.update(
                 conversationToConversationEntity(numberedConversation)
@@ -520,26 +530,28 @@ class ConversationRepository(
     }
 
     fun conversationToConversationEntity(conversation: Conversation): ConversationEntity {
-        require(conversation.messageNodes.none { it.messages.any { message -> message.hasBase64Part() } })
+        val normalizedConversation = conversation.normalizeWorkspaceState()
+        require(normalizedConversation.messageNodes.none { it.messages.any { message -> message.hasBase64Part() } })
         return ConversationEntity(
-            id = conversation.id.toString(),
-            title = conversation.title,
+            id = normalizedConversation.id.toString(),
+            title = normalizedConversation.title,
             nodes = "[]",  // nodes 现在存储在单独的表中
-            createAt = conversation.createAt.toEpochMilli(),
-            updateAt = conversation.updateAt.toEpochMilli(),
-            assistantId = conversation.assistantId.toString(),
-            chatSuggestions = JsonInstant.encodeToString(conversation.chatSuggestions),
-            isPinned = conversation.isPinned,
-            customSystemPrompt = conversation.customSystemPrompt ?: "",
-            modeInjectionIds = JsonInstant.encodeToString(conversation.modeInjectionIds),
-            workspaceCwd = conversation.workspaceCwd ?: "",
-            folderId = conversation.folderId?.toString() ?: "",
-            conversationNumber = conversation.conversationNumber,
-            summarySourceAssistantId = conversation.summarySourceAssistantId?.toString() ?: "",
+            createAt = normalizedConversation.createAt.toEpochMilli(),
+            updateAt = normalizedConversation.updateAt.toEpochMilli(),
+            assistantId = normalizedConversation.assistantId.toString(),
+            chatSuggestions = JsonInstant.encodeToString(normalizedConversation.chatSuggestions),
+            isPinned = normalizedConversation.isPinned,
+            customSystemPrompt = normalizedConversation.customSystemPrompt ?: "",
+            modeInjectionIds = JsonInstant.encodeToString(normalizedConversation.modeInjectionIds),
+            workspaceId = normalizedConversation.workspaceId?.toString(),
+            workspaceCwd = normalizedConversation.workspaceCwd ?: "",
+            folderId = normalizedConversation.folderId?.toString() ?: "",
+            conversationNumber = normalizedConversation.conversationNumber,
+            summarySourceAssistantId = normalizedConversation.summarySourceAssistantId?.toString() ?: "",
             summarySourceConversationIds = JsonInstant.encodeToString(
-                conversation.summarySourceConversationIds.map { it.toString() }
+                normalizedConversation.summarySourceConversationIds.map { it.toString() }
             ),
-            summaryContext = conversation.summaryContext,
+            summaryContext = normalizedConversation.summaryContext,
         )
     }
 
@@ -547,6 +559,7 @@ class ConversationRepository(
         conversationEntity: ConversationEntity,
         messageNodes: List<MessageNode>
     ): Conversation {
+        val workspaceId = parsePersistedWorkspaceId(conversationEntity.workspaceId)
         return Conversation(
             id = Uuid.parse(conversationEntity.id),
             title = conversationEntity.title,
@@ -558,7 +571,8 @@ class ConversationRepository(
             isPinned = conversationEntity.isPinned,
             customSystemPrompt = conversationEntity.customSystemPrompt.ifEmpty { null },
             modeInjectionIds = JsonInstant.decodeFromString(conversationEntity.modeInjectionIds),
-            workspaceCwd = conversationEntity.workspaceCwd.ifEmpty { null },
+            workspaceId = workspaceId,
+            workspaceCwd = workspaceId?.let { conversationEntity.workspaceCwd.ifEmpty { null } },
             folderId = conversationEntity.folderId.ifEmpty { null }?.let { Uuid.parse(it) },
             conversationNumber = conversationEntity.conversationNumber,
             summarySourceAssistantId = conversationEntity.summarySourceAssistantId
@@ -600,6 +614,7 @@ class ConversationRepository(
     }
 
     private fun conversationSummaryToConversation(entity: LightConversationEntity): Conversation {
+        val workspaceId = parsePersistedWorkspaceId(entity.workspaceId)
         return Conversation(
             id = Uuid.parse(entity.id),
             assistantId = Uuid.parse(entity.assistantId),
@@ -609,6 +624,7 @@ class ConversationRepository(
             updateAt = Instant.ofEpochMilli(entity.updateAt),
             conversationNumber = entity.conversationNumber,
             messageNodes = emptyList(),
+            workspaceId = workspaceId,
             folderId = entity.folderId.ifEmpty { null }?.let { Uuid.parse(it) },
         )
     }
@@ -680,9 +696,17 @@ data class LightConversationEntity(
     val updateAt: Long,
     val conversationNumber: Long = 0,
     val folderId: String = "",
+    val workspaceId: String? = null,
 )
 
 data class ConversationPageResult(
     val items: List<Conversation>,
     val nextOffset: Int?,
 )
+
+private fun parsePersistedWorkspaceId(value: String?): Uuid? = value
+    ?.takeIf { it.isNotBlank() }
+    ?.let { runCatching { Uuid.parse(it) }.getOrNull() }
+
+private fun Conversation.normalizeWorkspaceState(): Conversation =
+    if (workspaceId == null && workspaceCwd != null) copy(workspaceCwd = null) else this

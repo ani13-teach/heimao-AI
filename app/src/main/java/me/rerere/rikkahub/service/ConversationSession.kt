@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.service
 
 import android.util.Log
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -23,6 +24,22 @@ class ConversationSession(
 ) {
     // 会话状态
     val state = MutableStateFlow(initial)
+
+    // ChatVM 创建 session 后才异步加载持久化会话；发送必须等待这一步完成，
+    // 否则临时初始值中的 workspaceId=null 可能覆盖新会话的助手默认值。
+    private val initialization = CompletableDeferred<Unit>()
+
+    suspend fun awaitInitialized() {
+        initialization.await()
+    }
+
+    fun completeInitialization() {
+        initialization.complete(Unit)
+    }
+
+    fun failInitialization(error: Throwable) {
+        initialization.completeExceptionally(error)
+    }
 
     // 原子引用计数
     private val refCount = AtomicInteger(0)
@@ -102,5 +119,6 @@ class ConversationSession(
         _generationJob.value = null
         idleCheckJob?.cancel()
         idleCheckJob = null
+        initialization.cancel()
     }
 }

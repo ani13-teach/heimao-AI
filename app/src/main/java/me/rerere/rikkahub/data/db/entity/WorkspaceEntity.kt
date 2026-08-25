@@ -4,6 +4,7 @@ import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
+import me.rerere.rikkahub.data.model.WorkspaceRuntimeMetadata
 import me.rerere.rikkahub.utils.JsonInstant
 import me.rerere.workspace.Workspace
 import me.rerere.workspace.WorkspaceShellStatus
@@ -30,13 +31,20 @@ data class WorkspaceEntity(
     val updatedAt: Long,
     @ColumnInfo("last_access_at")
     val lastAccessAt: Long? = null,
-    // 工具审批的用户覆盖项 (toolName -> needsApproval)，未覆盖的工具沿用默认值
+    // Legacy tool-approval overrides retained for schema compatibility; unified AI workspace
+    // tools intentionally ignore this field.
     @ColumnInfo("tool_approvals", defaultValue = "{}")
     val toolApprovals: String = "{}",
+    @ColumnInfo("runtime_metadata", defaultValue = "{}")
+    val runtimeMetadata: String = "{}",
 ) {
     fun toolApprovalOverrides(): Map<String, Boolean> = runCatching {
         JsonInstant.decodeFromString<Map<String, Boolean>>(toolApprovals)
     }.getOrDefault(emptyMap())
+
+    fun runtimeMetadataOrDefault(): WorkspaceRuntimeMetadata = runCatching {
+        JsonInstant.decodeFromString<WorkspaceRuntimeMetadata>(runtimeMetadata)
+    }.getOrDefault(WorkspaceRuntimeMetadata())
 
     fun toWorkspace(): Workspace = Workspace(
         id = id,

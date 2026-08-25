@@ -1,5 +1,6 @@
 package me.rerere.rikkahub.ui.pages.backup.tabs
 
+import android.net.Uri
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.File01
 import me.rerere.hugeicons.stroke.FileImport
@@ -24,8 +25,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.dokar.sonner.ToastType
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.workspace.LegacyWorkspaceArchiveRequiresConfirmationException
+import me.rerere.rikkahub.ui.pages.backup.components.BackupPasswordDialog
+import me.rerere.rikkahub.ui.pages.backup.components.LegacyBackupConfirmationDialog
 import me.rerere.rikkahub.ui.components.ui.CardGroup
 import me.rerere.rikkahub.ui.components.ui.StickyHeader
 import me.rerere.rikkahub.ui.context.LocalToaster
@@ -37,135 +44,192 @@ import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 
 @Composable
-fun ImportExportTab(
-    vm: BackupVM,
-    onShowRestartDialog: () -> Unit
-) {
+fun ImportExportTab(vm: BackupVM) {
     val toaster = LocalToaster.current
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     var isExporting by remember { mutableStateOf(false) }
     var isRestoring by remember { mutableStateOf(false) }
-
-    // 导入类型：local 为本地备份，chatbox 为 Chatbox 导入，cherry 为 Cherry Studio 导入
     var importType by remember { mutableStateOf("local") }
+    var passwordAction by remember { mutableStateOf<String?>(null) }
+    var passwordActionUri by remember { mutableStateOf<Uri?>(null) }
+    var pendingLegacyRestore by remember { mutableStateOf<PendingLocalLegacyRestore?>(null) }
+    var showLegacyConfirmation by remember { mutableStateOf(false) }
 
-    // 创建文件保存的launcher
-    val createDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("application/zip")
-    ) { uri ->
-        uri?.let { targetUri ->
-            scope.launch {
-                isExporting = true
-                runCatching {
-                    // 导出文件
-                    val exportFile = vm.exportToFile()
+    fun requestPassword(action: String, uri: Uri) {
+        passwordAction = action
+        passwordActionUri = uri
+    }
 
-                    // 复制到用户选择的位置
+    fun startExport(targetUri: Uri, passwordText: String) {
+        scope.launch {
+            isExporting = true
+            val password = passwordText.toCharArray()
+            var exportFile: File? = null
+            try {
+                val generatedFile = vm.exportToFile(password)
+                exportFile = generatedFile
+                withContext(Dispatchers.IO) {
                     context.contentResolver.openOutputStream(targetUri)?.use { outputStream ->
-                        FileInputStream(exportFile).use { inputStream ->
+                        FileInputStream(generatedFile).use { inputStream ->
                             inputStream.copyTo(outputStream)
                         }
-                    }
-
-                    // 清理临时文件
-                    exportFile.delete()
-
-                    toaster.show(
-                        context.getString(R.string.backup_page_backup_success),
-                        type = ToastType.Success
-                    )
-                }.onFailure { e ->
-                    e.printStackTrace()
-                    toaster.show(
-                        context.getString(R.string.backup_page_restore_failed, e.message ?: ""),
-                        type = ToastType.Error
-                    )
+                    } ?: error("Unable to open selected export destination")
                 }
+                toaster.show(
+                    context.getString(R.string.backup_page_backup_success),
+                    type = ToastType.Success,
+                )
+            } catch (error: Throwable) {
+                error.printStackTrace()
+                toaster.show(
+                    context.getString(R.string.backup_page_restore_failed, error.message ?: ""),
+                    type = ToastType.Error,
+                )
+            } finally {
+                withContext(NonCancellable + Dispatchers.IO) {
+                    exportFile?.let(::cleanupTemporaryFile)
+                }
+                password.fill('\u0000')
                 isExporting = false
             }
         }
     }
 
-    // 创建文件选择的launcher
+    fun startLocalRestore(sourceUri: Uri, password: CharArray, allowLegacy: Boolean) {
+        scope.launch {
+            isRestoring = true
+            var waitingForLegacyConfirmation = false
+            val tempFile = File(context.cacheDir, "temp_restore_${System.currentTimeMillis()}.zip")
+            val partialFile = File(tempFile.path + ".partial")
+            try {
+                withContext(Dispatchers.IO) {
+                    context.contentResolver.openInputStream(sourceUri)?.use { inputStream ->
+                        FileOutputStream(partialFile).use { outputStream ->
+                            inputStream.copyTo(outputStream)
+                        }
+                    } ?: error("Unable to open selected backup")
+                    require(partialFile.renameTo(tempFile)) { "Unable to finalize selected backup" }
+                }
+                vm.restoreFromLocalFile(tempFile, password, allowLegacy)
+                vm.restoreWarnings.value.takeIf { it.isNotEmpty() }?.let { warnings ->
+                    toaster.show(warnings.joinToString("; "), type = ToastType.Warning)
+                }
+                toaster.show(
+                    context.getString(R.string.backup_page_restore_success),
+                    type = ToastType.Success,
+                )
+            } catch (legacy: LegacyWorkspaceArchiveRequiresConfirmationException) {
+                if (allowLegacy) throw legacy
+                waitingForLegacyConfirmation = true
+                pendingLegacyRestore = PendingLocalLegacyRestore(sourceUri, password)
+                showLegacyConfirmation = true
+            } catch (error: Throwable) {
+                error.printStackTrace()
+                toaster.show(
+                    context.getString(R.string.backup_page_restore_failed, error.message ?: ""),
+                    type = ToastType.Error,
+                )
+            } finally {
+                withContext(NonCancellable + Dispatchers.IO) {
+                    cleanupTemporaryFile(partialFile)
+                    cleanupTemporaryFile(tempFile)
+                }
+                if (!waitingForLegacyConfirmation) password.fill('\u0000')
+                isRestoring = false
+            }
+        }
+    }
+
+    // The document picker returns before any archive bytes are created/read. A password is
+    // collected first, so cancellation never leaves an archive plaintext temp behind.
+    val createDocumentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { uri ->
+        uri?.let { requestPassword("export", it) }
+    }
+
     val openDocumentLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         uri?.let { sourceUri ->
-            scope.launch {
-                isRestoring = true
-                runCatching {
-                    when (importType) {
-                        "local" -> {
-                            // 本地备份导入：处理zip文件
-                            val tempFile =
-                                File(context.cacheDir, "temp_restore_${System.currentTimeMillis()}.zip")
-
+            if (importType == "local") {
+                requestPassword("restore", sourceUri)
+            } else {
+                scope.launch {
+                    isRestoring = true
+                    val tempFile = File(
+                        context.cacheDir,
+                        "temp_${importType}_${System.currentTimeMillis()}.${if (importType == "chatbox") "json" else "zip"}",
+                    )
+                    try {
+                        withContext(Dispatchers.IO) {
                             context.contentResolver.openInputStream(sourceUri)?.use { inputStream ->
                                 FileOutputStream(tempFile).use { outputStream ->
                                     inputStream.copyTo(outputStream)
                                 }
-                            }
-
-                            // 从临时文件恢复
-                            vm.restoreFromLocalFile(tempFile)
-
-                            // 清理临时文件
-                            tempFile.delete()
+                            } ?: error("Unable to open selected file")
                         }
-
-                        "chatbox" -> {
-                            // Chatbox导入：处理json文件
-                            val tempFile =
-                                File(context.cacheDir, "temp_chatbox_${System.currentTimeMillis()}.json")
-
-                            context.contentResolver.openInputStream(sourceUri)?.use { inputStream ->
-                                FileOutputStream(tempFile).use { outputStream ->
-                                    inputStream.copyTo(outputStream)
-                                }
-                            }
-
-                            // 从Chatbox文件恢复
+                        if (importType == "chatbox") {
                             vm.restoreFromChatBox(tempFile)
-
-                            // 清理临时文件
-                            tempFile.delete()
-                        }
-
-                        "cherry" -> {
-                            // Cherry Studio导入：处理zip文件
-                            val tempFile =
-                                File(context.cacheDir, "temp_cherry_${System.currentTimeMillis()}.zip")
-
-                            context.contentResolver.openInputStream(sourceUri)?.use { inputStream ->
-                                FileOutputStream(tempFile).use { outputStream ->
-                                    inputStream.copyTo(outputStream)
-                                }
-                            }
-
-                            // 从Cherry Studio备份恢复
+                        } else {
                             vm.restoreFromCherryStudio(tempFile)
-
-                            // 清理临时文件
-                            tempFile.delete()
                         }
+                        toaster.show(
+                            context.getString(R.string.backup_page_restore_success),
+                            type = ToastType.Success,
+                        )
+                    } catch (error: Throwable) {
+                        error.printStackTrace()
+                        toaster.show(
+                            context.getString(R.string.backup_page_restore_failed, error.message ?: ""),
+                            type = ToastType.Error,
+                        )
+                    } finally {
+                        withContext(NonCancellable + Dispatchers.IO) {
+                            cleanupTemporaryFile(tempFile)
+                        }
+                        isRestoring = false
                     }
-
-                    toaster.show(
-                        context.getString(R.string.backup_page_restore_success),
-                        type = ToastType.Success
-                    )
-                    onShowRestartDialog()
-                }.onFailure { e ->
-                    e.printStackTrace()
-                    toaster.show(
-                        context.getString(R.string.backup_page_restore_failed, e.message ?: ""),
-                        type = ToastType.Error
-                    )
                 }
-                isRestoring = false
             }
         }
+    }
+
+    passwordAction?.let { action ->
+        BackupPasswordDialog(
+            onDismiss = {
+                passwordAction = null
+                passwordActionUri = null
+            },
+            onConfirm = { password, _ ->
+                val uri = passwordActionUri
+                passwordAction = null
+                passwordActionUri = null
+                if (uri == null) return@BackupPasswordDialog
+                if (action == "export") {
+                    startExport(uri, password)
+                } else {
+                    startLocalRestore(uri, password.toCharArray(), allowLegacy = false)
+                }
+            },
+        )
+    }
+
+    if (showLegacyConfirmation) {
+        LegacyBackupConfirmationDialog(
+            onDismiss = {
+                pendingLegacyRestore?.password?.fill('\u0000')
+                pendingLegacyRestore = null
+                showLegacyConfirmation = false
+            },
+            onConfirm = {
+                val pending = pendingLegacyRestore ?: return@LegacyBackupConfirmationDialog
+                pendingLegacyRestore = null
+                showLegacyConfirmation = false
+                startLocalRestore(pending.uri, pending.password, allowLegacy = true)
+            },
+        )
     }
 
     LazyColumn(
@@ -186,7 +250,7 @@ fun ImportExportTab(
                         {
                             val timestamp = LocalDateTime.now()
                                 .format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
-                            createDocumentLauncher.launch("黑猫ai_backup_$timestamp.zip")
+                            createDocumentLauncher.launch("黑猫ai_backup_$timestamp.zip.enc")
                         }
                     } else null,
                     headlineContent = { Text(stringResource(R.string.backup_page_local_backup_export)) },
@@ -212,7 +276,7 @@ fun ImportExportTab(
                     onClick = if (!isRestoring) {
                         {
                             importType = "local"
-                            openDocumentLauncher.launch(arrayOf("application/zip"))
+                            openDocumentLauncher.launch(arrayOf("application/octet-stream", "application/zip"))
                         }
                     } else null,
                     headlineContent = { Text(stringResource(R.string.backup_page_local_backup_import)) },
@@ -282,4 +346,14 @@ fun ImportExportTab(
             }
         }
     }
+}
+
+private data class PendingLocalLegacyRestore(
+    val uri: Uri,
+    val password: CharArray,
+)
+
+private fun cleanupTemporaryFile(file: File) {
+    if (!file.exists()) return
+    require(file.delete()) { "Unable to clean temporary restore file: ${file.path}" }
 }

@@ -29,7 +29,9 @@ import kotlinx.serialization.json.putJsonArray
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.core.TokenUsage
+import me.rerere.ai.core.UsageNormalizer
 import me.rerere.ai.provider.BuiltInTools
+import me.rerere.ai.provider.LogicalPrompt
 import me.rerere.ai.provider.Modality
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
@@ -200,7 +202,10 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
             model = params.model.modelId,
             message = parseMessage(candidate),
             finishReason = candidate["finishReason"]?.jsonPrimitive?.contentOrNull,
-            usage = parseUsageMeta(bodyJson["usageMetadata"] as? JsonObject),
+            usage = parseUsageMeta(
+                bodyJson["usageMetadata"] as? JsonObject,
+                model = params.model.modelId,
+            ),
         )
     }
 
@@ -319,19 +324,21 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         messages: List<UIMessage>,
         params: TextGenerationParams
     ): JsonObject = buildJsonObject {
-        // System message if available
-        val systemMessage = messages.firstOrNull { it.role == MessageRole.SYSTEM }
-        if (systemMessage != null && !params.model.outputModalities.contains(Modality.IMAGE)) {
-            put("systemInstruction", buildJsonObject {
-                putJsonArray("parts") {
-                    add(buildJsonObject {
-                        put(
-                            "text",
-                            systemMessage.parts.filterIsInstance<UIMessagePart.Text>()
-                                .joinToString { it.text })
-                    })
-                }
-            })
+        // Gemini deliberately keeps the normal request shape. The logical prompt only
+        // determines stable ordering; no explicit cache lifecycle or cache key is sent.
+        val prompt = params.logicalPrompt ?: LogicalPrompt.fromMessages(messages, params.tools)
+        val systemMessages = prompt.system
+        if (systemMessages.isNotEmpty() && !params.model.outputModalities.contains(Modality.IMAGE)) {
+            val systemText = systemMessages
+                .flatMap { message -> message.parts.filterIsInstance<UIMessagePart.Text>() }
+                .joinToString("\n") { it.text }
+            if (systemText.isNotBlank()) {
+                put("systemInstruction", buildJsonObject {
+                    putJsonArray("parts") {
+                        add(buildJsonObject { put("text", systemText) })
+                    }
+                })
+            }
         }
 
         // Generation config
@@ -383,7 +390,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         // Contents (user messages)
         put(
             "contents",
-            buildContents(messages)
+            buildContents(prompt.toProviderMessages(includeSystem = false))
         )
 
         // Tools
@@ -750,7 +757,10 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
             })
         }
 
-    private fun parseUsageMeta(jsonObject: JsonObject?): TokenUsage? {
+    private fun parseUsageMeta(jsonObject: JsonObject?): TokenUsage? =
+        parseUsageMeta(jsonObject, model = null)
+
+    private fun parseUsageMeta(jsonObject: JsonObject?, model: String?): TokenUsage? {
         if (jsonObject == null) {
             return null
         }
@@ -759,11 +769,13 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         val cachedTokens = jsonObject["cachedContentTokenCount"]?.jsonPrimitiveOrNull?.intOrNull ?: 0
         val candidatesTokens = jsonObject["candidatesTokenCount"]?.jsonPrimitiveOrNull?.intOrNull ?: 0
         val totalTokens = jsonObject["totalTokenCount"]?.jsonPrimitiveOrNull?.intOrNull ?: 0
-        return TokenUsage(
-            promptTokens = promptTokens,
+        return UsageNormalizer.normalize(
+            totalInputTokens = promptTokens,
             completionTokens = candidatesTokens + thoughtTokens,
             totalTokens = totalTokens,
-            cachedTokens = cachedTokens
+            cacheReadTokens = cachedTokens,
+            provider = "gemini",
+            model = model,
         )
     }
 }

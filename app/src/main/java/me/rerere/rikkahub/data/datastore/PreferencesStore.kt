@@ -4,12 +4,14 @@ import android.content.Context
 import android.util.Log
 import androidx.datastore.core.IOException
 import androidx.datastore.preferences.SharedPreferencesMigration
+import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import androidx.datastore.preferences.preferencesDataStoreFile
 import io.pebbletemplates.pebble.PebbleEngine
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -48,12 +50,18 @@ import me.rerere.search.SearchCommonOptions
 import me.rerere.search.SearchServiceOptions
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.get
+import java.io.File
 import kotlin.uuid.Uuid
 
 private const val TAG = "PreferencesStore"
 
+internal const val SETTINGS_DATASTORE_NAME = "settings"
+
+internal fun settingsDataStoreFile(context: Context): File =
+    context.preferencesDataStoreFile(SETTINGS_DATASTORE_NAME)
+
 private val Context.settingsStore by preferencesDataStore(
-    name = "settings",
+    name = SETTINGS_DATASTORE_NAME,
     produceMigrations = { context ->
         listOf(
             PreferenceStoreV1Migration(),
@@ -63,6 +71,63 @@ private val Context.settingsStore by preferencesDataStore(
         )
     }
 )
+
+private fun MutablePreferences.writeSettings(settings: Settings) {
+    this[SettingsStore.DYNAMIC_COLOR] = settings.dynamicColor
+    this[SettingsStore.THEME_ID] = settings.themeId
+    this[SettingsStore.CUSTOM_THEMES] = JsonInstant.encodeToString(settings.customThemes)
+    this[SettingsStore.DEVELOPER_MODE] = settings.developerMode
+    this[SettingsStore.DISPLAY_SETTING] = JsonInstant.encodeToString(settings.displaySetting)
+    this[SettingsStore.PROMPT_CACHE_ENABLED] = settings.promptCacheEnabled
+
+    this[SettingsStore.FAVORITE_MODELS] = JsonInstant.encodeToString(settings.favoriteModels)
+    this[SettingsStore.SELECT_MODEL] = settings.chatModelId.toString()
+    this[SettingsStore.FAST_MODEL] = settings.fastModelId.toString()
+    settings.titleModelId?.let {
+        this[SettingsStore.TITLE_MODEL] = it.toString()
+    } ?: remove(SettingsStore.TITLE_MODEL)
+    this[SettingsStore.TRANSLATE_MODEL] = settings.translateModeId.toString()
+    this[SettingsStore.ENABLE_SUGGESTION] = settings.enableSuggestion
+    settings.suggestionModelId?.let {
+        this[SettingsStore.SUGGESTION_MODEL] = it.toString()
+    } ?: remove(SettingsStore.SUGGESTION_MODEL)
+    this[SettingsStore.IMAGE_GENERATION_MODEL] = settings.imageGenerationModelId.toString()
+    this[SettingsStore.TITLE_PROMPT] = settings.titlePrompt
+    this[SettingsStore.TRANSLATION_PROMPT] = settings.translatePrompt
+    this[SettingsStore.TRANSLATE_THINKING_BUDGET] = settings.translateThinkingBudget
+    this[SettingsStore.SUGGESTION_PROMPT] = settings.suggestionPrompt
+    this[SettingsStore.OCR_MODEL] = settings.ocrModelId.toString()
+    this[SettingsStore.OCR_PROMPT] = settings.ocrPrompt
+    this[SettingsStore.COMPRESS_MODEL] = settings.compressModelId.toString()
+    this[SettingsStore.COMPRESS_PROMPT] = settings.compressPrompt
+
+    this[SettingsStore.PROVIDERS] = JsonInstant.encodeToString(settings.providers)
+
+    this[SettingsStore.ASSISTANTS] = JsonInstant.encodeToString(settings.assistants)
+    this[SettingsStore.SELECT_ASSISTANT] = settings.assistantId.toString()
+    this[SettingsStore.ASSISTANT_TAGS] = JsonInstant.encodeToString(settings.assistantTags)
+
+    this[SettingsStore.SEARCH_SERVICES] = JsonInstant.encodeToString(settings.searchServices)
+    this[SettingsStore.SEARCH_COMMON] = JsonInstant.encodeToString(settings.searchCommonOptions)
+    this[SettingsStore.SEARCH_SELECTED] = settings.searchServiceSelected.coerceIn(0, settings.searchServices.size - 1)
+
+    this[SettingsStore.MCP_SERVERS] = JsonInstant.encodeToString(settings.mcpServers)
+    this[SettingsStore.WEBDAV_CONFIG] = JsonInstant.encodeToString(settings.webDavConfig)
+    this[SettingsStore.S3_CONFIG] = JsonInstant.encodeToString(settings.s3Config)
+    this[SettingsStore.MODE_INJECTIONS] = JsonInstant.encodeToString(settings.modeInjections)
+    this[SettingsStore.BACKUP_REMINDER_CONFIG] = JsonInstant.encodeToString(settings.backupReminderConfig)
+    this[SettingsStore.LAUNCH_COUNT] = settings.launchCount
+}
+
+/**
+ * Restores settings without constructing [SettingsStore] or touching Koin. The same DataStore
+ * delegate and Preferences serialization path used by [SettingsStore] are deliberately reused.
+ */
+internal suspend fun restoreSettingsDataStore(context: Context, settings: Settings) {
+    context.settingsStore.edit { preferences ->
+        preferences.writeSettings(settings)
+    }
+}
 
 class SettingsStore(
     context: Context,
@@ -78,6 +143,7 @@ class SettingsStore(
         val CUSTOM_THEMES = stringPreferencesKey("custom_themes")
         val DISPLAY_SETTING = stringPreferencesKey("display_setting")
         val DEVELOPER_MODE = booleanPreferencesKey("developer_mode")
+        val PROMPT_CACHE_ENABLED = booleanPreferencesKey("prompt_cache_enabled")
 
         // 模型选择
         val FAVORITE_MODELS = stringPreferencesKey("favorite_models")
@@ -175,6 +241,7 @@ class SettingsStore(
                 } ?: emptyList(),
                 developerMode = preferences[DEVELOPER_MODE] == true,
                 displaySetting = JsonInstant.decodeFromString(preferences[DISPLAY_SETTING] ?: "{}"),
+                promptCacheEnabled = preferences[PROMPT_CACHE_ENABLED] != false,
                 searchServices = preferences[SEARCH_SERVICES]?.let {
                     JsonInstant.decodeFromString(it)
                 } ?: listOf(SearchServiceOptions.DEFAULT),
@@ -284,49 +351,7 @@ class SettingsStore(
         }
         settingsFlow.value = settings
         dataStore.edit { preferences ->
-            preferences[DYNAMIC_COLOR] = settings.dynamicColor
-            preferences[THEME_ID] = settings.themeId
-            preferences[CUSTOM_THEMES] = JsonInstant.encodeToString(settings.customThemes)
-            preferences[DEVELOPER_MODE] = settings.developerMode
-            preferences[DISPLAY_SETTING] = JsonInstant.encodeToString(settings.displaySetting)
-
-            preferences[FAVORITE_MODELS] = JsonInstant.encodeToString(settings.favoriteModels)
-            preferences[SELECT_MODEL] = settings.chatModelId.toString()
-            preferences[FAST_MODEL] = settings.fastModelId.toString()
-            settings.titleModelId?.let {
-                preferences[TITLE_MODEL] = it.toString()
-            } ?: preferences.remove(TITLE_MODEL)
-            preferences[TRANSLATE_MODEL] = settings.translateModeId.toString()
-            preferences[ENABLE_SUGGESTION] = settings.enableSuggestion
-            settings.suggestionModelId?.let {
-                preferences[SUGGESTION_MODEL] = it.toString()
-            } ?: preferences.remove(SUGGESTION_MODEL)
-            preferences[IMAGE_GENERATION_MODEL] = settings.imageGenerationModelId.toString()
-            preferences[TITLE_PROMPT] = settings.titlePrompt
-            preferences[TRANSLATION_PROMPT] = settings.translatePrompt
-            preferences[TRANSLATE_THINKING_BUDGET] = settings.translateThinkingBudget
-            preferences[SUGGESTION_PROMPT] = settings.suggestionPrompt
-            preferences[OCR_MODEL] = settings.ocrModelId.toString()
-            preferences[OCR_PROMPT] = settings.ocrPrompt
-            preferences[COMPRESS_MODEL] = settings.compressModelId.toString()
-            preferences[COMPRESS_PROMPT] = settings.compressPrompt
-
-            preferences[PROVIDERS] = JsonInstant.encodeToString(settings.providers)
-
-            preferences[ASSISTANTS] = JsonInstant.encodeToString(settings.assistants)
-            preferences[SELECT_ASSISTANT] = settings.assistantId.toString()
-            preferences[ASSISTANT_TAGS] = JsonInstant.encodeToString(settings.assistantTags)
-
-            preferences[SEARCH_SERVICES] = JsonInstant.encodeToString(settings.searchServices)
-            preferences[SEARCH_COMMON] = JsonInstant.encodeToString(settings.searchCommonOptions)
-            preferences[SEARCH_SELECTED] = settings.searchServiceSelected.coerceIn(0, settings.searchServices.size - 1)
-
-            preferences[MCP_SERVERS] = JsonInstant.encodeToString(settings.mcpServers)
-            preferences[WEBDAV_CONFIG] = JsonInstant.encodeToString(settings.webDavConfig)
-            preferences[S3_CONFIG] = JsonInstant.encodeToString(settings.s3Config)
-            preferences[MODE_INJECTIONS] = JsonInstant.encodeToString(settings.modeInjections)
-            preferences[BACKUP_REMINDER_CONFIG] = JsonInstant.encodeToString(settings.backupReminderConfig)
-            preferences[LAUNCH_COUNT] = settings.launchCount
+            preferences.writeSettings(settings)
         }
     }
 
@@ -425,6 +450,7 @@ data class Settings(
     val customThemes: List<CustomTheme> = emptyList(),
     val developerMode: Boolean = false,
     val displaySetting: DisplaySetting = DisplaySetting(),
+    val promptCacheEnabled: Boolean = true,
     val favoriteModels: List<Uuid> = emptyList(),
     val chatModelId: Uuid = Uuid.random(),
     val fastModelId: Uuid = Uuid.random(),

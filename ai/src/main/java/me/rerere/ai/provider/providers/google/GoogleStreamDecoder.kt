@@ -9,6 +9,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.TokenUsage
+import me.rerere.ai.core.UsageNormalizer
 import me.rerere.ai.provider.stream.DecodeResult
 import me.rerere.ai.provider.stream.SseEvent
 import me.rerere.ai.provider.stream.StreamChunkDecoder
@@ -119,11 +120,13 @@ internal class GoogleStreamDecoder(
         val cachedTokens = usage["cachedContentTokenCount"]?.jsonPrimitiveOrNull?.intOrNull ?: 0
         val candidateTokens = usage["candidatesTokenCount"]?.jsonPrimitiveOrNull?.intOrNull ?: 0
         val totalTokens = usage["totalTokenCount"]?.jsonPrimitiveOrNull?.intOrNull ?: 0
-        return TokenUsage(
-            promptTokens = promptTokens,
+        return UsageNormalizer.normalize(
+            totalInputTokens = promptTokens,
             completionTokens = candidateTokens + thoughtTokens,
             totalTokens = totalTokens,
-            cachedTokens = cachedTokens,
+            cacheReadTokens = cachedTokens,
+            provider = "gemini",
+            model = model,
         )
     }
 

@@ -11,6 +11,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.TokenUsage
+import me.rerere.ai.core.UsageNormalizer
 import me.rerere.ai.provider.stream.DecodeResult
 import me.rerere.ai.provider.stream.SseEvent
 import me.rerere.ai.provider.stream.StreamChunkDecoder
@@ -171,15 +172,18 @@ internal class ChatCompletionsStreamDecoder : StreamChunkDecoder {
 
     private fun parseUsage(usage: JsonObject?): TokenUsage? {
         if (usage == null) return null
-        return TokenUsage(
-            promptTokens = usage["prompt_tokens"]?.jsonPrimitive?.intOrNull ?: 0,
-            completionTokens = usage["completion_tokens"]?.jsonPrimitive?.intOrNull ?: 0,
-            totalTokens = usage["total_tokens"]?.jsonPrimitive?.intOrNull ?: 0,
-            cachedTokens = usage["prompt_tokens_details"]?.jsonObjectOrNull
-                ?.get("cached_tokens")?.jsonPrimitive?.intOrNull
-                ?: usage["cached_tokens"]?.jsonPrimitive?.intOrNull
-                ?: usage["prompt_cache_hit_tokens"]?.jsonPrimitive?.intOrNull
-                ?: 0,
+        val cachedTokens = usage["prompt_tokens_details"]?.jsonObjectOrNull
+            ?.get("cached_tokens")?.jsonPrimitive?.intOrNull
+            ?: usage["cached_tokens"]?.jsonPrimitive?.intOrNull
+            ?: usage["prompt_cache_hit_tokens"]?.jsonPrimitive?.intOrNull
+            ?: 0
+        return UsageNormalizer.normalize(
+            totalInputTokens = usage["prompt_tokens"]?.jsonPrimitive?.intOrNull,
+            completionTokens = usage["completion_tokens"]?.jsonPrimitive?.intOrNull,
+            totalTokens = usage["total_tokens"]?.jsonPrimitive?.intOrNull,
+            cacheReadTokens = cachedTokens,
+            provider = "openai",
+            model = responseModel,
         )
     }
 

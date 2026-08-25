@@ -44,7 +44,6 @@ import me.rerere.hugeicons.stroke.File02
 import me.rerere.hugeicons.stroke.FileImport
 import me.rerere.hugeicons.stroke.Share08
 import me.rerere.rikkahub.R
-import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
 import me.rerere.workspace.WorkspaceStorageArea
 import org.koin.compose.koinInject
@@ -57,9 +56,9 @@ private val WORKSPACE_FILE_TOOL_NAMES = setOf("workspace_write_file", "workspace
 @Composable
 internal fun EditedFilesList(
     parts: List<UIMessagePart>,
-    assistant: Assistant?,
+    workspaceId: String?,
 ) {
-    val workspaceId = assistant?.workspaceId?.toString() ?: return
+    val persistedWorkspaceId = workspaceId ?: return
     val editedFiles = remember(parts) {
         parts.filterIsInstance<UIMessagePart.Tool>()
             .filter { it.toolName in WORKSPACE_FILE_TOOL_NAMES && it.isExecuted }
@@ -89,7 +88,7 @@ internal fun EditedFilesList(
             runCatching {
                 val (area, relativePath) = resolveWorkspacePath(path)
                 outputStream.use { output ->
-                    workspaceRepository.exportFile(workspaceId, area, relativePath, output)
+                    workspaceRepository.exportFile(persistedWorkspaceId, area, relativePath, output)
                 }
             }
         }
@@ -198,7 +197,7 @@ internal fun EditedFilesList(
                                 val dir = File(context.cacheDir, "workspace_share").apply { mkdirs() }
                                 val file = File(dir, p.substringAfterLast('/'))
                                 file.outputStream().use { output ->
-                                    workspaceRepository.exportFile(workspaceId, area, relativePath, output)
+                                    workspaceRepository.exportFile(persistedWorkspaceId, area, relativePath, output)
                                 }
                                 val uri = FileProvider.getUriForFile(
                                     context,

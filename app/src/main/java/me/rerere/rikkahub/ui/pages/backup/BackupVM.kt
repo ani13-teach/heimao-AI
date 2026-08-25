@@ -17,6 +17,11 @@ import me.rerere.rikkahub.data.sync.webdav.WebDavBackupItem
 import me.rerere.rikkahub.data.sync.webdav.WebDavSync
 import me.rerere.rikkahub.data.sync.S3BackupItem
 import me.rerere.rikkahub.data.sync.S3Sync
+import me.rerere.rikkahub.data.workspace.BackupPasswordSlot
+import me.rerere.rikkahub.data.workspace.BackupPasswordStore
+import me.rerere.rikkahub.data.workspace.WorkspaceArchiveInspection
+import me.rerere.rikkahub.data.workspace.WorkspaceArchiveRestoreResult
+import me.rerere.rikkahub.data.workspace.WorkspaceArchiveService
 import me.rerere.rikkahub.utils.UiState
 import java.io.File
 
@@ -27,6 +32,8 @@ class BackupVM(
     private val webDavSync: WebDavSync,
     private val s3Sync: S3Sync,
     private val conversationRepository: ConversationRepository,
+    private val workspaceArchiveService: WorkspaceArchiveService,
+    private val backupPasswordStore: BackupPasswordStore,
 ) : ViewModel() {
     val settings = settingsStore.settingsFlow.stateIn(
         scope = viewModelScope,
@@ -36,6 +43,7 @@ class BackupVM(
 
     val webDavBackupItems = MutableStateFlow<UiState<List<WebDavBackupItem>>>(UiState.Idle)
     val s3BackupItems = MutableStateFlow<UiState<List<S3BackupItem>>>(UiState.Idle)
+    val restoreWarnings = MutableStateFlow<List<String>>(emptyList())
 
     init {
         loadBackupFileItems()
@@ -69,32 +77,57 @@ class BackupVM(
         webDavSync.testConnection(settings.value.webDavConfig)
     }
 
-    suspend fun backup() {
-        webDavSync.backup(settings.value.webDavConfig)
+    suspend fun backup(password: CharArray) {
+        webDavSync.backup(settings.value.webDavConfig, password)
         recordBackupTime()
     }
 
-    suspend fun restore(item: WebDavBackupItem) {
-        webDavSync.restore(config = settings.value.webDavConfig, item = item)
+    suspend fun restore(
+        item: WebDavBackupItem,
+        password: CharArray?,
+        allowLegacy: Boolean = false,
+    ): WorkspaceArchiveRestoreResult {
+        return webDavSync.restore(
+            config = settings.value.webDavConfig,
+            item = item,
+            password = password,
+            allowLegacy = allowLegacy,
+        ).also {
+            restoreWarnings.value = it.warnings
+        }
     }
 
     suspend fun deleteWebDavBackupFile(item: WebDavBackupItem) {
         webDavSync.deleteBackupFile(settings.value.webDavConfig, item)
     }
 
-    suspend fun exportToFile(): File {
-        val file = webDavSync.prepareBackupFile(
-            settings.value.webDavConfig.copy(items = WebDavConfig.BackupItem.entries)
+    suspend fun exportToFile(password: CharArray): File {
+        val file = workspaceArchiveService.createBackupFile(
+            includeDatabase = true,
+            includeFiles = true,
+            password = password,
         )
         recordBackupTime()
         return file
     }
 
-    suspend fun restoreFromLocalFile(file: File) {
-        webDavSync.restoreFromLocalFile(
-            file,
-            settings.value.webDavConfig.copy(items = WebDavConfig.BackupItem.entries),
-        )
+    fun inspectLocalBackup(file: File): WorkspaceArchiveInspection =
+        workspaceArchiveService.inspectBackupFile(file)
+
+    suspend fun restoreFromLocalFile(
+        file: File,
+        password: CharArray?,
+        allowLegacy: Boolean = false,
+    ): WorkspaceArchiveRestoreResult {
+        return workspaceArchiveService.restoreBackupFile(
+            file = file,
+            includeDatabase = true,
+            includeFiles = true,
+            password = password,
+            allowLegacy = allowLegacy,
+        ).also {
+            restoreWarnings.value = it.warnings
+        }
     }
 
     suspend fun restoreFromChatBox(file: File): ChatboxRestoreResult {
@@ -181,13 +214,34 @@ class BackupVM(
         s3Sync.testS3(settings.value.s3Config)
     }
 
-    suspend fun backupToS3() {
-        s3Sync.backupToS3(settings.value.s3Config)
+    suspend fun backupToS3(password: CharArray) {
+        s3Sync.backupToS3(settings.value.s3Config, password)
         recordBackupTime()
     }
 
-    suspend fun restoreFromS3(item: S3BackupItem) {
-        s3Sync.restoreFromS3(config = settings.value.s3Config, item = item)
+    suspend fun restoreFromS3(
+        item: S3BackupItem,
+        password: CharArray?,
+        allowLegacy: Boolean = false,
+    ): WorkspaceArchiveRestoreResult {
+        return s3Sync.restoreFromS3(
+            config = settings.value.s3Config,
+            item = item,
+            password = password,
+            allowLegacy = allowLegacy,
+        ).also {
+            restoreWarnings.value = it.warnings
+        }
+    }
+
+    fun storedBackupPassword(slot: BackupPasswordSlot): CharArray? = backupPasswordStore.read(slot)
+
+    fun rememberBackupPassword(slot: BackupPasswordSlot, password: CharArray) {
+        backupPasswordStore.write(slot, password)
+    }
+
+    fun forgetBackupPassword(slot: BackupPasswordSlot) {
+        backupPasswordStore.clear(slot)
     }
 
     suspend fun deleteS3BackupFile(item: S3BackupItem) {

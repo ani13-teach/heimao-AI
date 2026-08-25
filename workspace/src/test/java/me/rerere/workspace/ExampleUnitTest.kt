@@ -2,6 +2,7 @@ package me.rerere.workspace
 
 import com.sun.net.httpserver.HttpServer
 import org.junit.Assert.*
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -41,7 +42,7 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun rootfsRequiresShellEntryPoint() {
+    fun rootfsRequiresFullShellEntryPoints() {
         val baseDir = Files.createTempDirectory("workspace-manager-test").toFile()
         val manager = WorkspaceManager(baseDir)
         val root = "test-workspace"
@@ -54,17 +55,27 @@ class ExampleUnitTest {
 
         File(manager.linuxDir(root), "bin").mkdirs()
         File(manager.linuxDir(root), "bin/sh").writeText("#!/bin/sh\n")
+        assertFalse(manager.hasRootfs(root))
+
+        File(manager.linuxDir(root), "bin/bash").writeText("#!/bin/bash\n")
+        File(manager.linuxDir(root), "usr/bin").mkdirs()
+        File(manager.linuxDir(root), "usr/bin/env").writeText("env\n")
         assertTrue(manager.hasRootfs(root))
     }
 
     @Test
     fun rootfsInstallerDownloadsAndExtractsTarGz() {
         val baseDir = Files.createTempDirectory("workspace-manager-test").toFile()
+        assumeSymbolicLinksSupported(baseDir)
         val manager = WorkspaceManager(baseDir)
         val installer = RootfsInstaller(manager)
         val archive = tarGz(
             TarTestEntry("bin/", type = '5'),
+            TarTestEntry("bin/sh", content = "#!/bin/sh\n".toByteArray(), mode = 493),
+            TarTestEntry("bin/bash", content = "#!/bin/bash\n".toByteArray(), mode = 493),
             TarTestEntry("bin/hello", content = "echo hello\n".toByteArray(), mode = 493),
+            TarTestEntry("usr/bin/", type = '5'),
+            TarTestEntry("usr/bin/env", content = "env\n".toByteArray(), mode = 493),
             TarTestEntry("usr/bin/hello-link", type = '2', linkName = "../../bin/hello"),
         )
         val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
@@ -88,6 +99,7 @@ class ExampleUnitTest {
 
     @Test
     fun commandRunsInsideWorkspaceFilesDirectory() {
+        assumeUnixShellAvailable()
         val baseDir = Files.createTempDirectory("workspace-command-test").toFile()
         val manager = WorkspaceManager(baseDir)
         val root = "test-workspace"
@@ -102,6 +114,7 @@ class ExampleUnitTest {
 
     @Test
     fun commandReceivesStdin() {
+        assumeUnixShellAvailable()
         val baseDir = Files.createTempDirectory("workspace-stdin-test").toFile()
         val manager = WorkspaceManager(baseDir)
         val root = "test-workspace"
@@ -130,11 +143,13 @@ class ExampleUnitTest {
         val result = manager.executeCommand(root, "cat /etc/os-release")
 
         assertEquals(127, result.exitCode)
-        assertEquals("Rootfs is not installed", result.stderr)
+        assertTrue(result.stderr.contains("FULL_ROOTFS rootfs is incomplete"))
+        assertTrue(result.stderr.contains("apt/python3"))
     }
 
     @Test
     fun commandOutputIsTruncatedAtLimit() {
+        assumeUnixShellAvailable()
         val baseDir = Files.createTempDirectory("workspace-truncate-test").toFile()
         val manager = WorkspaceManager(baseDir)
         val root = "test-workspace"
@@ -184,6 +199,10 @@ class ExampleUnitTest {
         assertTrue(File(linuxDir, "tmp").canWrite())
         assertTrue(File(linuxDir, "var/tmp").canWrite())
         assertTrue(File(linuxDir, "root").isDirectory)
+    }
+
+    private fun assumeUnixShellAvailable() {
+        assumeTrue("HostShellRunner tests require Unix /bin/sh", File("/bin/sh").isFile)
     }
 
     private fun tarGz(vararg entries: TarTestEntry): ByteArray {

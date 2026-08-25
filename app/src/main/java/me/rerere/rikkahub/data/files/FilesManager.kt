@@ -491,6 +491,8 @@ object FileFolders {
     const val SKILLS = "skills"
     const val FONTS = "fonts"
     const val TOOL_OUTPUTS = "tool_outputs"
+    /** App-private workspace snapshots; deliberately not included in any shell bind mount. */
+    const val SNAPSHOTS = "snapshots"
 }
 
 suspend fun FilesManager.saveUploadFromUri(

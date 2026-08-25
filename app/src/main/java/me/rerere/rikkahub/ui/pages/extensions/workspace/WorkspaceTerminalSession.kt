@@ -4,7 +4,6 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.net.ConnectivityManager
 import android.util.Log
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -15,9 +14,15 @@ import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import com.termux.view.TerminalView
 import com.termux.view.TerminalViewClient
-import me.rerere.rikkahub.data.files.FileFolders
+import me.rerere.rikkahub.data.workspace.workspaceBindMounts
+import me.rerere.rikkahub.data.workspace.workspaceDirectory
+import me.rerere.rikkahub.data.workspace.workspaceDnsServers
+import me.rerere.workspace.ProotShellRunner
 import me.rerere.workspace.RootfsPatchOptions
 import me.rerere.workspace.RootfsPatcher
+import me.rerere.workspace.WorkspaceShellAccessMode
+import me.rerere.workspace.WorkspaceShellContext
+import me.rerere.workspace.hasUsableFullRootfs
 import java.io.File
 
 internal fun createWorkspaceTerminalSession(
@@ -26,46 +31,33 @@ internal fun createWorkspaceTerminalSession(
     client: TerminalSessionClient,
 ): TerminalSession {
     val appContext = context.applicationContext
-    val workspaceDir = File(File(appContext.filesDir, "workspaces"), root)
+    val workspaceDir = appContext.workspaceDirectory(root)
     val filesDir = File(workspaceDir, "files")
     val linuxDir = File(workspaceDir, "linux")
     val tempDir = File(workspaceDir, "tmp")
-    val skillsDir = File(appContext.filesDir, FileFolders.SKILLS).apply { mkdirs() }
     val nativeLibraryDir = File(appContext.applicationInfo.nativeLibraryDir)
     val proot = File(nativeLibraryDir, "libproot_exec.so")
     val loader = File(nativeLibraryDir, "libproot_loader.so")
-
-    val args = mutableListOf(
-        "--root-id",
-        "--link2symlink",
-        "--kill-on-exit",
-        "-r",
-        linuxDir.absolutePath,
-        "-w",
-        WORKSPACE_DIR,
-        "-b",
-        "${filesDir.absolutePath}:$WORKSPACE_DIR",
-        "-b",
-        "${skillsDir.absolutePath}:$SKILLS_DIR",
+    val shellContext = WorkspaceShellContext(
+        root = root,
+        command = "",
+        cwd = "",
+        filesDir = filesDir,
+        linuxDir = linuxDir,
+        tempDir = tempDir,
+        workingDir = filesDir,
+        timeoutMillis = 2_000,
+        accessMode = WorkspaceShellAccessMode.FULL_ROOTFS,
+        bindMounts = appContext.workspaceBindMounts(),
+        // The rootfs is patched during prepareWorkspaceTerminalSession on Dispatchers.IO;
+        // this command builder does not execute another patch.
+        rootfsPatchOptions = RootfsPatchOptions(),
     )
-    listOf("/dev", "/proc", "/sys").forEach { path ->
-        if (File(path).exists()) {
-            args += "-b"
-            args += path
-        }
-    }
-    args += listOf(
-        "/usr/bin/env",
-        "-i",
-        "HOME=/root",
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "TERM=xterm-256color",
-        "LANG=C.UTF-8",
-        "LC_ALL=C.UTF-8",
-        "USER=root",
-        "SHELL=/bin/bash",
-        "/bin/bash",
-    )
+    // The shared builder returns a ProcessBuilder-style list including argv[0];
+    // TerminalSession receives the executable separately.
+    val args = ProotShellRunner(nativeLibraryDir)
+        .buildFullRootfsInteractiveCommand(shellContext, proot)
+        .drop(1)
 
     val env = arrayOf(
         "PROOT_LOADER=${loader.absolutePath}",
@@ -87,20 +79,20 @@ internal fun createWorkspaceTerminalSession(
 
 internal fun prepareWorkspaceTerminalSession(context: Context, root: String) {
     val appContext = context.applicationContext
-    val workspaceDir = File(File(appContext.filesDir, "workspaces"), root)
+    val workspaceDir = appContext.workspaceDirectory(root)
     val linuxDir = File(workspaceDir, "linux")
     File(workspaceDir, "files").mkdirs()
     File(workspaceDir, "tmp").mkdirs()
-    File(appContext.filesDir, FileFolders.SKILLS).mkdirs()
+    appContext.workspaceBindMounts()
     RootfsPatcher().patch(
         linuxDir,
-        RootfsPatchOptions(nameservers = appContext.activeDnsServers())
+        RootfsPatchOptions(nameservers = appContext.workspaceDnsServers())
     )
 }
 
 internal fun workspaceRootfsReady(context: Context, root: String): Boolean {
-    val linuxDir = File(File(File(context.applicationContext.filesDir, "workspaces"), root), "linux")
-    return linuxDir.isDirectory && File(linuxDir, "bin/sh").isFile
+    val linuxDir = File(context.applicationContext.workspaceDirectory(root), "linux")
+    return linuxDir.hasUsableFullRootfs()
 }
 
 internal class WorkspaceTerminalSessionClient(
@@ -313,9 +305,6 @@ internal class WorkspaceTerminalViewClient(
     }
 }
 
-private const val WORKSPACE_DIR = "/workspace"
-private const val SKILLS_DIR = "/skills"
-
 // 一个 URL 最多还原跨越的软换行行数(向上/向下各算), 足够覆盖任意真实 URL
 private const val URL_MAX_WRAP_ROWS = 50
 
@@ -324,13 +313,3 @@ private val URL_REGEX =
 
 // 终端里 URL 后面常跟标点(行尾句号、被括号包裹等), 打开前去掉这些结尾字符
 private val URL_TRAILING_TRIM = charArrayOf('.', ',', ';', ':', '!', '?', ')', ']', '}', '\'', '"')
-
-private fun Context.activeDnsServers(): List<String> {
-    val connectivityManager =
-        getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return emptyList()
-    val network = connectivityManager.activeNetwork ?: return emptyList()
-    return connectivityManager.getLinkProperties(network)
-        ?.dnsServers
-        ?.mapNotNull { it.hostAddress }
-        .orEmpty()
-}

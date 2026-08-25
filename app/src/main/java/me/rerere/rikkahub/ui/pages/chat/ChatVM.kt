@@ -300,6 +300,9 @@ class ChatVM(
             val updatedConversation = conversationFull.copy(
                 assistantId = targetAssistantId,
                 folderId = null,
+                // Moving assistants does not rebind the session workspace or its CWD.
+                workspaceId = conversationFull.workspaceId,
+                workspaceCwd = conversationFull.workspaceCwd,
             )
             if (conversation.id == _conversationId) {
                 chatService.saveConversation(_conversationId, updatedConversation)

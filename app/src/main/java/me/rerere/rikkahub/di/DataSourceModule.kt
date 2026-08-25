@@ -31,8 +31,14 @@ import me.rerere.rikkahub.data.db.migrations.Migration_15_16
 import me.rerere.rikkahub.data.db.migrations.Migration_24_25
 import me.rerere.rikkahub.data.db.migrations.Migration_25_26
 import me.rerere.rikkahub.data.db.migrations.Migration_26_27
+import me.rerere.rikkahub.data.db.migrations.Migration_27_28
+import me.rerere.rikkahub.data.db.migrations.Migration_28_29
+import me.rerere.rikkahub.data.db.migrations.Migration_29_30
 import me.rerere.rikkahub.data.ai.mcp.McpManager
 import me.rerere.rikkahub.data.sync.webdav.WebDavSync
+import me.rerere.rikkahub.data.workspace.BackupPasswordStore
+import me.rerere.rikkahub.data.workspace.WorkspaceArchiveService
+import me.rerere.rikkahub.data.workspace.WorkspaceSnapshotService
 import me.rerere.search.SearchService
 import me.rerere.rikkahub.data.sync.S3Sync
 import okhttp3.MediaType.Companion.toMediaType
@@ -44,6 +50,8 @@ import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 val dataSourceModule = module {
+    single { BackupPasswordStore(context = get()) }
+
     single {
         SettingsStore(context = get(), scope = get())
     }
@@ -52,7 +60,7 @@ val dataSourceModule = module {
         val context: Context = get()
         Room.databaseBuilder(context, AppDatabase::class.java, "rikka_hub")
             .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
-            .addMigrations(Migration_6_7, Migration_11_12, Migration_13_14, Migration_14_15, Migration_15_16, Migration_24_25, Migration_25_26, Migration_26_27)
+            .addMigrations(Migration_6_7, Migration_11_12, Migration_13_14, Migration_14_15, Migration_15_16, Migration_24_25, Migration_25_26, Migration_26_27, Migration_27_28, Migration_28_29, Migration_29_30)
             .addCallback(object : RoomDatabase.Callback() {
                 override fun onOpen(db: SupportSQLiteDatabase) {
                     val dictDir = SimpleDictManager.extractDict(context)
@@ -143,6 +151,14 @@ val dataSourceModule = module {
     }
 
     single {
+        get<AppDatabase>().workspaceAuditDao()
+    }
+
+    single {
+        get<AppDatabase>().workspaceSnapshotDao()
+    }
+
+    single {
         get<AppDatabase>().folderDao()
     }
 
@@ -209,11 +225,30 @@ val dataSourceModule = module {
     }
 
     single {
-        WebDavSync(
-            settingsStore = get(),
-            json = get(),
+        WorkspaceArchiveService(
             context = get(),
-            httpClient = get()
+            json = get(),
+            settingsStore = get(),
+            workspaceRepository = get(),
+            conversationDAO = get(),
+            database = get(),
+        )
+    }
+
+    single {
+        WorkspaceSnapshotService(
+            context = get(),
+            json = get(),
+            workspaceRepository = get(),
+            snapshotDao = get(),
+        )
+    }
+
+    single {
+        WebDavSync(
+            context = get(),
+            httpClient = get(),
+            archiveService = get(),
         )
     }
 
@@ -234,10 +269,9 @@ val dataSourceModule = module {
 
     single {
         S3Sync(
-            settingsStore = get(),
-            json = get(),
             context = get(),
-            httpClient = get()
+            httpClient = get(),
+            archiveService = get(),
         )
     }
 

@@ -6,6 +6,7 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.ai.core.TokenUsage
+import me.rerere.ai.core.UsageNormalizer
 import me.rerere.ai.provider.stream.DecodeResult
 import me.rerere.ai.provider.stream.SseEvent
 import me.rerere.ai.provider.stream.StreamChunkDecoder
@@ -182,11 +183,13 @@ internal class ClaudeStreamDecoder : StreamChunkDecoder {
         val cachedCreationTokens = usageJson["cache_creation_input_tokens"]?.jsonPrimitive?.intOrNull ?: 0
         val completionTokens = usageJson["output_tokens"]?.jsonPrimitive?.intOrNull ?: 0
         val promptTokens = inputTokens + cachedInputTokens + cachedCreationTokens
-        return TokenUsage(
-            promptTokens = promptTokens,
+        return UsageNormalizer.normalize(
+            totalInputTokens = promptTokens,
             completionTokens = completionTokens,
-            totalTokens = promptTokens + completionTokens,
-            cachedTokens = cachedInputTokens,
+            cacheReadTokens = cachedInputTokens,
+            cacheWriteTokens = cachedCreationTokens,
+            provider = "claude",
+            model = responseModel,
         )
     }
 

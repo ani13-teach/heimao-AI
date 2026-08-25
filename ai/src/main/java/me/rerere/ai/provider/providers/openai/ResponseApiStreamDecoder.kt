@@ -8,6 +8,7 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.ai.core.TokenUsage
+import me.rerere.ai.core.UsageNormalizer
 import me.rerere.ai.provider.stream.DecodeResult
 import me.rerere.ai.provider.stream.SseEvent
 import me.rerere.ai.provider.stream.StreamChunkDecoder
@@ -190,7 +191,10 @@ internal class ResponseApiStreamDecoder : StreamChunkDecoder {
         }
 
         return buildList {
-            parseUsage(response?.get("usage") as? JsonObject)?.let { add(StreamChunk.Usage(it)) }
+            parseUsage(
+                response?.get("usage") as? JsonObject,
+                model = response?.get("model")?.jsonPrimitive?.contentOrNull,
+            )?.let { add(StreamChunk.Usage(it)) }
             addAll(state.finish(
                 finishReason = finishReason,
                 responseId = response?.get("id")?.jsonPrimitive?.contentOrNull,
@@ -225,14 +229,20 @@ internal class ResponseApiStreamDecoder : StreamChunkDecoder {
         }
     }
 
-    private fun parseUsage(usage: JsonObject?): TokenUsage? {
+    private fun parseUsage(usage: JsonObject?): TokenUsage? =
+        parseUsage(usage, model = null)
+
+    private fun parseUsage(usage: JsonObject?, model: String?): TokenUsage? {
         if (usage == null) return null
-        return TokenUsage(
-            promptTokens = usage["input_tokens"]?.jsonPrimitive?.intOrNull ?: 0,
-            completionTokens = usage["output_tokens"]?.jsonPrimitive?.intOrNull ?: 0,
-            totalTokens = usage["total_tokens"]?.jsonPrimitive?.intOrNull ?: 0,
-            cachedTokens = usage["input_tokens_details"]?.jsonObjectOrNull
-                ?.get("cached_tokens")?.jsonPrimitive?.intOrNull ?: 0,
+        val cachedTokens = usage["input_tokens_details"]?.jsonObjectOrNull
+            ?.get("cached_tokens")?.jsonPrimitive?.intOrNull ?: 0
+        return UsageNormalizer.normalize(
+            totalInputTokens = usage["input_tokens"]?.jsonPrimitive?.intOrNull,
+            completionTokens = usage["output_tokens"]?.jsonPrimitive?.intOrNull,
+            totalTokens = usage["total_tokens"]?.jsonPrimitive?.intOrNull,
+            cacheReadTokens = cachedTokens,
+            provider = "openai",
+            model = model,
         )
     }
 

@@ -31,13 +31,16 @@ import kotlinx.serialization.json.putJsonArray
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.core.TokenUsage
+import me.rerere.ai.core.UsageNormalizer
 import me.rerere.ai.core.merge
 import me.rerere.ai.provider.BuiltInTools
+import me.rerere.ai.provider.CacheBoundary
 import me.rerere.ai.provider.ClaudePromptCacheTtl
 import me.rerere.ai.provider.ImageGenerationParams
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.Provider
+import me.rerere.ai.provider.LogicalPrompt
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.provider.TextGenerationResult
 import me.rerere.ai.provider.TextGenerationParams
@@ -236,6 +239,10 @@ private fun TokenUsage?.sum(other: TokenUsage?): TokenUsage? {
         completionTokens = completionTokens + other.completionTokens,
         cachedTokens = cachedTokens + other.cachedTokens,
         totalTokens = totalTokens + other.totalTokens,
+        cacheReadTokens = cacheReadTokens + other.cacheReadTokens,
+        cacheWriteTokens = cacheWriteTokens + other.cacheWriteTokens,
+        provider = other.provider ?: provider,
+        model = other.model ?: model,
     )
 }
 
@@ -424,24 +431,80 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
         // trySend 在缓冲满时会静默丢弃 delta，导致回复中间缺字 (#1295)，因此缓冲必须无界
     }.buffer(Channel.UNLIMITED)
 
+    /**
+     * Keep the explicit logical sections for the initial request and append Claude's
+     * pause_turn response only to the current tool-loop tail on continuations.
+     */
+    private fun logicalPromptForRequest(
+        messages: List<UIMessage>,
+        params: TextGenerationParams,
+    ): LogicalPrompt {
+        val configured = params.logicalPrompt ?: return LogicalPrompt.fromMessages(messages, params.tools)
+        val configuredMessages = configured.toMessages()
+        if (messages == configuredMessages) return configured
+
+        // A new assistant response is appended after the logical prompt on the first
+        // pause_turn continuation. Subsequent continuations replace/merge the last assistant
+        // message in place, so handle that same-size case separately.
+        if (messages.size > configuredMessages.size &&
+            messages.take(configuredMessages.size) == configuredMessages
+        ) {
+            return configured.copy(
+                currentToolLoop = configured.currentToolLoop +
+                    messages.drop(configuredMessages.size),
+            )
+        }
+        if (configured.currentToolLoop.isNotEmpty() &&
+            messages.size == configuredMessages.size &&
+            messages.dropLast(1) == configuredMessages.dropLast(1)
+        ) {
+            return configured.copy(
+                currentToolLoop = configured.currentToolLoop.dropLast(1) + messages.last(),
+            )
+        }
+
+        // Direct provider callers may supply a different list than the request builder. The
+        // legacy reconstruction is the safest fallback for those calls.
+        return LogicalPrompt.fromMessages(messages, params.tools)
+    }
+
     private fun buildMessageRequest(
         providerSetting: ProviderSetting.Claude,
         messages: List<UIMessage>,
         params: TextGenerationParams,
         stream: Boolean = false
     ): JsonObject {
-        return buildJsonObject {
-            put("model", params.model.modelId)
-            put(
-                "messages",
-                buildMessages(messages, providerSetting.promptCaching, providerSetting.promptCacheTtl)
-            )
-            put("max_tokens", params.maxTokens ?: 64_000)
-
-            // 顶层 cache_control: 让 Anthropic 自动管理缓存断点
-            if (providerSetting.promptCaching) {
-                put("cache_control", cacheControlEphemeral(providerSetting.promptCacheTtl))
+        // Prefer the request builder's explicit section boundaries. Claude pause_turn appends
+        // the previous response to the flat message list, so merge only that continuation tail
+        // into the current tool-loop section instead of reclassifying transient context as history.
+        val prompt = logicalPromptForRequest(messages, params)
+        val renderedMessages = renderMessages(prompt)
+        val systemBlocks = prompt.system.flatMap { message ->
+            message.parts.mapNotNull { part ->
+                (part as? UIMessagePart.Text)
+                    ?.takeIf { it.text.isNotBlank() }
+                    ?.let { textPart ->
+                        buildJsonObject {
+                            put("type", "text")
+                            put("text", textPart.text)
+                        }
+                    }
             }
+        }
+        val toolDefinitions = buildToolDefinitions(params)
+        val layout = ClaudeRequestLayout(
+            history = renderedMessages.locationsFor(ClaudePromptRegion.HISTORY),
+            transient = renderedMessages.locationsFor(ClaudePromptRegion.TRANSIENT),
+            memory = renderedMessages.locationsFor(ClaudePromptRegion.MEMORY),
+            memoryPresent = prompt.hasMemory,
+            system = systemBlocks.indices.map(ClaudeCacheLocation::System),
+            tools = toolDefinitions.indices.map(ClaudeCacheLocation::Tool),
+        )
+
+        var request = buildJsonObject {
+            put("model", params.model.modelId)
+            put("messages", JsonArray(renderedMessages.map { it.body }))
+            put("max_tokens", params.maxTokens ?: 64_000)
 
             if (params.temperature != null && !params.reasoningLevel.isEnabled) put(
                 "temperature",
@@ -451,26 +514,9 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
 
             put("stream", stream)
 
-            // system prompt
-            val systemMessage = messages.firstOrNull { it.role == MessageRole.SYSTEM }
-            val systemTextParts = systemMessage?.parts?.filterIsInstance<UIMessagePart.Text>().orEmpty()
-            if (systemTextParts.isNotEmpty()) {
-                put("system", buildJsonArray {
-                    systemTextParts.forEachIndexed { index, part ->
-                        add(buildJsonObject {
-                            put("type", "text")
-                            put("text", part.text)
-                            if (providerSetting.promptCaching && index == systemTextParts.lastIndex) {
-                                put("cache_control", cacheControlEphemeral(providerSetting.promptCacheTtl))
-                            }
-                        })
-                    }
-                })
-            }
+            if (systemBlocks.isNotEmpty()) put("system", JsonArray(systemBlocks))
 
-            // 处理 thinking
-            // Anthropic 新 API: adaptive 模式 + output_config.effort 控制强度
-            // 旧的 type=enabled + budget_tokens 在 Opus 4.7+ 上已不支持
+            // Anthropic's adaptive thinking configuration is independent of prompt caching.
             if (params.model.abilities.contains(ModelAbility.REASONING)) {
                 when (params.reasoningLevel) {
                     ReasoningLevel.OFF -> {
@@ -496,47 +542,65 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
                 }
             }
 
-            // 处理工具
-            val useFunctionTools =
-                params.model.abilities.contains(ModelAbility.TOOL) && params.tools.isNotEmpty()
-            val toolDefinitions = buildList {
-                if (useFunctionTools) {
-                    params.tools.forEach { tool ->
-                        add(buildJsonObject {
-                            put("name", tool.name)
-                            put("description", tool.description)
-                            put("input_schema", json.encodeToJsonElement(tool.parameters()))
-                        })
-                    }
-                }
-                params.model.tools.forEach { builtInTool ->
-                    when (builtInTool) {
-                        BuiltInTools.Search -> add(buildJsonObject {
-                            put("type", "web_search_20250305")
-                            put("name", "web_search")
-                        })
-                        BuiltInTools.UrlContext,
-                        BuiltInTools.ImageGeneration,
-                            -> Unit
-                    }
-                }
-            }
             if (toolDefinitions.isNotEmpty()) {
-                putJsonArray("tools") {
-                    toolDefinitions.forEachIndexed { index, definition ->
-                        if (providerSetting.promptCaching && index == toolDefinitions.lastIndex) {
-                            add(JsonObject(
-                                definition + mapOf(
-                                    "cache_control" to cacheControlEphemeral(providerSetting.promptCacheTtl)
-                                )
-                            ))
-                        } else {
-                            add(definition)
-                        }
-                    }
-                }
+                put("tools", JsonArray(toolDefinitions))
             }
         }.mergeCustomBody(params.customBody)
+
+        if (!providerSetting.promptCaching || !params.promptCacheEnabled) return request
+        // Custom body values can replace the arrays used by the logical layout. Applying
+        // cached indices after such a replacement could attach a boundary to unrelated
+        // content, so leave the caller-owned wire shape untouched and skip caching.
+        if (params.customBody.any { it.key == "messages" || it.key == "system" || it.key == "tools" }) {
+            Log.w(TAG, "[PromptCache] skipped: custom body overrides prompt layout")
+            return request
+        }
+
+        val historyResult = applyCacheBoundary(
+            request = request,
+            boundary = CacheBoundary.HISTORY_END,
+            layout = layout,
+            promptCacheTtl = providerSetting.promptCacheTtl,
+        )
+        request = historyResult.request
+        val memoryResult = applyCacheBoundary(
+            request = request,
+            boundary = CacheBoundary.MEMORY_END,
+            layout = layout,
+            promptCacheTtl = providerSetting.promptCacheTtl,
+        )
+        request = memoryResult.request
+        Log.d(
+            TAG,
+            "[PromptCache] provider=claude model=${params.model.modelId} " +
+                "historyBreakpoint=${historyResult.applied} memoryBreakpoint=${memoryResult.applied}"
+        )
+        return request
+    }
+
+    private fun buildToolDefinitions(params: TextGenerationParams): List<JsonObject> = buildList {
+        val useFunctionTools =
+            params.model.abilities.contains(ModelAbility.TOOL) && params.tools.isNotEmpty()
+        if (useFunctionTools) {
+            params.tools.forEach { tool ->
+                add(buildJsonObject {
+                    put("name", tool.name)
+                    put("description", tool.description)
+                    put("input_schema", json.encodeToJsonElement(tool.parameters()))
+                })
+            }
+        }
+        params.model.tools.forEach { builtInTool ->
+            when (builtInTool) {
+                BuiltInTools.Search -> add(buildJsonObject {
+                    put("type", "web_search_20250305")
+                    put("name", "web_search")
+                })
+                BuiltInTools.UrlContext,
+                BuiltInTools.ImageGeneration,
+                    -> Unit
+            }
+        }
     }
 
     private fun cacheControlEphemeral(promptCacheTtl: ClaudePromptCacheTtl) = buildJsonObject {
@@ -544,67 +608,215 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
         promptCacheTtl.apiValue?.let { put("ttl", it) }
     }
 
-    private fun buildMessages(
-        messages: List<UIMessage>,
-        promptCaching: Boolean,
-        promptCacheTtl: ClaudePromptCacheTtl
-    ) = buildJsonArray {
-        messages
-            .filter { it.isValidToUpload() && it.role != MessageRole.SYSTEM }
-            .forEach { message ->
-                if (message.role == MessageRole.ASSISTANT) {
-                    addAssistantMessage(message)
-                } else {
-                    addUserMessage(message)
+    private fun renderMessages(prompt: LogicalPrompt): List<RenderedClaudeMessage> = buildList {
+        fun addSection(messages: List<UIMessage>, region: ClaudePromptRegion) {
+            messages
+                .filter { it.isValidToUpload() }
+                .forEach { message ->
+                    val wireMessage = message.asContextMessage()
+                    val rendered = if (wireMessage.role == MessageRole.ASSISTANT) {
+                        buildJsonArray { addAssistantMessage(wireMessage) }
+                    } else {
+                        buildJsonArray { addUserMessage(wireMessage) }
+                    }
+                    rendered.forEach { add(RenderedClaudeMessage(it.jsonObject, region)) }
                 }
-            }
-    }.let { messagesArray ->
-        if (!promptCaching) return@let messagesArray
-        insertMessagesCacheControl(messagesArray, promptCacheTtl)
+        }
+
+        addSection(prompt.history, ClaudePromptRegion.HISTORY)
+        addSection(prompt.transientContext, ClaudePromptRegion.TRANSIENT)
+        addSection(prompt.memory, ClaudePromptRegion.MEMORY)
+        prompt.latestUser?.let { addSection(listOf(it), ClaudePromptRegion.CURRENT) }
+        addSection(prompt.currentToolLoop, ClaudePromptRegion.CURRENT)
     }
 
     /**
-     * 在倒数第二条非 tool_result 的 user message 的最后一个 content block 上插入 cache_control
+     * Compatibility renderer for existing provider message tests. Production requests use
+     * [buildMessageRequest], where both logical boundaries and the top-level sections are
+     * available. This helper intentionally only renders the message timeline.
      */
-    private fun insertMessagesCacheControl(
-        messages: JsonArray,
-        promptCacheTtl: ClaudePromptCacheTtl
+    @Suppress("UNUSED_PARAMETER")
+    private fun buildMessages(
+        messages: List<UIMessage>,
+        promptCaching: Boolean,
+        promptCacheTtl: ClaudePromptCacheTtl,
     ): JsonArray {
-        // 找出所有非 tool_result 的 user message 的索引
-        val realUserIndices = messages.mapIndexedNotNull { index, msg ->
-            val obj = msg.jsonObject
-            if (obj["role"]?.jsonPrimitive?.contentOrNull == "user") {
-                val content = obj["content"]?.jsonArray
-                val isToolResult = content?.any {
-                    it.jsonObject["type"]?.jsonPrimitive?.contentOrNull == "tool_result"
-                } == true
-                if (!isToolResult) index else null
-            } else null
-        }
+        val prompt = LogicalPrompt.fromMessages(messages)
+        val rendered = renderMessages(prompt)
+        if (!promptCaching) return JsonArray(rendered.map { it.body })
 
-        // 取倒数第二条
-        val targetIndex = if (realUserIndices.size >= 2) {
-            realUserIndices[realUserIndices.size - 2]
-        } else return messages
-
-        // 在目标 message 的最后一个 content block 上添加 cache_control
-        return JsonArray(messages.mapIndexed { index, msg ->
-            if (index == targetIndex) {
-                val obj = msg.jsonObject
-                val content = obj["content"]?.jsonArray ?: return@mapIndexed msg
-                val newContent = JsonArray(content.mapIndexed { contentIndex, block ->
-                    if (contentIndex == content.lastIndex) {
-                        JsonObject(
-                            block.jsonObject + mapOf("cache_control" to cacheControlEphemeral(promptCacheTtl))
-                        )
-                    } else block
-                })
-                JsonObject(obj + mapOf("content" to newContent))
-            } else msg
-        })
+        val layout = ClaudeRequestLayout(
+            history = rendered.locationsFor(ClaudePromptRegion.HISTORY),
+            transient = rendered.locationsFor(ClaudePromptRegion.TRANSIENT),
+            memory = rendered.locationsFor(ClaudePromptRegion.MEMORY),
+            memoryPresent = prompt.hasMemory,
+            system = emptyList(),
+            tools = emptyList(),
+        )
+        val request = buildJsonObject { put("messages", JsonArray(rendered.map { it.body })) }
+        return applyCacheBoundary(
+            request = request,
+            boundary = CacheBoundary.HISTORY_END,
+            layout = layout,
+            promptCacheTtl = promptCacheTtl,
+        ).request["messages"]?.jsonArray ?: JsonArray(emptyList())
     }
 
+    private fun UIMessage.asContextMessage(): UIMessage =
+        if (role == MessageRole.SYSTEM) copy(role = MessageRole.USER) else this
+
+    private fun List<RenderedClaudeMessage>.locationsFor(
+        region: ClaudePromptRegion
+    ): List<ClaudeCacheLocation> = flatMapIndexed { messageIndex, rendered ->
+        if (rendered.region != region) return@flatMapIndexed emptyList()
+        rendered.body["content"]?.jsonArray.orEmpty().indices.map { blockIndex ->
+            ClaudeCacheLocation.Message(messageIndex, blockIndex)
+        }
+    }
+
+    private data class RenderedClaudeMessage(
+        val body: JsonObject,
+        val region: ClaudePromptRegion,
+    )
+
+    private enum class ClaudePromptRegion {
+        HISTORY,
+        TRANSIENT,
+        MEMORY,
+        CURRENT,
+    }
+
+    private sealed interface ClaudeCacheLocation {
+        data class System(val index: Int) : ClaudeCacheLocation
+        data class Tool(val index: Int) : ClaudeCacheLocation
+        data class Message(val messageIndex: Int, val blockIndex: Int) : ClaudeCacheLocation
+    }
+
+    private data class ClaudeRequestLayout(
+        val history: List<ClaudeCacheLocation>,
+        val transient: List<ClaudeCacheLocation>,
+        val memory: List<ClaudeCacheLocation>,
+        val memoryPresent: Boolean,
+        val system: List<ClaudeCacheLocation>,
+        val tools: List<ClaudeCacheLocation>,
+    )
+
+    private data class ClaudeCacheBoundaryResult(
+        val request: JsonObject,
+        val applied: Boolean,
+    )
+
+    /** Apply one logical boundary and never mutate any other wire content. */
+    private fun applyCacheBoundary(
+        request: JsonObject,
+        boundary: CacheBoundary,
+        layout: ClaudeRequestLayout,
+        promptCacheTtl: ClaudePromptCacheTtl,
+    ): ClaudeCacheBoundaryResult {
+        val candidates = when (boundary) {
+            // History is the longest stable prefix. If no history block is legal, fall back
+            // to the stable system and finally the tool definitions.
+            CacheBoundary.HISTORY_END -> layout.history.asReversed() +
+                layout.system.asReversed() + layout.tools.asReversed()
+
+            // A memory boundary is intentionally absent when memory is empty. It may use
+            // transient context as the final legal block only when a memory section exists.
+            CacheBoundary.MEMORY_END -> if (layout.memoryPresent) {
+                layout.memory.asReversed() + layout.transient.asReversed()
+            } else {
+                emptyList()
+            }
+        }
+
+        for (candidate in candidates) {
+            val updated = request.withCacheControl(candidate, cacheControlEphemeral(promptCacheTtl))
+            if (updated != null) return ClaudeCacheBoundaryResult(updated, applied = true)
+        }
+        return ClaudeCacheBoundaryResult(request, applied = false)
+    }
+
+    private fun JsonObject.withCacheControl(
+        location: ClaudeCacheLocation,
+        cacheControl: JsonObject,
+    ): JsonObject? {
+        val key: String
+        val index: Int
+        val block: JsonObject
+        when (location) {
+            is ClaudeCacheLocation.System -> {
+                key = "system"
+                index = location.index
+                block = this[key]?.jsonArray?.getOrNull(index)?.jsonObject ?: return null
+            }
+
+            is ClaudeCacheLocation.Tool -> {
+                key = "tools"
+                index = location.index
+                block = this[key]?.jsonArray?.getOrNull(index)?.jsonObject ?: return null
+                return JsonObject(this + (key to JsonArray(
+                    this[key]!!.jsonArray.mapIndexed { blockIndex, item ->
+                        if (blockIndex == index) JsonObject(block + ("cache_control" to cacheControl)) else item
+                    }
+                )))
+            }
+
+            is ClaudeCacheLocation.Message -> {
+                val messages = this["messages"]?.jsonArray ?: return null
+                val message = messages.getOrNull(location.messageIndex)?.jsonObject ?: return null
+                key = "messages"
+                index = location.messageIndex
+                block = message["content"]?.jsonArray?.getOrNull(location.blockIndex)?.jsonObject
+                    ?: return null
+                if (!isCacheControlAllowed(block)) return null
+                val content = message["content"]!!.jsonArray
+                val updatedMessage = JsonObject(message + ("content" to JsonArray(
+                    content.mapIndexed { blockIndex, item ->
+                        if (blockIndex == location.blockIndex) {
+                            JsonObject(item.jsonObject + ("cache_control" to cacheControl))
+                        } else item
+                    }
+                )))
+                return JsonObject(this + (key to JsonArray(
+                    messages.mapIndexed { messageIndex, item ->
+                        if (messageIndex == index) updatedMessage else item
+                    }
+                )))
+            }
+        }
+
+        if (!isCacheControlAllowed(block)) return null
+        val array = this[key]?.jsonArray ?: return null
+        return JsonObject(this + (key to JsonArray(
+            array.mapIndexed { blockIndex, item ->
+                if (blockIndex == index) JsonObject(block + ("cache_control" to cacheControl)) else item
+            }
+        )))
+    }
+
+    private fun isCacheControlAllowed(block: JsonObject): Boolean {
+        val type = block["type"]?.jsonPrimitive?.contentOrNull
+        return when {
+            // Thinking and redacted-thinking blocks are deliberately excluded by Anthropic.
+            type in setOf("text", "image", "document", "tool_use", "tool_result") -> true
+            type == "server_tool_use" -> true
+            // Server tools use provider-specific names such as web_fetch_tool_result.
+            type?.endsWith("_tool_use") == true || type?.endsWith("_tool_result") == true -> true
+            else -> false
+        }
+    }
+
+    @Suppress("DEPRECATION")
     private fun JsonArrayBuilder.addAssistantMessage(message: UIMessage) {
+        // Legacy ToolCall/ToolResult parts can still occur in imported history. They must be
+        // rendered as Claude's assistant tool_use followed by a separate user tool_result;
+        // putting both blocks in one assistant message changes the timeline and is invalid.
+        if (message.parts.any {
+                it is UIMessagePart.ToolCall || it is UIMessagePart.ToolResult
+            }) {
+            addLegacyAssistantMessage(message)
+            return
+        }
+
         val groups = groupPartsByToolBoundary(message.parts)
         val contentBuffer = mutableListOf<JsonObject>()
 
@@ -645,9 +857,72 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
         }
     }
 
+    @Suppress("DEPRECATION")
+    private fun JsonArrayBuilder.addLegacyAssistantMessage(message: UIMessage) {
+        val assistantContent = mutableListOf<JsonObject>()
+        val pendingResults = mutableListOf<JsonObject>()
+
+        fun flushAssistant() {
+            if (assistantContent.isEmpty()) return
+            add(buildJsonObject {
+                put("role", "assistant")
+                putJsonArray("content") { assistantContent.forEach { add(it) } }
+            })
+            assistantContent.clear()
+        }
+
+        fun flushResults() {
+            if (pendingResults.isEmpty()) return
+            add(buildJsonObject {
+                put("role", "user")
+                putJsonArray("content") { pendingResults.forEach { add(it) } }
+            })
+            pendingResults.clear()
+        }
+
+        message.parts.forEach { part ->
+            when (part) {
+                is UIMessagePart.ToolCall -> {
+                    // A new legacy call after results starts another assistant turn.
+                    if (pendingResults.isNotEmpty()) {
+                        flushAssistant()
+                        flushResults()
+                    }
+                    assistantContent += part.toLegacyToolUseBlock()
+                }
+
+                is UIMessagePart.ToolResult -> {
+                    flushAssistant()
+                    pendingResults += part.toLegacyToolResultBlock()
+                }
+
+                is UIMessagePart.Tool -> {
+                    if (pendingResults.isNotEmpty()) {
+                        flushAssistant()
+                        flushResults()
+                    }
+                    assistantContent += part.toToolUseBlock()
+                    if (part.isExecuted) pendingResults += part.toToolResultBlock()
+                }
+
+                else -> {
+                    // Tool results must immediately follow their assistant tool_use block.
+                    flushAssistant()
+                    flushResults()
+                    assistantContent += part.toContentBlocks()
+                }
+            }
+        }
+
+        flushAssistant()
+        flushResults()
+    }
+
     private fun JsonArrayBuilder.addUserMessage(message: UIMessage) {
         add(buildJsonObject {
-            put("role", message.role.name.lowercase())
+            // Claude has no standalone `tool` role; legacy tool messages are user messages
+            // containing tool_result blocks.
+            put("role", if (message.role == MessageRole.ASSISTANT) "assistant" else "user")
             putJsonArray("content") {
                 message.parts.flatMap { it.toContentBlocks() }.forEach { add(it) }
             }
@@ -749,7 +1024,29 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
             metadataAs<ClaudeReasoningMetadata>()?.signature?.let { put("signature", it) }
         }
 
+        is UIMessagePart.Tool -> toToolUseBlock()
+
+        is UIMessagePart.ToolCall -> toLegacyToolUseBlock()
+
+        is UIMessagePart.ToolResult -> toLegacyToolResultBlock()
+
         else -> null
+    }
+
+    @Suppress("DEPRECATION")
+    private fun UIMessagePart.ToolCall.toLegacyToolUseBlock() = buildJsonObject {
+        put("type", "tool_use")
+        put("id", toolCallId)
+        put("name", toolName)
+        put("input", runCatching { json.parseToJsonElement(arguments) }
+            .getOrElse { JsonObject(emptyMap()) })
+    }
+
+    @Suppress("DEPRECATION")
+    private fun UIMessagePart.ToolResult.toLegacyToolResultBlock() = buildJsonObject {
+        put("type", "tool_result")
+        put("tool_use_id", toolCallId)
+        put("content", content)
     }
 
     private fun UIMessagePart.Tool.toToolUseBlock() = buildJsonObject {
@@ -901,11 +1198,13 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
         val cachedCreationTokens = usageJson["cache_creation_input_tokens"]?.jsonPrimitiveOrNull?.intOrNull ?: 0
         val completionTokens = usageJson["output_tokens"]?.jsonPrimitive?.intOrNull ?: 0
         val promptTokens = inputTokens + cachedInputTokens + cachedCreationTokens
-        return TokenUsage(
-            promptTokens = promptTokens,
+        return UsageNormalizer.normalize(
+            totalInputTokens = promptTokens,
             completionTokens = completionTokens,
-            totalTokens = promptTokens + completionTokens,
-            cachedTokens = cachedInputTokens,
+            cacheReadTokens = cachedInputTokens,
+            cacheWriteTokens = cachedCreationTokens,
+            provider = "claude",
+            model = bodyJson["model"]?.jsonPrimitive?.contentOrNull,
         )
     }
 }

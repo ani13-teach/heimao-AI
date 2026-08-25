@@ -2,17 +2,18 @@ package me.rerere.rikkahub.ui.components.ai
 
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -32,6 +33,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -48,12 +51,6 @@ import kotlin.math.roundToInt
 
 private val levels = ReasoningLevel.entries
 private val levelCount = levels.size
-private val labeledLevels = setOf(
-    ReasoningLevel.OFF,
-    ReasoningLevel.AUTO,
-    ReasoningLevel.LOW,
-    ReasoningLevel.MAX,
-)
 
 @Composable
 fun ReasoningButton(
@@ -101,6 +98,9 @@ fun ReasoningPicker(
 ) {
     val currentIndex = levels.indexOf(reasoningLevel).coerceAtLeast(0)
     var sliderValue by remember { mutableFloatStateOf(currentIndex.toFloat()) }
+    val previewIndex = sliderValue.roundToInt().coerceIn(0, levelCount - 1)
+    val previewLevel = levels[previewIndex]
+    val previewLabel = previewLevel.label()
 
     LaunchedEffect(currentIndex) {
         sliderValue = currentIndex.toFloat()
@@ -113,6 +113,7 @@ fun ReasoningPicker(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
                 .padding(horizontal = 24.dp)
                 .padding(bottom = 32.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -141,11 +142,11 @@ fun ReasoningPicker(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 val iconColor by animateColorAsState(
-                    if (reasoningLevel.isEnabled) MaterialTheme.colorScheme.primary
+                    if (previewLevel.isEnabled) MaterialTheme.colorScheme.primary
                     else MaterialTheme.colorScheme.onSurface
                 )
                 Icon(
-                    imageVector = when (reasoningLevel) {
+                    imageVector = when (previewLevel) {
                         ReasoningLevel.OFF -> HugeIcons.Idea
                         ReasoningLevel.AUTO -> HugeIcons.Idea01
                         ReasoningLevel.LOW -> ReasoningLow
@@ -159,7 +160,7 @@ fun ReasoningPicker(
                     tint = iconColor,
                 )
                 Text(
-                    text = reasoningLevel.label(),
+                    text = previewLabel,
                     style = MaterialTheme.typography.titleMedium,
                 )
             }
@@ -178,7 +179,9 @@ fun ReasoningPicker(
                     },
                     valueRange = 0f..(levelCount - 1).toFloat(),
                     steps = levelCount - 2,
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .semantics { stateDescription = previewLabel },
                     thumb = {
                         Box(
                             modifier = Modifier
@@ -205,7 +208,7 @@ fun ReasoningPicker(
                 )
 
                 ReasoningScale(
-                    selectedLevel = reasoningLevel,
+                    selectedLevel = previewLevel,
                     onSelect = { level ->
                         sliderValue = levels.indexOf(level).toFloat()
                         onUpdateReasoningLevel(level)
@@ -221,56 +224,19 @@ private fun ReasoningScale(
     selectedLevel: ReasoningLevel,
     onSelect: (ReasoningLevel) -> Unit,
 ) {
-    Row(
+    FlowRow(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
+        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         levels.forEach { level ->
-            val selected = level == selectedLevel
-            val tickColor by animateColorAsState(
-                if (selected) MaterialTheme.colorScheme.primary
-                else MaterialTheme.colorScheme.outlineVariant
+            FilterChip(
+                selected = level == selectedLevel,
+                onClick = { onSelect(level) },
+                label = {
+                    Text(text = level.label())
+                },
             )
-            val labelColor by animateColorAsState(
-                if (selected) MaterialTheme.colorScheme.primary
-                else MaterialTheme.colorScheme.onSurfaceVariant
-            )
-
-            Column(
-                modifier = Modifier.weight(1f),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                ToggleSurface(
-                    checked = selected,
-                    onClick = { onSelect(level) },
-                    modifier = Modifier,
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .padding(horizontal = 8.dp, vertical = 10.dp)
-                            .fillMaxWidth(),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .width(if (selected) 20.dp else 16.dp)
-                                .height(if (selected) 6.dp else 4.dp)
-                                .clip(RoundedCornerShape(999.dp))
-                                .background(tickColor)
-                        )
-                        Text(
-                            text = if (level in labeledLevels) level.label() else "",
-                            style = MaterialTheme.typography.labelSmall,
-                            textAlign = TextAlign.Center,
-                            color = labelColor,
-                            minLines = 1,
-                            maxLines = 1,
-                        )
-                    }
-                }
-            }
         }
     }
 }

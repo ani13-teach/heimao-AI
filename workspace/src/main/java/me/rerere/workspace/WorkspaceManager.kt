@@ -11,6 +11,7 @@ class WorkspaceManager(
     private val config: WorkspaceConfig = WorkspaceConfig(),
     private val shellRunner: WorkspaceShellRunner = HostShellRunner(),
     private val bindMounts: List<WorkspaceBindMount> = emptyList(),
+    private val rootfsPatchOptionsProvider: () -> RootfsPatchOptions = { RootfsPatchOptions() },
 ) {
     private val fileSystem = WorkspaceFileSystem(config)
 
@@ -22,9 +23,19 @@ class WorkspaceManager(
     }
 
     fun ensureWorkspace(root: String): File {
+        val dir = ensureWorkspaceFiles(root)
+        linuxDir(root).mkdirs()
+        return dir
+    }
+
+    /**
+     * Prepare only the host-side files/temp areas. The internal files-only channel may use this while a
+     * rootfs is being atomically exchanged; they must not recreate a temporarily moved linux
+     * directory and interfere with recovery.
+     */
+    fun ensureWorkspaceFiles(root: String): File {
         val dir = workspaceDir(root)
         filesDir(root).mkdirs()
-        linuxDir(root).mkdirs()
         tempDir(root).mkdirs()
         return dir
     }
@@ -40,7 +51,7 @@ class WorkspaceManager(
 
     fun tempDir(root: String): File = File(workspaceDir(root), TEMP_DIR)
 
-    fun hasRootfs(root: String): Boolean = File(linuxDir(root), "bin/sh").isFile
+    fun hasRootfs(root: String): Boolean = linuxDir(root).hasUsableFullRootfs()
 
     fun deleteWorkspace(root: String): Boolean = workspaceDir(root).deleteRecursively()
 
@@ -207,6 +218,14 @@ class WorkspaceManager(
                 } else {
                     emptyList()
                 },
+                rootfsPatchOptions = if (
+                    accessMode == WorkspaceShellAccessMode.FULL_ROOTFS ||
+                    accessMode == WorkspaceShellAccessMode.WORKSPACE_PACKAGE
+                ) {
+                    rootfsPatchOptionsProvider()
+                } else {
+                    RootfsPatchOptions()
+                },
             )
         )
     }
@@ -240,6 +259,7 @@ class WorkspaceManager(
         private const val LINUX_DIR = "linux"
         private const val TEMP_DIR = "tmp"
         const val DEFAULT_COMMAND_TIMEOUT_MS = 30_000L
+        const val MAX_COMMAND_TIMEOUT_MS = 600_000L
 
         /** Rootfs 内工作区文件区的挂载点 */
         const val ROOTFS_WORKSPACE_DIR = "/workspace"

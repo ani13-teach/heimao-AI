@@ -140,10 +140,8 @@ internal fun FilesPicker(
 
         if (workspaces.isNotEmpty()) {
             WorkspacePickerListItem(
-                assistant = assistant,
                 conversation = conversation,
                 workspaces = workspaces,
-                onUpdateAssistant = onUpdateAssistant,
                 onUpdateConversation = onUpdateConversation,
                 onNavigateToDetail = { id ->
                     onDismiss()
@@ -236,9 +234,10 @@ internal fun FilesPicker(
                 },
         )
 
-        // Workspace CWD
-        val boundWorkspace = remember(workspaces, assistant.workspaceId) {
-            workspaces.find { it.id == assistant.workspaceId?.toString() }
+        // Workspace CWD is owned by the conversation, not the assistant's current binding.
+        val conversationWorkspaceId = conversation.workspaceId?.toString()
+        val boundWorkspace = remember(workspaces, conversationWorkspaceId) {
+            workspaces.find { it.id == conversationWorkspaceId }
         }
         if (boundWorkspace != null && boundWorkspace.shellStatus == WorkspaceShellStatus.READY.name) {
             var showCwdSheet by remember { mutableStateOf(false) }
@@ -298,18 +297,17 @@ internal fun FilesPicker(
 
 @Composable
 private fun WorkspacePickerListItem(
-    assistant: Assistant,
     conversation: Conversation,
     workspaces: List<WorkspaceEntity>,
-    onUpdateAssistant: (Assistant) -> Unit,
     onUpdateConversation: (Conversation) -> Unit,
     onNavigateToDetail: (String) -> Unit,
     onNavigateToTerminal: (String) -> Unit,
     onNavigateToManage: () -> Unit,
 ) {
     var showSheet by remember { mutableStateOf(false) }
-    val boundWorkspace = remember(workspaces, assistant.workspaceId) {
-        workspaces.find { it.id == assistant.workspaceId?.toString() }
+    val conversationWorkspaceId = conversation.workspaceId?.toString()
+    val boundWorkspace = remember(workspaces, conversationWorkspaceId) {
+        workspaces.find { it.id == conversationWorkspaceId }
     }
 
     ListItem(
@@ -361,16 +359,11 @@ private fun WorkspacePickerListItem(
 
     if (showSheet) {
         WorkspaceSelectSheet(
-            assistant = assistant,
+            selectedWorkspaceId = conversationWorkspaceId,
             workspaces = workspaces,
             onSelect = { workspaceId ->
                 val newId = workspaceId?.let { Uuid.parse(it) }
-                if (newId != assistant.workspaceId) {
-                    onUpdateAssistant(assistant.copy(workspaceId = newId))
-                    if (conversation.workspaceCwd != null) {
-                        onUpdateConversation(conversation.copy(workspaceCwd = null))
-                    }
-                }
+                onUpdateConversation(conversation.withWorkspaceId(newId))
                 showSheet = false
             },
             onManage = {

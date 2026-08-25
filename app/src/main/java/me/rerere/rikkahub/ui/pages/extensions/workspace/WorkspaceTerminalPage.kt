@@ -43,6 +43,7 @@ import com.termux.terminal.TerminalSession
 import com.termux.view.TerminalView
 import androidx.compose.ui.res.stringResource
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.workspace.workspaceDirectory
 import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.theme.ColorMode
 import me.rerere.rikkahub.ui.theme.RikkahubTheme
@@ -50,7 +51,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import org.koin.androidx.compose.koinViewModel
+import me.rerere.workspace.WorkspaceShellStatus
+import me.rerere.workspace.hasUsableFullRootfs
 import org.koin.core.parameter.parametersOf
+import java.io.File
 
 @Composable
 fun WorkspaceTerminalPage(id: String) {
@@ -74,6 +78,7 @@ fun WorkspaceTerminalPage(id: String) {
         ) { innerPadding ->
             WorkspaceTerminalContent(
                 root = state.workspace?.root,
+                shellStatus = state.workspace?.shellStatus,
                 contentPadding = innerPadding,
             )
         }
@@ -83,6 +88,7 @@ fun WorkspaceTerminalPage(id: String) {
 @Composable
 private fun WorkspaceTerminalContent(
     root: String?,
+    shellStatus: String?,
     contentPadding: PaddingValues,
 ) {
     val context = LocalContext.current
@@ -107,6 +113,7 @@ private fun WorkspaceTerminalContent(
     val sessionState by produceState<TerminalSessionUiState>(
         initialValue = TerminalSessionUiState.Loading,
         root,
+        shellStatus,
         sessionClient,
     ) {
         val current = root
@@ -116,7 +123,8 @@ private fun WorkspaceTerminalContent(
             // rootfs stat 与 RootfsPatcher().patch()/DNS 查询都是阻塞 I/O, 放到 IO 线程执行;
             // TerminalSession 构造内部会创建 Handler, 必须回到主线程执行
             val prepared = withContext(Dispatchers.IO) {
-                if (!workspaceRootfsReady(context, current)) {
+                val linuxDir = File(context.applicationContext.workspaceDirectory(current), "linux")
+                if (shellStatus != WorkspaceShellStatus.READY.name || !linuxDir.hasUsableFullRootfs()) {
                     false
                 } else {
                     prepareWorkspaceTerminalSession(context, current)

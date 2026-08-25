@@ -8,6 +8,8 @@ import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.file.Files
+import java.security.DigestInputStream
+import java.security.MessageDigest
 import java.util.Locale
 import java.util.zip.GZIPInputStream
 import org.tukaani.xz.XZInputStream
@@ -20,29 +22,243 @@ class RootfsInstaller(
         root: String,
         url: String,
         onProgress: (RootfsInstallProgress) -> Unit = {},
-    ) {
+        expectedSha256: String? = null,
+        supportedAbis: List<String> = RootfsRuntimeInspector.defaultSupportedAbis(),
+    ): RootfsInstallResult {
         require(url.isNotBlank()) { "Rootfs download url is required" }
-        manager.ensureWorkspace(root)
+        val normalizedExpectedSha256 = normalizeExpectedSha256(expectedSha256)
+        manager.ensureWorkspaceFiles(root)
+        recoverPendingSwap(root)
+        manager.linuxDir(root).mkdirs()
         val format = ArchiveFormat.fromUrl(url)
         val tempDir = manager.tempDir(root)
         val archive = File(tempDir, "rootfs.${format.extension}")
         val stagingDir = File(tempDir, "rootfs-staging")
         val linuxDir = manager.linuxDir(root)
+        val expectedArchitecture = RootfsRuntimeInspector.architectureFromSourceUrl(url)
 
         try {
             stagingDir.deleteRecursively()
             stagingDir.mkdirs()
-            download(url, archive, onProgress)
-            extractTar(archive, stagingDir, format, onProgress)
-            linuxDir.deleteRecursively()
-            require(stagingDir.renameTo(linuxDir)) {
-                "Failed to move rootfs into workspace"
+            val downloaded = download(url, archive, onProgress)
+            require(
+                normalizedExpectedSha256 == null || MessageDigest.isEqual(
+                    normalizedExpectedSha256.toByteArray(Charsets.UTF_8),
+                    downloaded.sha256.toByteArray(Charsets.UTF_8),
+                )
+            ) {
+                "Rootfs archive SHA-256 mismatch"
             }
-            patcher.patch(linuxDir)
+            // Reject a known-incompatible archive before extraction. A failed hash or
+            // architecture check leaves both the current rootfs and its metadata untouched.
+            RootfsRuntimeInspector.assertArchitectureCompatible(
+                expectedArchitecture = expectedArchitecture,
+                detectedArchitecture = null,
+                supportedAbis = supportedAbis,
+            )
+            extractTar(archive, stagingDir, format, onProgress)
+            // Keep the current rootfs untouched until the candidate has been patched and
+            // passes the capability check. This is important for reinstalls: a failed
+            // download, patch, or incomplete archive must not destroy a working rootfs.
+            patcher.patch(stagingDir)
+            val missing = stagingDir.missingFullRootfsPaths()
+            require(missing.isEmpty()) { fullRootfsIncompleteMessage(missing) }
+            val inspection = RootfsRuntimeInspector.inspect(stagingDir)
+            RootfsRuntimeInspector.assertArchitectureCompatible(
+                expectedArchitecture = expectedArchitecture,
+                detectedArchitecture = inspection.detectedArchitecture,
+                supportedAbis = supportedAbis,
+            )
+            exchangeRootfs(stagingDir, linuxDir, tempDir)
             onProgress(RootfsInstallProgress(stage = RootfsInstallStage.INSTALLED))
+            val warnings = buildList {
+                if (expectedArchitecture == null) {
+                    add("Archive architecture was not inferred from the source name")
+                }
+                if (supportedAbis.isEmpty()) {
+                    add("Supported ABI list is unavailable")
+                }
+                addAll(inspection.warnings)
+            }.distinct()
+            return RootfsInstallResult(
+                archiveSha256 = downloaded.sha256,
+                archiveSize = downloaded.size,
+                expectedSha256 = normalizedExpectedSha256,
+                expectedArchitecture = expectedArchitecture,
+                detectedArchitecture = inspection.detectedArchitecture,
+                supportedAbis = supportedAbis.map { it.trim() }.filter { it.isNotBlank() }.distinct(),
+                distroId = inspection.distroId,
+                distroVersion = inspection.distroVersion,
+                capabilityChecks = inspection.capabilityChecks,
+                toolVersions = inspection.toolVersions,
+                toolScanAt = inspection.toolScanAt,
+                warnings = warnings,
+            )
         } finally {
             archive.delete()
             stagingDir.deleteRecursively()
+        }
+    }
+
+    /**
+     * Recover an exchange interrupted between the two directory renames.
+     *
+     * The fixed backup name is intentional: startup and the next install can find it even if
+     * the process was killed after moving the old rootfs away but before moving the candidate
+     * into place.
+     */
+    fun recoverPendingSwap(root: String) {
+        val workspaceDir = manager.workspaceDir(root)
+        if (!workspaceDir.isDirectory) return
+        val tempDir = manager.tempDir(root)
+        val linuxDir = manager.linuxDir(root)
+        val previousDir = File(tempDir, ROOTFS_BACKUP_DIR)
+        if (!previousDir.exists()) return
+
+        when {
+            !linuxDir.exists() -> {
+                require(previousDir.renameTo(linuxDir)) {
+                    "Failed to recover previous rootfs from ${previousDir.path}"
+                }
+            }
+            linuxDir.hasUsableFullRootfs() -> {
+                // The new candidate reached its destination; only stale recovery data remains.
+                require(previousDir.deleteRecursively()) {
+                    "Failed to remove completed rootfs backup: ${previousDir.path}"
+                }
+            }
+            else -> {
+                // A non-usable destination is the interrupted exchange's partial state. Never
+                // delete it in place: first validate the backup, move the partial tree to a
+                // quarantine sibling, and restore the backup. If restore fails, put the partial
+                // tree back so recovery never turns a bad state into a missing rootfs.
+                require(previousDir.hasUsableFullRootfs()) {
+                    "Previous rootfs backup is incomplete: ${previousDir.path}"
+                }
+                val quarantineDir = File(tempDir, ROOTFS_QUARANTINE_DIR)
+                require(!quarantineDir.exists() || quarantineDir.deleteRecursively()) {
+                    "Failed to clear rootfs recovery quarantine: ${quarantineDir.path}"
+                }
+                require(linuxDir.renameTo(quarantineDir)) {
+                    "Failed to quarantine incomplete rootfs: ${linuxDir.path}"
+                }
+                try {
+                    require(previousDir.renameTo(linuxDir)) {
+                        "Failed to recover previous rootfs from ${previousDir.path}"
+                    }
+                } catch (error: Throwable) {
+                    if (!linuxDir.exists() && quarantineDir.exists() && !quarantineDir.renameTo(linuxDir)) {
+                        error.addSuppressed(
+                            IOException("Failed to restore incomplete rootfs quarantine: ${quarantineDir.path}")
+                        )
+                    }
+                    throw error
+                }
+                runCatching { quarantineDir.deleteRecursively() }
+            }
+        }
+    }
+
+    /**
+     * Finalizes a successful install after its metadata has been committed by the caller.
+     * Keeping the previous directory until this point lets the repository roll back if the
+     * Room write fails after the filesystem exchange.
+     */
+    fun commitPendingInstall(root: String) {
+        val previousDir = File(manager.tempDir(root), ROOTFS_BACKUP_DIR)
+        if (previousDir.exists()) {
+            require(previousDir.deleteRecursively()) {
+                "Failed to remove committed rootfs backup: ${previousDir.path}"
+            }
+        }
+    }
+
+    /** Restores the previous directory left by [install], without following guest links. */
+    fun rollbackPendingInstall(root: String) {
+        val tempDir = manager.tempDir(root)
+        val previousDir = File(tempDir, ROOTFS_BACKUP_DIR)
+        if (!previousDir.exists()) return
+        require(previousDir.isDirectory) {
+            "Rootfs rollback backup is not a directory: ${previousDir.path}"
+        }
+        val linuxDir = manager.linuxDir(root)
+        val quarantineDir = File(tempDir, ROOTFS_QUARANTINE_DIR)
+        require(!quarantineDir.exists() || quarantineDir.deleteRecursively()) {
+            "Failed to clear rootfs rollback quarantine: ${quarantineDir.path}"
+        }
+        var candidateMoved = false
+        try {
+            if (linuxDir.exists()) {
+                require(linuxDir.renameTo(quarantineDir)) {
+                    "Failed to quarantine installed rootfs: ${linuxDir.path}"
+                }
+                candidateMoved = true
+            }
+            require(previousDir.renameTo(linuxDir)) {
+                "Failed to restore previous rootfs from ${previousDir.path}"
+            }
+        } catch (error: Throwable) {
+            if (!linuxDir.exists() && candidateMoved && quarantineDir.exists() &&
+                !quarantineDir.renameTo(linuxDir)
+            ) {
+                error.addSuppressed(
+                    IOException("Failed to restore installed rootfs quarantine: ${quarantineDir.path}")
+                )
+            }
+            throw error
+        }
+        runCatching { quarantineDir.deleteRecursively() }
+    }
+
+    /**
+     * Replaces [linuxDir] only after [stagingDir] is known to be usable.
+     *
+     * Moving the old directory to a fixed sibling backup first gives us a recovery point if
+     * the second rename fails. The backup is retained until [commitPendingInstall].
+     */
+    private fun exchangeRootfs(stagingDir: File, linuxDir: File, tempDir: File) {
+        val previousDir = File(tempDir, ROOTFS_BACKUP_DIR)
+        require(!previousDir.exists() || previousDir.deleteRecursively()) {
+            "Failed to clear stale rootfs backup: ${previousDir.path}"
+        }
+        var previousMoved = false
+        try {
+            if (linuxDir.exists()) {
+                require(linuxDir.renameTo(previousDir)) {
+                    "Failed to move existing rootfs into backup"
+                }
+                previousMoved = true
+            }
+            require(stagingDir.renameTo(linuxDir)) {
+                "Failed to move rootfs into workspace"
+            }
+        } catch (error: Throwable) {
+            if (previousMoved) {
+                restorePreviousRootfs(previousDir, linuxDir, error)
+            }
+            throw error
+        }
+
+    }
+
+    private fun restorePreviousRootfs(
+        previousDir: File,
+        linuxDir: File,
+        failure: Throwable,
+    ) {
+        // In the normal failure path linuxDir does not exist because the first rename moved
+        // it away. Never delete a destination here: if a platform left one behind, retaining
+        // it is safer than risking deletion of the old rootfs while recovering.
+        if (linuxDir.exists()) {
+            failure.addSuppressed(
+                IOException("Cannot restore previous rootfs because destination exists: ${linuxDir.path}")
+            )
+            return
+        }
+        if (previousDir.exists() && !previousDir.renameTo(linuxDir)) {
+            failure.addSuppressed(
+                IOException("Failed to restore previous rootfs from ${previousDir.path}")
+            )
         }
     }
 
@@ -50,7 +266,8 @@ class RootfsInstaller(
         url: String,
         target: File,
         onProgress: (RootfsInstallProgress) -> Unit,
-    ) {
+    ): DownloadedArchive {
+        val digest = MessageDigest.getInstance("SHA-256")
         val connection = URL(url).openConnection() as HttpURLConnection
         connection.connectTimeout = CONNECT_TIMEOUT_MS
         connection.readTimeout = READ_TIMEOUT_MS
@@ -60,7 +277,7 @@ class RootfsInstaller(
             require(code in 200..299) { "Rootfs download failed: HTTP $code" }
             val totalBytes = connection.contentLengthLong.takeIf { it > 0 }
             target.parentFile?.mkdirs()
-            connection.inputStream.use { input ->
+            DigestInputStream(connection.inputStream, digest).use { input ->
                 target.outputStream().use { output ->
                     val buffer = ByteArray(BUFFER_SIZE)
                     var bytesRead = 0L
@@ -69,6 +286,7 @@ class RootfsInstaller(
                         checkInterrupted()
                         val read = input.read(buffer)
                         if (read < 0) break
+                        if (read == 0) continue
                         output.write(buffer, 0, read)
                         bytesRead += read
                         if (bytesRead - lastReportBytes >= PROGRESS_STEP_BYTES || bytesRead == totalBytes) {
@@ -91,6 +309,10 @@ class RootfsInstaller(
                             )
                         )
                     }
+                    return DownloadedArchive(
+                        sha256 = digest.digest().toHexString(),
+                        size = bytesRead,
+                    )
                 }
             }
         } finally {
@@ -139,9 +361,9 @@ class RootfsInstaller(
                     continue
                 }
                 val target = targetDir.safeResolve(header.name)
-                target.parentFile?.mkdirs()
+                targetDir.ensureRootfsParentDirectory(header.name)
                 when (header.type) {
-                    TarEntryType.DIRECTORY -> target.mkdirs()
+                    TarEntryType.DIRECTORY -> targetDir.ensureRootfsDirectory(header.name)
                     TarEntryType.SYMLINK -> createSymlink(targetDir, target, header.linkName)
                     TarEntryType.HARDLINK -> createHardLink(targetDir, target, header.linkName)
                     TarEntryType.FILE -> {
@@ -316,15 +538,8 @@ class RootfsInstaller(
         return offset
     }
 
-    private fun File.safeResolve(path: String): File {
-        val normalized = normalizeTarPath(path)
-        val root = canonicalFile
-        val target = File(root, normalized).canonicalFile
-        require(target.path == root.path || target.path.startsWith(root.path + File.separator)) {
-            "Rootfs entry escapes target directory: $path"
-        }
-        return target
-    }
+    private fun File.safeResolve(path: String): File =
+        resolveRootfsPathNoFollow(path)
 
     private fun File.applyMode(mode: Int) {
         setReadable(mode and 0b100_000_000 != 0, false)
@@ -333,15 +548,19 @@ class RootfsInstaller(
     }
 
     private fun normalizeTarPath(path: String): String {
-        val normalized = path
-            .replace('\\', '/')
-            .trim()
-            .trimStart('/')
-            .removePrefix("./")
-        require(normalized.isNotBlank()) { "Rootfs entry path is blank" }
-        require(!normalized.contains('\u0000')) { "Rootfs entry path contains invalid character" }
-        require(normalized.split('/').none { it == ".." }) { "Rootfs entry escapes target directory: $path" }
-        return normalized
+        return RootfsPathSafety.normalizeRelativePath(path)
+    }
+
+    private fun normalizeExpectedSha256(value: String?): String? {
+        val normalized = value?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        require(normalized.matches(SHA256_REGEX)) {
+            "Expected rootfs SHA-256 must be a 64-character hexadecimal string"
+        }
+        return normalized.lowercase(Locale.US)
+    }
+
+    private fun ByteArray.toHexString(): String = joinToString("") { byte ->
+        "%02x".format(Locale.US, byte.toInt() and 0xff)
     }
 
     private fun ByteArray.string(offset: Int, length: Int): String {
@@ -364,6 +583,11 @@ class RootfsInstaller(
     }
 
     private fun Long.paddedTarSize(): Long = this + paddingSize()
+
+    private data class DownloadedArchive(
+        val sha256: String,
+        val size: Long,
+    )
 
     private data class TarHeader(
         val name: String,
@@ -409,10 +633,13 @@ class RootfsInstaller(
     }
 
     companion object {
+        private const val ROOTFS_BACKUP_DIR = "rootfs-previous"
+        private const val ROOTFS_QUARANTINE_DIR = "rootfs-incomplete"
         private const val TAR_BLOCK_SIZE = 512
         private const val BUFFER_SIZE = 64 * 1024
         private const val PROGRESS_STEP_BYTES = 512 * 1024
         private const val CONNECT_TIMEOUT_MS = 30_000
         private const val READ_TIMEOUT_MS = 60_000
+        private val SHA256_REGEX = Regex("[0-9a-fA-F]{64}")
     }
 }

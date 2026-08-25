@@ -56,10 +56,14 @@ import com.dokar.sonner.ToastType
 import kotlinx.coroutines.launch
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.datastore.WebDavConfig
+import me.rerere.rikkahub.data.workspace.BackupPasswordSlot
+import me.rerere.rikkahub.data.workspace.LegacyWorkspaceArchiveRequiresConfirmationException
 import me.rerere.rikkahub.data.sync.webdav.WebDavBackupItem
 import me.rerere.rikkahub.ui.components.ui.CardGroup
 import me.rerere.rikkahub.ui.context.LocalToaster
 import me.rerere.rikkahub.ui.pages.backup.BackupVM
+import me.rerere.rikkahub.ui.pages.backup.components.BackupPasswordDialog
+import me.rerere.rikkahub.ui.pages.backup.components.LegacyBackupConfirmationDialog
 import me.rerere.rikkahub.utils.UiState
 import me.rerere.rikkahub.utils.fileSizeToString
 import me.rerere.rikkahub.utils.onError
@@ -69,10 +73,7 @@ import me.rerere.rikkahub.utils.toLocalDateTime
 import java.time.Instant
 
 @Composable
-fun WebDavTab(
-    vm: BackupVM,
-    onShowRestartDialog: () -> Unit
-) {
+fun WebDavTab(vm: BackupVM) {
     val settings by vm.settings.collectAsStateWithLifecycle()
     val webDavConfig = settings.webDavConfig
     val backupItemsState by vm.webDavBackupItems.collectAsStateWithLifecycle()
@@ -82,6 +83,79 @@ fun WebDavTab(
     var showBackupFiles by remember { mutableStateOf(false) }
     var restoringItemId by remember { mutableStateOf<String?>(null) }
     var isBackingUp by remember { mutableStateOf(false) }
+    var passwordAction by remember { mutableStateOf<WebDavPasswordAction?>(null) }
+    var passwordInitial by remember { mutableStateOf("") }
+    var pendingLegacyRestore by remember { mutableStateOf<PendingWebDavLegacyRestore?>(null) }
+    var showLegacyConfirmation by remember { mutableStateOf(false) }
+
+    fun requestPassword(action: WebDavPasswordAction) {
+        val stored = vm.storedBackupPassword(BackupPasswordSlot.WEBDAV)
+        passwordInitial = stored?.concatToString().orEmpty()
+        stored?.fill('\u0000')
+        passwordAction = action
+    }
+
+    fun startBackup(password: CharArray, rememberPassword: Boolean) {
+        scope.launch {
+            isBackingUp = true
+            try {
+                vm.backup(password)
+                if (rememberPassword) vm.rememberBackupPassword(BackupPasswordSlot.WEBDAV, password)
+                vm.loadBackupFileItems()
+                toaster.show(
+                    context.getString(R.string.backup_page_backup_success),
+                    type = ToastType.Success,
+                )
+            } catch (error: Throwable) {
+                error.printStackTrace()
+                toaster.show(
+                    error.message ?: context.getString(R.string.backup_page_unknown_error),
+                    type = ToastType.Error,
+                )
+            } finally {
+                password.fill('\u0000')
+                isBackingUp = false
+            }
+        }
+    }
+
+    fun startRestore(
+        item: WebDavBackupItem,
+        password: CharArray,
+        rememberPassword: Boolean,
+        allowLegacy: Boolean,
+    ) {
+        scope.launch {
+            restoringItemId = item.displayName
+            var waitingForLegacyConfirmation = false
+            try {
+                vm.restore(item, password, allowLegacy)
+                if (rememberPassword) vm.rememberBackupPassword(BackupPasswordSlot.WEBDAV, password)
+                vm.restoreWarnings.value.takeIf { it.isNotEmpty() }?.let { warnings ->
+                    toaster.show(warnings.joinToString("; "), type = ToastType.Warning)
+                }
+                toaster.show(
+                    context.getString(R.string.backup_page_restore_success),
+                    type = ToastType.Success,
+                )
+                showBackupFiles = false
+            } catch (legacy: LegacyWorkspaceArchiveRequiresConfirmationException) {
+                if (allowLegacy) throw legacy
+                waitingForLegacyConfirmation = true
+                pendingLegacyRestore = PendingWebDavLegacyRestore(item, password, rememberPassword)
+                showLegacyConfirmation = true
+            } catch (error: Throwable) {
+                error.printStackTrace()
+                toaster.show(
+                    context.getString(R.string.backup_page_restore_failed, error.message ?: ""),
+                    type = ToastType.Error,
+                )
+            } finally {
+                if (!waitingForLegacyConfirmation) password.fill('\u0000')
+                restoringItemId = null
+            }
+        }
+    }
 
     fun updateWebDavConfig(newConfig: WebDavConfig) {
         vm.updateSettings(settings.copy(webDavConfig = newConfig))
@@ -100,6 +174,53 @@ fun WebDavTab(
         UiState.Loading -> "${stringResource(R.string.backup_page_files)}: ..."
         UiState.Idle -> "${stringResource(R.string.backup_page_files)}: -"
         is UiState.Error -> "${stringResource(R.string.backup_page_files)}: -"
+    }
+
+    passwordAction?.let { action ->
+        BackupPasswordDialog(
+            initialPassword = passwordInitial,
+            allowRemember = true,
+            rememberByDefault = passwordInitial.isNotEmpty(),
+            onDismiss = {
+                passwordAction = null
+                passwordInitial = ""
+            },
+            onConfirm = { password, rememberPassword ->
+                passwordAction = null
+                passwordInitial = ""
+                if (!rememberPassword) vm.forgetBackupPassword(BackupPasswordSlot.WEBDAV)
+                when (action) {
+                    WebDavPasswordAction.Backup -> startBackup(password.toCharArray(), rememberPassword)
+                    is WebDavPasswordAction.Restore -> startRestore(
+                        item = action.item,
+                        password = password.toCharArray(),
+                        rememberPassword = rememberPassword,
+                        allowLegacy = false,
+                    )
+                }
+            },
+        )
+    }
+
+    if (showLegacyConfirmation) {
+        LegacyBackupConfirmationDialog(
+            onDismiss = {
+                pendingLegacyRestore?.password?.fill('\u0000')
+                pendingLegacyRestore = null
+                showLegacyConfirmation = false
+            },
+            onConfirm = {
+                val pending = pendingLegacyRestore ?: return@LegacyBackupConfirmationDialog
+                pendingLegacyRestore = null
+                showLegacyConfirmation = false
+                startRestore(
+                    item = pending.item,
+                    password = pending.password,
+                    rememberPassword = pending.rememberPassword,
+                    allowLegacy = true,
+                )
+            },
+        )
     }
 
     Column(
@@ -263,26 +384,8 @@ fun WebDavTab(
                 Text(stringResource(R.string.backup_page_restore))
             }
             Button(
-                onClick = {
-                    scope.launch {
-                        isBackingUp = true
-                        runCatching {
-                            vm.backup()
-                            vm.loadBackupFileItems()
-                            toaster.show(
-                                context.getString(R.string.backup_page_backup_success),
-                                type = ToastType.Success
-                            )
-                        }.onFailure {
-                            it.printStackTrace()
-                            toaster.show(
-                                it.message ?: context.getString(R.string.backup_page_unknown_error),
-                                type = ToastType.Error
-                            )
-                        }
-                        isBackingUp = false
-                    }
-                },
+                onClick = { requestPassword(WebDavPasswordAction.Backup) },
+
                 enabled = !isBackingUp
             ) {
                 if (isBackingUp) {
@@ -355,28 +458,7 @@ fun WebDavTab(
                                     }
                                 },
                                 onRestore = { restoreItem ->
-                                    scope.launch {
-                                        restoringItemId = restoreItem.displayName
-                                        runCatching {
-                                            vm.restore(item = restoreItem)
-                                            toaster.show(
-                                                context.getString(R.string.backup_page_restore_success),
-                                                type = ToastType.Success
-                                            )
-                                            showBackupFiles = false
-                                            onShowRestartDialog()
-                                        }.onFailure { err ->
-                                            err.printStackTrace()
-                                            toaster.show(
-                                                context.getString(
-                                                    R.string.backup_page_restore_failed,
-                                                    err.message ?: ""
-                                                ),
-                                                type = ToastType.Error
-                                            )
-                                        }
-                                        restoringItemId = null
-                                    }
+                                    requestPassword(WebDavPasswordAction.Restore(restoreItem))
                                 },
                             )
                         }
@@ -403,6 +485,17 @@ fun WebDavTab(
         }
     }
 }
+
+private sealed interface WebDavPasswordAction {
+    data object Backup : WebDavPasswordAction
+    data class Restore(val item: WebDavBackupItem) : WebDavPasswordAction
+}
+
+private data class PendingWebDavLegacyRestore(
+    val item: WebDavBackupItem,
+    val password: CharArray,
+    val rememberPassword: Boolean,
+)
 
 @Composable
 private fun BackupStatusCard(
@@ -449,7 +542,11 @@ private fun WebDavBackupItemCard(
         item(
             headlineContent = {
                 Text(
-                    text = item.displayName,
+                    text = if (item.displayName.endsWith(".zip") && !item.displayName.endsWith(".zip.enc")) {
+                        stringResource(R.string.backup_page_legacy_label, item.displayName)
+                    } else {
+                        item.displayName
+                    },
                     style = MaterialTheme.typography.titleMedium
                 )
             },

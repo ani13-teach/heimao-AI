@@ -29,6 +29,8 @@ import kotlinx.serialization.json.putJsonArray
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.core.TokenUsage
+import me.rerere.ai.core.UsageNormalizer
+import me.rerere.ai.provider.LogicalPrompt
 import me.rerere.ai.provider.Modality
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
@@ -115,7 +117,10 @@ class ChatCompletionsAPI(
             ?.jsonPrimitive
             ?.content
             ?: "unknown"
-        val usage = parseTokenUsage(bodyJson["usage"] as? JsonObject)
+        val usage = parseTokenUsage(
+            bodyJson["usage"] as? JsonObject,
+            model = bodyJson["model"]?.jsonPrimitive?.contentOrNull,
+        )
 
         TextGenerationResult(
             id = id,
@@ -225,17 +230,21 @@ class ChatCompletionsAPI(
     ): JsonObject {
         val host = providerSetting.baseUrl.toHttpUrl().host
         val isOpenRouter = host == "openrouter.ai"
+        val prompt = params.logicalPrompt ?: LogicalPrompt.fromMessages(messages, params.tools)
         return buildJsonObject {
             put("model", params.model.modelId)
             put(
                 "messages",
                 buildMessages(
-                    messages = messages,
+                    messages = prompt.toProviderMessages(includeSystem = true),
                     includeHistoryReasoning = providerSetting.includeHistoryReasoning,
                     includeOpenRouterReasoningDetails = isOpenRouter,
                     supportInputModalities = params.model.inputModalities,
                 )
             )
+            if (params.promptCacheEnabled && !params.promptCacheKey.isNullOrBlank()) {
+                put("prompt_cache_key", params.promptCacheKey)
+            }
 
             if (isModelAllowTemperature(params.model)) {
                 if (params.temperature != null) put("temperature", params.temperature)
@@ -787,18 +796,23 @@ class ChatCompletionsAPI(
         }
     }
 
-    private fun parseTokenUsage(jsonObject: JsonObject?): TokenUsage? {
+    // Keep the one-argument overload for provider usage parsing tests and old callers.
+    private fun parseTokenUsage(jsonObject: JsonObject?): TokenUsage? =
+        parseTokenUsage(jsonObject, model = null)
+
+    private fun parseTokenUsage(jsonObject: JsonObject?, model: String?): TokenUsage? {
         if (jsonObject == null) return null
-        return TokenUsage(
-            promptTokens = jsonObject["prompt_tokens"]?.jsonPrimitive?.intOrNull ?: 0,
-            completionTokens = jsonObject["completion_tokens"]?.jsonPrimitive?.intOrNull ?: 0,
-            totalTokens = jsonObject["total_tokens"]?.jsonPrimitive?.intOrNull ?: 0,
-            // 各 provider 汇报缓存命中的字段形状不统一，按方言兜底解析（#1576）：
-            // OpenAI 嵌套 -> Moonshot 顶层 cached_tokens -> DeepSeek prompt_cache_hit_tokens
-            cachedTokens = jsonObject["prompt_tokens_details"]?.jsonObjectOrNull?.get("cached_tokens")?.jsonPrimitive?.intOrNull
-                ?: jsonObject["cached_tokens"]?.jsonPrimitive?.intOrNull
-                ?: jsonObject["prompt_cache_hit_tokens"]?.jsonPrimitive?.intOrNull
-                ?: 0
+        val cachedTokens = jsonObject["prompt_tokens_details"]?.jsonObjectOrNull?.get("cached_tokens")?.jsonPrimitive?.intOrNull
+            ?: jsonObject["cached_tokens"]?.jsonPrimitive?.intOrNull
+            ?: jsonObject["prompt_cache_hit_tokens"]?.jsonPrimitive?.intOrNull
+            ?: 0
+        return UsageNormalizer.normalize(
+            totalInputTokens = jsonObject["prompt_tokens"]?.jsonPrimitive?.intOrNull,
+            completionTokens = jsonObject["completion_tokens"]?.jsonPrimitive?.intOrNull,
+            totalTokens = jsonObject["total_tokens"]?.jsonPrimitive?.intOrNull,
+            cacheReadTokens = cachedTokens,
+            provider = "openai",
+            model = model,
         )
     }
 
