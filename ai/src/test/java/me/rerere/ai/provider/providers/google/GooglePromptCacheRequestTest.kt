@@ -50,6 +50,6 @@ class GooglePromptCacheRequestTest {
                 part.jsonObject["text"]?.jsonPrimitive?.content
             }
         }
-        assertEquals(listOf("history", "retrieval", "memory", "latest"), texts)
+        assertEquals(listOf("memory", "history", "retrieval", "latest"), texts)
     }
 }

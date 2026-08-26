@@ -2,6 +2,7 @@ package me.rerere.rikkahub.data.ai
 
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.put
 import me.rerere.rikkahub.data.model.AssistantMemory
 import me.rerere.rikkahub.data.repository.LayeredMemoryContext
@@ -26,10 +27,33 @@ internal fun buildMemoryPrompt(memories: List<AssistantMemory>) =
         appendLine()
     }
 
-internal fun buildLayeredMemoryPrompt(context: LayeredMemoryContext): String =
+internal fun buildMemoryDeltaPrompt(
+    changed: List<AssistantMemory>,
+    deletedIds: List<Int>,
+) = buildString {
+    appendLine()
+    append("**Memory Updates**")
+    appendLine()
+    append("These updates override the stable memory snapshot. Deleted IDs must be ignored.")
+    appendLine()
+    val json = buildJsonObject {
+        put("upsert", buildJsonArray {
+            changed.forEach { memory ->
+                add(buildJsonObject {
+                    put("id", memory.id)
+                    put("content", memory.content)
+                })
+            }
+        })
+        put("deleted", buildJsonArray {
+            deletedIds.forEach { add(JsonPrimitive(it)) }
+        })
+    }
+    append(JsonInstantPretty.encodeToString(json))
+    appendLine()
+}
+internal fun buildLayeredMemoryPrompt(context: LayeredMemoryContext) =
     buildString {
-        appendLine()
-        append("**Layered Memories**")
         appendLine()
         append(
             "Below is a compact memory index plus the most recent ACTIVE records. " +

@@ -1,7 +1,8 @@
 package me.rerere.ai.provider
 
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.decodeFromString
+import kotlinx.serialization.decodeFromString
+
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.UsageNormalizer
 import me.rerere.ai.ui.UIMessage
@@ -24,11 +25,11 @@ class PromptCacheModelTest {
         )
 
         assertEquals(
-            listOf("system", "history", "retrieval", "memory", "latest", "tool loop"),
+            listOf("system", "memory", "history", "retrieval", "latest", "tool loop"),
             prompt.toMessages().map { it.toText() },
         )
         assertEquals(
-            listOf("system", "history", "retrieval", "memory", "latest", "tool loop"),
+            listOf("system", "memory", "history", "retrieval", "latest", "tool loop"),
             prompt.toProviderMessages(includeSystem = true).map { it.toText() },
         )
         assertEquals(MessageRole.USER, prompt.toProviderMessages(false)[2].role)

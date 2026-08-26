@@ -26,38 +26,42 @@ data class LogicalPrompt(
     val system: List<UIMessage> = emptyList(),
     val history: List<UIMessage> = emptyList(),
     val transientContext: List<UIMessage> = emptyList(),
-    val memory: List<UIMessage> = emptyList(),
+    val memorySnapshot: List<UIMessage> = emptyList(),
+    val memoryDelta: List<UIMessage> = emptyList(),
     val latestUser: UIMessage? = null,
     val currentToolLoop: List<UIMessage> = emptyList(),
+    /** Legacy alias retained for provider tests and callers that do not use snapshot state. */
+    @Deprecated("Use memorySnapshot or memoryDelta")
+    val memory: List<UIMessage> = emptyList(),
 ) {
-    /** Whether the memory section contains content that can be sent to a provider. */
-    val hasMemory: Boolean
-        get() = memory.any { it.isValidToUpload() }
+    private val effectiveMemorySnapshot: List<UIMessage>
+        get() = if (memorySnapshot.isNotEmpty()) memorySnapshot else memory
 
-    /**
-     * Flatten the logical prompt without changing the section order. Memory and transient
-     * system messages are kept as system messages here; adapters decide how their wire format
-     * represents sections that cannot be interleaved with a provider system field.
-     */
+    /** Whether the stable memory section contains content that can be sent to a provider. */
+    val hasMemory: Boolean
+        get() = effectiveMemorySnapshot.any { it.isValidToUpload() }
+
+    /** Flatten in cache-aware order: stable snapshot, growing history, then dynamic suffix. */
     fun toMessages(): List<UIMessage> = buildList {
         addAll(system)
+        addAll(effectiveMemorySnapshot)
         addAll(history)
         addAll(transientContext)
-        addAll(memory)
+        addAll(memoryDelta)
         latestUser?.let(::add)
         addAll(currentToolLoop)
     }
 
     /**
-     * Flatten the prompt for a provider whose system field is separate from its message list.
-     * Memory/transient system messages are represented as user context so their position after
-     * history remains observable on the wire. The stable [system] section is optionally kept.
+     * Flatten for providers with a separate system field. Snapshot stays directly after the
+     * stable system prefix; dynamic memory is deliberately kept after history.
      */
     fun toProviderMessages(includeSystem: Boolean): List<UIMessage> = buildList {
         if (includeSystem) addAll(system)
+        effectiveMemorySnapshot.forEach { add(it.asContextMessage()) }
         addAll(history)
         transientContext.forEach { add(it.asContextMessage()) }
-        memory.forEach { add(it.asContextMessage()) }
+        memoryDelta.forEach { add(it.asContextMessage()) }
         latestUser?.let(::add)
         addAll(currentToolLoop)
     }

@@ -50,12 +50,15 @@ import me.rerere.rikkahub.data.repository.MemoryRepository
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
 import me.rerere.rikkahub.utils.applyPlaceholders
 import java.util.Locale
+import java.util.LinkedHashMap
 import kotlin.time.Clock
 import kotlin.uuid.Uuid
 
 private const val TAG = "GenerationHandler"
 private const val MAX_TOOL_OUTPUT_CHARS = 32 * 1024
 private const val TOOL_OUTPUT_PREVIEW_CHARS = 4 * 1024
+private const val MAX_MEMORY_SNAPSHOT_ENTRIES = 32
+
 
 @Serializable
 sealed interface GenerationChunk {
@@ -80,6 +83,40 @@ class GenerationHandler(
     private val memoryRepo: MemoryRepository,
     private val workspaceRepository: WorkspaceRepository,
 ) {
+    private data class MemorySnapshotState(
+        val snapshot: List<AssistantMemory>,
+    )
+
+    private val memorySnapshots = object : LinkedHashMap<String, MemorySnapshotState>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, MemorySnapshotState>): Boolean =
+            size > MAX_MEMORY_SNAPSHOT_ENTRIES
+    }
+
+    private fun memorySnapshotFor(
+        key: String?,
+        current: List<AssistantMemory>,
+    ): Pair<List<AssistantMemory>, List<UIMessage>> {
+        if (key.isNullOrBlank()) {
+            return emptyList<AssistantMemory>() to listOf(
+                UIMessage.user(buildMemoryDeltaPrompt(current, emptyList()))
+            )
+        }
+        synchronized(memorySnapshots) {
+            val state = memorySnapshots[key]
+            if (state == null) {
+                memorySnapshots[key] = MemorySnapshotState(current)
+                return current to emptyList()
+            }
+            val oldById = state.snapshot.associateBy { it.id }
+            val currentById = current.associateBy { it.id }
+            val changed = current.filter { it != oldById[it.id] }
+            val deleted = oldById.keys - currentById.keys
+            if (changed.isEmpty() && deleted.isEmpty()) return state.snapshot to emptyList()
+            val delta = buildMemoryDeltaPrompt(changed, deleted.sorted())
+            return state.snapshot to listOf(UIMessage.user(delta))
+        }
+    }
+
     fun generateText(
         settings: Settings,
         model: Model,
@@ -116,6 +153,15 @@ class GenerationHandler(
             } else {
                 null
             }
+
+            val currentMemories = if (memoryAssistantId == null || useLayeredMemory) {
+                emptyList()
+            } else if (assistant.useGlobalMemory) {
+                memoryRepo.getGlobalMemoriesForPrompt()
+            } else {
+                memoryRepo.getMemoriesOfAssistantForPrompt(assistant.id.toString())
+            }
+            val (memorySnapshot, memoryDelta) = memorySnapshotFor(promptCacheKey, currentMemories)
 
             // 分层记忆：每次生成前重建索引 + ACTIVE 上下文（只记统计，不打印正文）
             val layeredMemoryContext = if (useLayeredMemory) {
@@ -217,7 +263,9 @@ class GenerationHandler(
                     providerImpl = providerImpl,
                     provider = provider,
                     tools = toolsInternal,
-                    memories = if (useLayeredMemory) emptyList() else memories ?: emptyList(),
+                    memories = currentMemories,
+                    memorySnapshot = memorySnapshot,
+                    memoryDelta = memoryDelta,
                     layeredMemoryContext = layeredMemoryContext,
                     stream = assistant.streamOutput,
                     processingStatus = processingStatus,
@@ -425,6 +473,8 @@ class GenerationHandler(
         provider: ProviderSetting,
         tools: List<Tool>,
         memories: List<AssistantMemory>,
+        memorySnapshot: List<AssistantMemory>,
+        memoryDelta: List<UIMessage>,
         stream: Boolean,
         processingStatus: MutableStateFlow<String?> = MutableStateFlow(null),
         conversationSystemPrompt: String? = null,
@@ -453,7 +503,7 @@ class GenerationHandler(
             if (layeredMemoryContext != null) {
                 buildLayeredMemoryPrompt(layeredMemoryContext)
             } else {
-                buildMemoryPrompt(memories = memories)
+                buildMemoryPrompt(memories = memorySnapshot)
             }
         } else {
             ""
@@ -463,16 +513,12 @@ class GenerationHandler(
         } else if (layeredMemoryContext != null) {
             layeredMemoryContext.indexCount > 0 || layeredMemoryContext.activeCount > 0
         } else {
-            memories.any { it.content.isNotBlank() }
+            memorySnapshot.any { it.content.isNotBlank() }
         }
 
-        // Transformers still see the same stable prompt, memory and conversation material,
-        // but the final logical prompt is assembled only after transformation so every
-        // provider receives the same history/transient/memory/latest-user order.
         val transformed = buildList {
             add(UIMessage.system(prompt = stableSystemPrompt))
             addAll(limitedMessages)
-            if (hasMemoryContent) add(UIMessage.system(prompt = memoryPrompt))
         }.transforms(
             transformers = transformers,
             context = context,
@@ -486,7 +532,6 @@ class GenerationHandler(
         )
         val systemMessages = transformed.filter { it.role == MessageRole.SYSTEM }
         val stableSystem = systemMessages.firstOrNull() ?: UIMessage.system(stableSystemPrompt)
-        val memoryMessages = if (hasMemoryContent) systemMessages.drop(1) else emptyList()
         val conversationMessages = transformed.filter { it.role != MessageRole.SYSTEM }
         val latestUserIndex = conversationMessages.indexOfLast { it.role == MessageRole.USER }
         val logicalPrompt = LogicalPrompt(
@@ -498,7 +543,8 @@ class GenerationHandler(
                 conversationMessages
             },
             transientContext = additionalContextMessages,
-            memory = memoryMessages,
+            memorySnapshot = if (hasMemoryContent) listOf(UIMessage.system(prompt = memoryPrompt)) else emptyList(),
+            memoryDelta = if (assistant.enableMemory && layeredMemoryContext == null) memoryDelta else emptyList(),
             latestUser = conversationMessages.getOrNull(latestUserIndex),
             currentToolLoop = if (latestUserIndex >= 0) {
                 conversationMessages.drop(latestUserIndex + 1)

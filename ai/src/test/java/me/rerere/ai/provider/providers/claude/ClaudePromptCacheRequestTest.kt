@@ -128,31 +128,25 @@ class ClaudePromptCacheRequestTest {
     @Test
     fun `dynamic system memory must not move cache breakpoint past stable prefix`() {
         val providerSetting = ProviderSetting.Claude(promptCaching = true)
-        val messages = listOf(
-            UIMessage.system("stable instructions and tools"),
-            UIMessage.system("dynamic memories"),
-            UIMessage.user("hello")
+        val prompt = LogicalPrompt(
+            system = listOf(UIMessage.system("stable instructions and tools")),
+            memorySnapshot = listOf(UIMessage.system("dynamic memories")),
+            latestUser = UIMessage.user("hello"),
         )
+        val messages = prompt.toMessages()
         val params = TextGenerationParams(
             model = Model(modelId = "claude-test", abilities = emptyList()),
-            tools = emptyList()
+            tools = emptyList(),
+            logicalPrompt = prompt
         )
 
         val system = buildRequest(providerSetting, messages, params)["system"]!!.jsonArray
-        assertEquals(1, system.size)
+        assertEquals(2, system.size)
         assertNull(system[0].jsonObject["cache_control"])
+        assertNotNull(system[1].jsonObject["cache_control"])
 
         val history = buildRequest(providerSetting, messages, params)["messages"]!!.jsonArray
-        val dynamic = history.first { message ->
-            message.jsonObject["content"]?.jsonArray?.any {
-                it.jsonObject["type"]?.jsonPrimitive?.content == "text" &&
-                    it.jsonObject["text"]?.jsonPrimitive?.content == "dynamic memories"
-            } == true
-        }
-        assertNotNull(dynamic)
-        assertNotNull(
-            dynamic.jsonObject["content"]!!.jsonArray.first().jsonObject["cache_control"]
-        )
+        assertEquals(1, history.size)
     }
     @Test
     fun `promptCaching=true without system should add cache_control to last tool`() {
@@ -393,7 +387,7 @@ class ClaudePromptCacheRequestTest {
 
     @Test
     fun `historical tool call and result stay adjacent and in order`() {
-        val tool = Tool(
+        val tool = UIMessagePart.Tool(
             toolCallId = "call-1",
             toolName = "lookup",
             input = "{}",

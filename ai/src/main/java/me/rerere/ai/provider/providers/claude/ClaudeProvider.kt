@@ -490,14 +490,32 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
                         }
                     }
             }
+        } + prompt.memorySnapshot.flatMap { message ->
+            message.parts.mapNotNull { part ->
+                (part as? UIMessagePart.Text)
+                    ?.takeIf { it.text.isNotBlank() }
+                    ?.let { textPart ->
+                        buildJsonObject {
+                            put("type", "text")
+                            put("text", textPart.text)
+                        }
+                    }
+            }
         }
+        val stableSystemBlockCount = prompt.system.sumOf { message ->
+            message.parts.count { part -> part is UIMessagePart.Text && part.text.isNotBlank() }
+        }
+        val memorySnapshotBlockCount = systemBlocks.size - stableSystemBlockCount
         val toolDefinitions = buildToolDefinitions(params)
         val layout = ClaudeRequestLayout(
             history = renderedMessages.locationsFor(ClaudePromptRegion.HISTORY),
             transient = renderedMessages.locationsFor(ClaudePromptRegion.TRANSIENT),
             memory = renderedMessages.locationsFor(ClaudePromptRegion.MEMORY),
+            memoryDelta = renderedMessages.locationsFor(ClaudePromptRegion.MEMORY_DELTA),
             memoryPresent = prompt.hasMemory,
-            system = systemBlocks.indices.map(ClaudeCacheLocation::System),
+            memorySnapshot = (stableSystemBlockCount until systemBlocks.size)
+                .map(ClaudeCacheLocation::System),
+            system = (0 until stableSystemBlockCount).map(ClaudeCacheLocation::System),
             tools = toolDefinitions.indices.map(ClaudeCacheLocation::Tool),
         )
 
@@ -556,13 +574,6 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
             return request
         }
 
-        val historyResult = applyCacheBoundary(
-            request = request,
-            boundary = CacheBoundary.HISTORY_END,
-            layout = layout,
-            promptCacheTtl = providerSetting.promptCacheTtl,
-        )
-        request = historyResult.request
         val memoryResult = applyCacheBoundary(
             request = request,
             boundary = CacheBoundary.MEMORY_END,
@@ -570,11 +581,13 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
             promptCacheTtl = providerSetting.promptCacheTtl,
         )
         request = memoryResult.request
-        Log.d(
-            TAG,
-            "[PromptCache] provider=claude model=${params.model.modelId} " +
-                "historyBreakpoint=${historyResult.applied} memoryBreakpoint=${memoryResult.applied}"
+        val historyResult = applyCacheBoundary(
+            request = request,
+            boundary = CacheBoundary.HISTORY_END,
+            layout = layout,
+            promptCacheTtl = providerSetting.promptCacheTtl,
         )
+        request = historyResult.request
         return request
     }
 
@@ -626,6 +639,7 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
         addSection(prompt.history, ClaudePromptRegion.HISTORY)
         addSection(prompt.transientContext, ClaudePromptRegion.TRANSIENT)
         addSection(prompt.memory, ClaudePromptRegion.MEMORY)
+        addSection(prompt.memoryDelta, ClaudePromptRegion.MEMORY_DELTA)
         prompt.latestUser?.let { addSection(listOf(it), ClaudePromptRegion.CURRENT) }
         addSection(prompt.currentToolLoop, ClaudePromptRegion.CURRENT)
     }
@@ -649,7 +663,9 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
             history = rendered.locationsFor(ClaudePromptRegion.HISTORY),
             transient = rendered.locationsFor(ClaudePromptRegion.TRANSIENT),
             memory = rendered.locationsFor(ClaudePromptRegion.MEMORY),
+            memoryDelta = rendered.locationsFor(ClaudePromptRegion.MEMORY_DELTA),
             memoryPresent = prompt.hasMemory,
+            memorySnapshot = emptyList(),
             system = emptyList(),
             tools = emptyList(),
         )
@@ -683,6 +699,7 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
         HISTORY,
         TRANSIENT,
         MEMORY,
+        MEMORY_DELTA,
         CURRENT,
     }
 
@@ -696,7 +713,9 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
         val history: List<ClaudeCacheLocation>,
         val transient: List<ClaudeCacheLocation>,
         val memory: List<ClaudeCacheLocation>,
+        val memoryDelta: List<ClaudeCacheLocation>,
         val memoryPresent: Boolean,
+        val memorySnapshot: List<ClaudeCacheLocation>,
         val system: List<ClaudeCacheLocation>,
         val tools: List<ClaudeCacheLocation>,
     )
@@ -714,15 +733,18 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
         promptCacheTtl: ClaudePromptCacheTtl,
     ): ClaudeCacheBoundaryResult {
         val candidates = when (boundary) {
-            // History is the longest stable prefix. If no history block is legal, fall back
-            // to the stable system and finally the tool definitions.
-            CacheBoundary.HISTORY_END -> layout.history.asReversed() +
+            CacheBoundary.HISTORY_END -> if (layout.history.isNotEmpty()) {
+                layout.history.asReversed()
+            } else if (layout.memorySnapshot.isEmpty()) {
                 layout.system.asReversed() + layout.tools.asReversed()
+            } else {
+                emptyList()
+            }
 
-            // A memory boundary is intentionally absent when memory is empty. It may use
-            // transient context as the final legal block only when a memory section exists.
-            CacheBoundary.MEMORY_END -> if (layout.memoryPresent) {
-                layout.memory.asReversed() + layout.transient.asReversed()
+            CacheBoundary.MEMORY_END -> if (layout.memorySnapshot.isNotEmpty()) {
+                layout.memorySnapshot.asReversed()
+            } else if (layout.memoryPresent) {
+                layout.memory.asReversed()
             } else {
                 emptyList()
             }

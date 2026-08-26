@@ -123,14 +123,14 @@ class PromptCacheRequestTest {
         val chatText = chatBody["messages"]!!.jsonArray.mapNotNull { message ->
             message.jsonObject["content"]?.jsonPrimitive?.content
         }
-        assertEquals(listOf("system", "history", "retrieval", "memory", "latest"), chatText)
+        assertEquals(listOf("system", "memory", "history", "retrieval", "latest"), chatText)
 
         val responseText = responseBody["input"]!!.jsonArray.mapNotNull { item ->
             val content = item.jsonObject["content"] ?: return@mapNotNull null
             (content as? JsonPrimitive)?.contentOrNull ?: content.jsonArray.firstOrNull()
                 ?.jsonObject?.get("text")?.jsonPrimitive?.content
         }
-        assertEquals(listOf("history", "retrieval", "memory", "latest"), responseText)
+        assertEquals(listOf("memory", "history", "retrieval", "latest"), responseText)
         assertEquals("system", responseBody["instructions"]?.jsonPrimitive?.content)
     }
 }
