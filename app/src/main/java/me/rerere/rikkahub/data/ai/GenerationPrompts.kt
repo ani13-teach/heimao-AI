@@ -27,18 +27,37 @@ internal fun buildMemoryPrompt(memories: List<AssistantMemory>) =
         appendLine()
     }
 
-internal fun buildMemoryDeltaPrompt(
+internal fun buildMemoryBasePrompt(memories: List<AssistantMemory>) =
+    buildString {
+        appendLine()
+        append("**Memory Base**")
+        appendLine()
+        appendLine("This is the complete baseline memory projection. Apply every later Memory Patch block in order.")
+        appendLine("For the same ID, the later upsert wins; a deleted tombstone invalidates all older content for that ID.")
+        val json = buildJsonArray {
+            memories.sortedBy { it.id }.forEach { memory ->
+                add(buildJsonObject {
+                    put("id", memory.id)
+                    put("content", memory.content)
+                })
+            }
+        }
+        append(JsonInstantPretty.encodeToString(json))
+        appendLine()
+    }
+
+internal fun buildMemoryPatchPrompt(
     changed: List<AssistantMemory>,
     deletedIds: List<Int>,
 ) = buildString {
     appendLine()
-    append("**Memory Updates**")
+    append("**Memory Patch**")
     appendLine()
-    append("These updates override the stable memory snapshot. Deleted IDs must be ignored.")
-    appendLine()
+    appendLine("Apply this patch after all preceding memory blocks. For the same ID, this later upsert wins.")
+    appendLine("IDs in deleted are tombstones: ignore any older content for those IDs unless a later patch upserts them.")
     val json = buildJsonObject {
         put("upsert", buildJsonArray {
-            changed.forEach { memory ->
+            changed.sortedBy { it.id }.forEach { memory ->
                 add(buildJsonObject {
                     put("id", memory.id)
                     put("content", memory.content)
@@ -46,12 +65,17 @@ internal fun buildMemoryDeltaPrompt(
             }
         })
         put("deleted", buildJsonArray {
-            deletedIds.forEach { add(JsonPrimitive(it)) }
+            deletedIds.sorted().forEach { add(JsonPrimitive(it)) }
         })
     }
     append(JsonInstantPretty.encodeToString(json))
     appendLine()
 }
+
+internal fun buildMemoryDeltaPrompt(
+    changed: List<AssistantMemory>,
+    deletedIds: List<Int>,
+) = buildMemoryPatchPrompt(changed, deletedIds)
 internal fun buildLayeredMemoryPrompt(context: LayeredMemoryContext) =
     buildString {
         appendLine()

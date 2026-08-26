@@ -19,7 +19,12 @@ class PromptCacheModelTest {
             system = listOf(UIMessage.system("system")),
             history = listOf(UIMessage.user("history")),
             transientContext = listOf(UIMessage.user("retrieval")),
-            memory = listOf(UIMessage.system("memory")),
+            memorySnapshot = listOf(UIMessage.system("memory")),
+            claudeMemoryCacheBlocks = listOf(
+                ClaudeMemoryCacheBlock("claude base"),
+                ClaudeMemoryCacheBlock("claude patch"),
+            ),
+            claudeMemoryDelta = listOf(UIMessage.user("claude dynamic patch")),
             latestUser = UIMessage.user("latest"),
             currentToolLoop = listOf(UIMessage.assistant("tool loop")),
         )
@@ -33,6 +38,7 @@ class PromptCacheModelTest {
             prompt.toProviderMessages(includeSystem = true).map { it.toText() },
         )
         assertEquals(MessageRole.USER, prompt.toProviderMessages(false)[2].role)
+        assertTrue(prompt.toMessages().none { it.toText().contains("claude") })
     }
 
     @Test

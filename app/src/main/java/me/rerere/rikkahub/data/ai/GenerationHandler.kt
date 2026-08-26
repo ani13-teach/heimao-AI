@@ -18,6 +18,7 @@ import kotlinx.serialization.json.put
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.core.Tool
+import me.rerere.ai.provider.ClaudeMemoryCacheBlock
 import me.rerere.ai.provider.CustomBody
 import me.rerere.ai.provider.LogicalPrompt
 import me.rerere.ai.provider.Model
@@ -58,6 +59,8 @@ private const val TAG = "GenerationHandler"
 private const val MAX_TOOL_OUTPUT_CHARS = 32 * 1024
 private const val TOOL_OUTPUT_PREVIEW_CHARS = 4 * 1024
 private const val MAX_MEMORY_SNAPSHOT_ENTRIES = 32
+internal const val MEMORY_PATCH_COMPACTION_COUNT = 16
+internal const val MEMORY_PATCH_COMPACTION_BYTES = 16 * 1024
 
 
 @Serializable
@@ -76,6 +79,165 @@ internal fun List<UIMessage>.withAdditionalContextMessages(
     return take(insertionIndex) + additionalContextMessages + drop(insertionIndex)
 }
 
+internal data class MemoryPromptEntry(
+    val id: Int,
+    val content: String,
+) {
+    fun toAssistantMemory() = AssistantMemory(id = id, content = content)
+}
+
+internal data class MemorySnapshotState(
+    val projection: List<MemoryPromptEntry>,
+    val cacheBlocks: List<ClaudeMemoryCacheBlock>,
+    val revision: Long = 0,
+    val lastIssuedRevision: Long = revision,
+    val patchCount: Int = 0,
+    val patchBytes: Int = 0,
+) {
+    val snapshot: List<AssistantMemory>
+        get() = projection.map(MemoryPromptEntry::toAssistantMemory)
+}
+
+internal data class MemorySnapshotCommit(
+    val key: String,
+    val revision: Long,
+    val nextState: MemorySnapshotState,
+)
+
+internal data class MemorySnapshotResolution(
+    /** The current Room projection used by provider-independent flattened prompts. */
+    val snapshot: List<AssistantMemory>,
+    /** Stable append-only Base/Patch blocks used only by Claude; null keeps legacy fallback. */
+    val claudeCacheBlocks: List<ClaudeMemoryCacheBlock>? = null,
+    /** Request-local patch against [claudeCacheBlocks], committed only after provider success. */
+    val delta: List<UIMessage> = emptyList(),
+    val commit: MemorySnapshotCommit? = null,
+)
+
+private fun List<AssistantMemory>.toMemoryProjection(): List<MemoryPromptEntry> =
+    map { MemoryPromptEntry(id = it.id, content = it.content) }.sortedBy { it.id }
+
+private fun memoryBaseBlocks(projection: List<MemoryPromptEntry>): List<ClaudeMemoryCacheBlock> =
+    if (projection.isEmpty()) {
+        emptyList()
+    } else {
+        listOf(
+            ClaudeMemoryCacheBlock(
+                buildMemoryBasePrompt(projection.map(MemoryPromptEntry::toAssistantMemory))
+            )
+        )
+    }
+
+internal fun prepareMemorySnapshot(
+    memorySnapshots: MutableMap<String, MemorySnapshotState>,
+    key: String?,
+    current: List<AssistantMemory>,
+): MemorySnapshotResolution {
+    // Legacy/no-key callers retain the complete flat memory prompt and do not use patch state.
+    if (key.isNullOrBlank()) return MemorySnapshotResolution(snapshot = current)
+
+    synchronized(memorySnapshots) {
+        val currentProjection = current.toMemoryProjection()
+        val state = memorySnapshots[key]
+        if (state == null) {
+            val initialState = MemorySnapshotState(
+                projection = currentProjection,
+                cacheBlocks = memoryBaseBlocks(currentProjection),
+            )
+            memorySnapshots[key] = initialState
+            return MemorySnapshotResolution(
+                snapshot = current,
+                claudeCacheBlocks = initialState.cacheBlocks,
+            )
+        }
+
+        val oldById = state.projection.associateBy { it.id }
+        val currentById = currentProjection.associateBy { it.id }
+        val changed = currentProjection.filter { oldById[it.id]?.content != it.content }
+        val deleted = (oldById.keys - currentById.keys).sorted()
+        if (changed.isEmpty() && deleted.isEmpty()) {
+            return MemorySnapshotResolution(
+                snapshot = current,
+                claudeCacheBlocks = state.cacheBlocks,
+            )
+        }
+
+        val patchText = buildMemoryPatchPrompt(
+            changed = changed.map(MemoryPromptEntry::toAssistantMemory),
+            deletedIds = deleted,
+        )
+        val candidateRevision = state.lastIssuedRevision + 1
+        val issuedState = state.copy(lastIssuedRevision = candidateRevision)
+        memorySnapshots[key] = issuedState
+        val nextPatchCount = state.patchCount + 1
+        val nextPatchBytes = state.patchBytes + patchText.toByteArray(Charsets.UTF_8).size
+        val shouldCompact = state.cacheBlocks.isEmpty() ||
+            nextPatchCount >= MEMORY_PATCH_COMPACTION_COUNT ||
+            nextPatchBytes >= MEMORY_PATCH_COMPACTION_BYTES
+        val nextState = issuedState.copy(
+            projection = currentProjection,
+            cacheBlocks = if (shouldCompact) {
+                memoryBaseBlocks(currentProjection)
+            } else {
+                state.cacheBlocks + ClaudeMemoryCacheBlock(patchText)
+            },
+            revision = candidateRevision,
+            patchCount = if (shouldCompact) 0 else nextPatchCount,
+            patchBytes = if (shouldCompact) 0 else nextPatchBytes,
+        )
+        return MemorySnapshotResolution(
+            snapshot = current,
+            claudeCacheBlocks = state.cacheBlocks,
+            delta = listOf(UIMessage.user(patchText)),
+            commit = MemorySnapshotCommit(
+                key = key,
+                revision = candidateRevision,
+                nextState = nextState,
+            ),
+        )
+    }
+}
+
+internal fun commitMemorySnapshot(
+    memorySnapshots: MutableMap<String, MemorySnapshotState>,
+    commit: MemorySnapshotCommit?,
+    latestRoomMemories: List<AssistantMemory>,
+): Boolean {
+    if (commit == null) return false
+    val latestRoomProjection = latestRoomMemories.toMemoryProjection()
+    synchronized(memorySnapshots) {
+        val current = memorySnapshots[commit.key] ?: return false
+        if (commit.nextState.projection != latestRoomProjection) return false
+        if (commit.revision > current.revision) {
+            memorySnapshots[commit.key] = commit.nextState.copy(
+                lastIssuedRevision = maxOf(current.lastIssuedRevision, commit.nextState.lastIssuedRevision),
+            )
+            return true
+        }
+        return false
+    }
+}
+
+internal suspend fun refreshAndCommitMemorySnapshot(
+    memorySnapshots: MutableMap<String, MemorySnapshotState>,
+    commit: MemorySnapshotCommit,
+    readLatestRoomMemories: suspend () -> List<AssistantMemory>,
+    onRefreshFailure: (Throwable) -> Unit = { error ->
+        Log.w(TAG, "Failed to refresh Room memories before snapshot commit", error)
+    },
+): Boolean = try {
+    commitMemorySnapshot(
+        memorySnapshots = memorySnapshots,
+        commit = commit,
+        latestRoomMemories = readLatestRoomMemories(),
+    )
+} catch (error: CancellationException) {
+    throw error
+} catch (error: Throwable) {
+    onRefreshFailure(error)
+    false
+}
+
 class GenerationHandler(
     private val context: Context,
     private val providerManager: ProviderManager,
@@ -83,38 +245,9 @@ class GenerationHandler(
     private val memoryRepo: MemoryRepository,
     private val workspaceRepository: WorkspaceRepository,
 ) {
-    private data class MemorySnapshotState(
-        val snapshot: List<AssistantMemory>,
-    )
-
     private val memorySnapshots = object : LinkedHashMap<String, MemorySnapshotState>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, MemorySnapshotState>): Boolean =
             size > MAX_MEMORY_SNAPSHOT_ENTRIES
-    }
-
-    private fun memorySnapshotFor(
-        key: String?,
-        current: List<AssistantMemory>,
-    ): Pair<List<AssistantMemory>, List<UIMessage>> {
-        if (key.isNullOrBlank()) {
-            return emptyList<AssistantMemory>() to listOf(
-                UIMessage.user(buildMemoryDeltaPrompt(current, emptyList()))
-            )
-        }
-        synchronized(memorySnapshots) {
-            val state = memorySnapshots[key]
-            if (state == null) {
-                memorySnapshots[key] = MemorySnapshotState(current)
-                return current to emptyList()
-            }
-            val oldById = state.snapshot.associateBy { it.id }
-            val currentById = current.associateBy { it.id }
-            val changed = current.filter { it != oldById[it.id] }
-            val deleted = oldById.keys - currentById.keys
-            if (changed.isEmpty() && deleted.isEmpty()) return state.snapshot to emptyList()
-            val delta = buildMemoryDeltaPrompt(changed, deleted.sorted())
-            return state.snapshot to listOf(UIMessage.user(delta))
-        }
     }
 
     fun generateText(
@@ -154,14 +287,20 @@ class GenerationHandler(
                 null
             }
 
-            val currentMemories = if (memoryAssistantId == null || useLayeredMemory) {
-                emptyList()
-            } else if (assistant.useGlobalMemory) {
-                memoryRepo.getGlobalMemoriesForPrompt()
+            val currentMemories = readOrdinaryMemories(
+                memoryAssistantId = memoryAssistantId,
+                useGlobalMemory = assistant.useGlobalMemory,
+                useLayeredMemory = useLayeredMemory,
+            )
+            val memoryResolution = if (memoryAssistantId != null && !useLayeredMemory) {
+                prepareMemorySnapshot(
+                    memorySnapshots = memorySnapshots,
+                    key = promptCacheKey,
+                    current = currentMemories,
+                )
             } else {
-                memoryRepo.getMemoriesOfAssistantForPrompt(assistant.id.toString())
+                MemorySnapshotResolution(snapshot = currentMemories)
             }
-            val (memorySnapshot, memoryDelta) = memorySnapshotFor(promptCacheKey, currentMemories)
 
             // 分层记忆：每次生成前重建索引 + ACTIVE 上下文（只记统计，不打印正文）
             val layeredMemoryContext = if (useLayeredMemory) {
@@ -264,8 +403,9 @@ class GenerationHandler(
                     provider = provider,
                     tools = toolsInternal,
                     memories = currentMemories,
-                    memorySnapshot = memorySnapshot,
-                    memoryDelta = memoryDelta,
+                    memorySnapshot = memoryResolution.snapshot,
+                    claudeMemoryCacheBlocks = memoryResolution.claudeCacheBlocks,
+                    memoryDelta = memoryResolution.delta,
                     layeredMemoryContext = layeredMemoryContext,
                     stream = assistant.streamOutput,
                     processingStatus = processingStatus,
@@ -275,6 +415,19 @@ class GenerationHandler(
                     workspaceId = workspaceId,
                     workspaceCwd = workspaceCwd,
                 )
+                memoryResolution.commit?.let { commit ->
+                    refreshAndCommitMemorySnapshot(
+                        memorySnapshots = memorySnapshots,
+                        commit = commit,
+                        readLatestRoomMemories = {
+                            readOrdinaryMemories(
+                                memoryAssistantId = memoryAssistantId,
+                                useGlobalMemory = assistant.useGlobalMemory,
+                                useLayeredMemory = useLayeredMemory,
+                            )
+                        },
+                    )
+                }
                 messages = messages.visualTransforms(
                     transformers = outputTransformers,
                     context = context,
@@ -461,6 +614,16 @@ class GenerationHandler(
 
     }.flowOn(Dispatchers.IO)
 
+    private suspend fun readOrdinaryMemories(
+        memoryAssistantId: String?,
+        useGlobalMemory: Boolean,
+        useLayeredMemory: Boolean,
+    ): List<AssistantMemory> = when {
+        memoryAssistantId == null || useLayeredMemory -> emptyList()
+        useGlobalMemory -> memoryRepo.getGlobalMemoriesForPrompt()
+        else -> memoryRepo.getMemoriesOfAssistantForPrompt(memoryAssistantId)
+    }
+
     private suspend fun generateInternal(
         assistant: Assistant,
         settings: Settings,
@@ -474,6 +637,7 @@ class GenerationHandler(
         tools: List<Tool>,
         memories: List<AssistantMemory>,
         memorySnapshot: List<AssistantMemory>,
+        claudeMemoryCacheBlocks: List<ClaudeMemoryCacheBlock>?,
         memoryDelta: List<UIMessage>,
         stream: Boolean,
         processingStatus: MutableStateFlow<String?> = MutableStateFlow(null),
@@ -544,7 +708,12 @@ class GenerationHandler(
             },
             transientContext = additionalContextMessages,
             memorySnapshot = if (hasMemoryContent) listOf(UIMessage.system(prompt = memoryPrompt)) else emptyList(),
-            memoryDelta = if (assistant.enableMemory && layeredMemoryContext == null) memoryDelta else emptyList(),
+            claudeMemoryCacheBlocks = if (assistant.enableMemory && layeredMemoryContext == null) {
+                claudeMemoryCacheBlocks
+            } else {
+                null
+            },
+            claudeMemoryDelta = if (assistant.enableMemory && layeredMemoryContext == null) memoryDelta else emptyList(),
             latestUser = conversationMessages.getOrNull(latestUserIndex),
             currentToolLoop = if (latestUserIndex >= 0) {
                 conversationMessages.drop(latestUserIndex + 1)

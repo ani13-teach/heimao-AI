@@ -4,6 +4,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import me.rerere.ai.provider.ClaudeMemoryCacheBlock
 import me.rerere.ai.provider.LogicalPrompt
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.TextGenerationParams
@@ -22,6 +23,8 @@ class GooglePromptCacheRequestTest {
             history = listOf(UIMessage.user("history")),
             transientContext = listOf(UIMessage.user("retrieval")),
             memory = listOf(UIMessage.system("memory")),
+            claudeMemoryCacheBlocks = listOf(ClaudeMemoryCacheBlock("claude base")),
+            claudeMemoryDelta = listOf(UIMessage.user("claude patch")),
             latestUser = UIMessage.user("latest"),
         )
         val params = TextGenerationParams(

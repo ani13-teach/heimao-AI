@@ -9,9 +9,15 @@ import me.rerere.ai.ui.UIMessage
  * protocol-specific request fields, but they must not invent additional boundaries.
  */
 enum class CacheBoundary {
-    HISTORY_END,
+    SYSTEM_END,
     MEMORY_END,
+    HISTORY_END,
 }
+
+/** A Claude-only top-level system text block used for append-only memory caching. */
+data class ClaudeMemoryCacheBlock(
+    val text: String,
+)
 
 /**
  * The stable logical shape of a chat prompt.
@@ -28,6 +34,12 @@ data class LogicalPrompt(
     val transientContext: List<UIMessage> = emptyList(),
     val memorySnapshot: List<UIMessage> = emptyList(),
     val memoryDelta: List<UIMessage> = emptyList(),
+    /**
+     * Claude-only append-only Base/Patch blocks. `null` keeps the legacy memorySnapshot fallback;
+     * an empty list explicitly means managed memory with no stable blocks yet.
+     */
+    val claudeMemoryCacheBlocks: List<ClaudeMemoryCacheBlock>? = null,
+    val claudeMemoryDelta: List<UIMessage> = emptyList(),
     val latestUser: UIMessage? = null,
     val currentToolLoop: List<UIMessage> = emptyList(),
     /** Legacy alias retained for provider tests and callers that do not use snapshot state. */

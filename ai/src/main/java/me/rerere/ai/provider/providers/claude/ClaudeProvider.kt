@@ -479,6 +479,12 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
         // into the current tool-loop section instead of reclassifying transient context as history.
         val prompt = logicalPromptForRequest(messages, params)
         val renderedMessages = renderMessages(prompt)
+        val memorySystemTexts = prompt.claudeMemoryCacheBlocks?.map { it.text }
+            ?: prompt.memorySnapshot.flatMap { message ->
+                message.parts.mapNotNull { part ->
+                    (part as? UIMessagePart.Text)?.text?.takeIf { it.isNotBlank() }
+                }
+            }
         val systemBlocks = prompt.system.flatMap { message ->
             message.parts.mapNotNull { part ->
                 (part as? UIMessagePart.Text)
@@ -490,29 +496,23 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
                         }
                     }
             }
-        } + prompt.memorySnapshot.flatMap { message ->
-            message.parts.mapNotNull { part ->
-                (part as? UIMessagePart.Text)
-                    ?.takeIf { it.text.isNotBlank() }
-                    ?.let { textPart ->
-                        buildJsonObject {
-                            put("type", "text")
-                            put("text", textPart.text)
-                        }
-                    }
+        } + memorySystemTexts.map { text ->
+            buildJsonObject {
+                put("type", "text")
+                put("text", text)
             }
         }
         val stableSystemBlockCount = prompt.system.sumOf { message ->
             message.parts.count { part -> part is UIMessagePart.Text && part.text.isNotBlank() }
         }
-        val memorySnapshotBlockCount = systemBlocks.size - stableSystemBlockCount
+        val memorySnapshotBlockCount = memorySystemTexts.size
         val toolDefinitions = buildToolDefinitions(params)
         val layout = ClaudeRequestLayout(
             history = renderedMessages.locationsFor(ClaudePromptRegion.HISTORY),
             transient = renderedMessages.locationsFor(ClaudePromptRegion.TRANSIENT),
             memory = renderedMessages.locationsFor(ClaudePromptRegion.MEMORY),
             memoryDelta = renderedMessages.locationsFor(ClaudePromptRegion.MEMORY_DELTA),
-            memoryPresent = prompt.hasMemory,
+            memoryPresent = memorySnapshotBlockCount > 0 || prompt.hasMemory,
             memorySnapshot = (stableSystemBlockCount until systemBlocks.size)
                 .map(ClaudeCacheLocation::System),
             system = (0 until stableSystemBlockCount).map(ClaudeCacheLocation::System),
@@ -574,6 +574,13 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
             return request
         }
 
+        val systemResult = applyCacheBoundary(
+            request = request,
+            boundary = CacheBoundary.SYSTEM_END,
+            layout = layout,
+            promptCacheTtl = providerSetting.promptCacheTtl,
+        )
+        request = systemResult.request
         val memoryResult = applyCacheBoundary(
             request = request,
             boundary = CacheBoundary.MEMORY_END,
@@ -640,6 +647,7 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
         addSection(prompt.transientContext, ClaudePromptRegion.TRANSIENT)
         addSection(prompt.memory, ClaudePromptRegion.MEMORY)
         addSection(prompt.memoryDelta, ClaudePromptRegion.MEMORY_DELTA)
+        addSection(prompt.claudeMemoryDelta, ClaudePromptRegion.CLAUDE_MEMORY_DELTA)
         prompt.latestUser?.let { addSection(listOf(it), ClaudePromptRegion.CURRENT) }
         addSection(prompt.currentToolLoop, ClaudePromptRegion.CURRENT)
     }
@@ -700,6 +708,7 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
         TRANSIENT,
         MEMORY,
         MEMORY_DELTA,
+        CLAUDE_MEMORY_DELTA,
         CURRENT,
     }
 
@@ -733,12 +742,10 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
         promptCacheTtl: ClaudePromptCacheTtl,
     ): ClaudeCacheBoundaryResult {
         val candidates = when (boundary) {
-            CacheBoundary.HISTORY_END -> if (layout.history.isNotEmpty()) {
-                layout.history.asReversed()
-            } else if (layout.memorySnapshot.isEmpty()) {
-                layout.system.asReversed() + layout.tools.asReversed()
+            CacheBoundary.SYSTEM_END -> if (layout.system.isNotEmpty()) {
+                layout.system.asReversed()
             } else {
-                emptyList()
+                layout.tools.asReversed()
             }
 
             CacheBoundary.MEMORY_END -> if (layout.memorySnapshot.isNotEmpty()) {
@@ -748,6 +755,8 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
             } else {
                 emptyList()
             }
+
+            CacheBoundary.HISTORY_END -> layout.history.asReversed()
         }
 
         for (candidate in candidates) {
