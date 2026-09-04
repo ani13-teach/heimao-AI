@@ -15,6 +15,7 @@ import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.toMetadata
 import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.rikkahub.data.workspace.AssistantWorkspaceAccessGate
 import me.rerere.rikkahub.data.workspace.MAX_WORKSPACE_SHELL_COMMAND_CHARS
 import me.rerere.rikkahub.data.workspace.WorkspaceAuditInvocation
 import me.rerere.rikkahub.data.workspace.WorkspaceAuditSuccess
@@ -42,20 +43,25 @@ suspend fun createWorkspaceTools(
     cwd: String? = null,
     assistantId: String? = null,
     conversationId: String? = null,
+    accessGate: AssistantWorkspaceAccessGate,
 ): List<Tool> {
     if (workspaceId.isNullOrBlank()) return emptyList()
+    require(!assistantId.isNullOrBlank() && !conversationId.isNullOrBlank()) {
+        "Workspace tools require an assistant and conversation owner"
+    }
     val shellCwd = normalizeAiWorkspaceCwd(cwd)
 
     return listOf(
-        createReadFileTool(workspaceId, workspaceRepository, assistantId, conversationId, shellCwd),
-        createWriteFileTool(workspaceId, workspaceRepository, assistantId, conversationId, shellCwd),
-        createEditFileTool(workspaceId, workspaceRepository, assistantId, conversationId, shellCwd),
+        createReadFileTool(workspaceId, workspaceRepository, assistantId, conversationId, shellCwd, accessGate),
+        createWriteFileTool(workspaceId, workspaceRepository, assistantId, conversationId, shellCwd, accessGate),
+        createEditFileTool(workspaceId, workspaceRepository, assistantId, conversationId, shellCwd, accessGate),
         createShellTool(
             workspaceId = workspaceId,
             workspaceRepository = workspaceRepository,
             defaultCwd = shellCwd,
             assistantId = assistantId,
             conversationId = conversationId,
+            accessGate = accessGate,
         ),
     )
 }
@@ -70,9 +76,10 @@ private fun String.isImagePath(): Boolean =
 private fun createReadFileTool(
     workspaceId: String,
     workspaceRepository: WorkspaceRepository,
-    assistantId: String?,
-    conversationId: String?,
+    assistantId: String,
+    conversationId: String,
     auditCwd: String,
+    accessGate: AssistantWorkspaceAccessGate,
 ) = Tool(
     name = "workspace_read_file",
     description = """
@@ -88,8 +95,9 @@ private fun createReadFileTool(
         )
     },
     needsApproval = { WORKSPACE_TOOL_REQUIRES_APPROVAL },
-    execute = {
-        val params = it.jsonObject
+    execute = { input ->
+        accessGate.withWorkspaceAccess(assistantId, conversationId, workspaceId) {
+            val params = input.jsonObject
         val rawPath = params.string("path").orEmpty()
         runWorkspaceAudit(
             invocation = WorkspaceAuditInvocation(
@@ -130,15 +138,17 @@ private fun createReadFileTool(
             }
             WorkspaceAuditSuccess(value = parts, bytes = bytes)
         }
+        }
     },
 )
 
 private fun createWriteFileTool(
     workspaceId: String,
     workspaceRepository: WorkspaceRepository,
-    assistantId: String?,
-    conversationId: String?,
+    assistantId: String,
+    conversationId: String,
     auditCwd: String,
+    accessGate: AssistantWorkspaceAccessGate,
 ) = Tool(
     name = "workspace_write_file",
     description = """
@@ -161,8 +171,9 @@ private fun createWriteFileTool(
         )
     },
     needsApproval = { WORKSPACE_TOOL_REQUIRES_APPROVAL },
-    execute = {
-        val params = it.jsonObject
+    execute = { input ->
+        accessGate.withWorkspaceAccess(assistantId, conversationId, workspaceId) {
+            val params = input.jsonObject
         val rawPath = params.string("path").orEmpty()
         val overwrite = params.boolean("overwrite", default = true)
         runWorkspaceAudit(
@@ -185,15 +196,17 @@ private fun createWriteFileTool(
                 details = buildJsonObject { put("overwrite", overwrite) }.toString(),
             )
         }
+        }
     },
 )
 
 private fun createEditFileTool(
     workspaceId: String,
     workspaceRepository: WorkspaceRepository,
-    assistantId: String?,
-    conversationId: String?,
+    assistantId: String,
+    conversationId: String,
     auditCwd: String,
+    accessGate: AssistantWorkspaceAccessGate,
 ) = Tool(
     name = "workspace_edit_file",
     description = """
@@ -222,8 +235,9 @@ private fun createEditFileTool(
         )
     },
     needsApproval = { WORKSPACE_TOOL_REQUIRES_APPROVAL },
-    execute = {
-        val params = it.jsonObject
+    execute = { input ->
+        accessGate.withWorkspaceAccess(assistantId, conversationId, workspaceId) {
+            val params = input.jsonObject
         val rawPath = params.string("path").orEmpty()
         val replaceAll = params.boolean("replace_all", default = false)
         runWorkspaceAudit(
@@ -274,6 +288,7 @@ private fun createEditFileTool(
                     put("replaceAll", replaceAll)
                 }.toString(),
             )
+        }
         }
     },
 )
@@ -329,8 +344,9 @@ private fun createShellTool(
     workspaceId: String,
     workspaceRepository: WorkspaceRepository,
     defaultCwd: String = "",
-    assistantId: String?,
-    conversationId: String?,
+    assistantId: String,
+    conversationId: String,
+    accessGate: AssistantWorkspaceAccessGate,
 ) = Tool(
     name = "workspace_shell",
     description = workspaceShellDescription(defaultCwd),
@@ -341,8 +357,9 @@ private fun createShellTool(
         )
     },
     needsApproval = { WORKSPACE_TOOL_REQUIRES_APPROVAL },
-    execute = {
-        val params = it.jsonObject
+    execute = { input ->
+        accessGate.withWorkspaceAccess(assistantId, conversationId, workspaceId) {
+            val params = input.jsonObject
         val rawCommand = params.string("command").orEmpty()
         val rawCwd = params.string("cwd") ?: defaultCwd
         val auditCwd = runCatching { normalizeAiWorkspaceCwd(rawCwd) }.getOrDefault("")
@@ -396,6 +413,7 @@ private fun createShellTool(
                     if (result.truncated) put("truncated", true)
                 }.toString(),
             )
+        }
         }
     },
 )

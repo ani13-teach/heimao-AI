@@ -17,6 +17,8 @@ data class Model(
     val abilities: List<ModelAbility> = emptyList(),
     val tools: Set<BuiltInTools> = emptySet(),
     val providerOverwrite: ProviderSetting? = null,
+    /** Whether this model uses streaming. Null is accepted only for legacy settings migration. */
+    val streamOutput: Boolean? = null,
 )
 
 @Serializable

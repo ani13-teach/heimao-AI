@@ -27,6 +27,16 @@ import me.rerere.rikkahub.utils.JsonInstant
 import java.time.Instant
 import kotlin.uuid.Uuid
 
+internal fun mergeConversationForRegularUpdate(
+    incoming: Conversation,
+    existing: ConversationEntity,
+): Conversation = incoming.copy(
+    assistantId = Uuid.parse(existing.assistantId),
+    folderId = existing.folderId.ifEmpty { null }?.let(Uuid::parse),
+    conversationNumber = existing.conversationNumber,
+    workspaceCwd = existing.workspaceCwd.ifEmpty { null },
+)
+
 class ConversationRepository(
     private val conversationDAO: ConversationDAO,
     private val messageNodeDAO: MessageNodeDAO,
@@ -357,7 +367,6 @@ class ConversationRepository(
         summarizerAssistantId: Uuid,
         sourceConversationIds: List<Uuid>,
         title: String,
-        workspaceId: Uuid? = null,
     ): Conversation {
         val normalizedIds = sourceConversationIds.distinct()
         require(normalizedIds.isNotEmpty()) { "At least one source conversation is required" }
@@ -370,7 +379,6 @@ class ConversationRepository(
             assistantId = summarizerAssistantId,
             title = title,
             messageNodes = emptyList(),
-            workspaceId = workspaceId,
             summarySourceAssistantId = sourceAssistantId,
             summarySourceConversationIds = normalizedIds,
         )
@@ -389,7 +397,7 @@ class ConversationRepository(
 
     suspend fun insertConversation(conversation: Conversation): Conversation {
         val persistedConversation = database.withTransaction {
-            val numberedConversation = assignConversationNumber(conversation.normalizeWorkspaceState())
+            val numberedConversation = assignConversationNumber(conversation.copy(workspaceCwd = null))
             conversationDAO.insert(
                 conversationToConversationEntity(numberedConversation)
             )
@@ -403,18 +411,10 @@ class ConversationRepository(
     suspend fun updateConversation(conversation: Conversation): Conversation {
         val persistedConversation = database.withTransaction {
             val existing = conversationDAO.getConversationById(conversation.id.toString())
-            val workspaceSafeConversation = (if (
-                existing != null &&
-                parsePersistedWorkspaceId(existing.workspaceId) != conversation.workspaceId
-            ) {
-                conversation.copy(workspaceCwd = null)
-            } else {
-                conversation
-            }).normalizeWorkspaceState()
             val numberedConversation = if (existing != null) {
-                workspaceSafeConversation.copy(conversationNumber = existing.conversationNumber)
+                mergeConversationForRegularUpdate(conversation, existing)
             } else {
-                assignConversationNumber(workspaceSafeConversation)
+                assignConversationNumber(conversation.copy(workspaceCwd = null))
             }
             conversationDAO.update(
                 conversationToConversationEntity(numberedConversation)
@@ -530,28 +530,27 @@ class ConversationRepository(
     }
 
     fun conversationToConversationEntity(conversation: Conversation): ConversationEntity {
-        val normalizedConversation = conversation.normalizeWorkspaceState()
-        require(normalizedConversation.messageNodes.none { it.messages.any { message -> message.hasBase64Part() } })
+        require(conversation.messageNodes.none { it.messages.any { message -> message.hasBase64Part() } })
         return ConversationEntity(
-            id = normalizedConversation.id.toString(),
-            title = normalizedConversation.title,
+            id = conversation.id.toString(),
+            title = conversation.title,
             nodes = "[]",  // nodes 现在存储在单独的表中
-            createAt = normalizedConversation.createAt.toEpochMilli(),
-            updateAt = normalizedConversation.updateAt.toEpochMilli(),
-            assistantId = normalizedConversation.assistantId.toString(),
-            chatSuggestions = JsonInstant.encodeToString(normalizedConversation.chatSuggestions),
-            isPinned = normalizedConversation.isPinned,
-            customSystemPrompt = normalizedConversation.customSystemPrompt ?: "",
-            modeInjectionIds = JsonInstant.encodeToString(normalizedConversation.modeInjectionIds),
-            workspaceId = normalizedConversation.workspaceId?.toString(),
-            workspaceCwd = normalizedConversation.workspaceCwd ?: "",
-            folderId = normalizedConversation.folderId?.toString() ?: "",
-            conversationNumber = normalizedConversation.conversationNumber,
-            summarySourceAssistantId = normalizedConversation.summarySourceAssistantId?.toString() ?: "",
+            createAt = conversation.createAt.toEpochMilli(),
+            updateAt = conversation.updateAt.toEpochMilli(),
+            assistantId = conversation.assistantId.toString(),
+            chatSuggestions = JsonInstant.encodeToString(conversation.chatSuggestions),
+            isPinned = conversation.isPinned,
+            customSystemPrompt = conversation.customSystemPrompt ?: "",
+            modeInjectionIds = JsonInstant.encodeToString(conversation.modeInjectionIds),
+            workspaceId = null,
+            workspaceCwd = conversation.workspaceCwd ?: "",
+            folderId = conversation.folderId?.toString() ?: "",
+            conversationNumber = conversation.conversationNumber,
+            summarySourceAssistantId = conversation.summarySourceAssistantId?.toString() ?: "",
             summarySourceConversationIds = JsonInstant.encodeToString(
-                normalizedConversation.summarySourceConversationIds.map { it.toString() }
+                conversation.summarySourceConversationIds.map { it.toString() }
             ),
-            summaryContext = normalizedConversation.summaryContext,
+            summaryContext = conversation.summaryContext,
         )
     }
 
@@ -559,7 +558,6 @@ class ConversationRepository(
         conversationEntity: ConversationEntity,
         messageNodes: List<MessageNode>
     ): Conversation {
-        val workspaceId = parsePersistedWorkspaceId(conversationEntity.workspaceId)
         return Conversation(
             id = Uuid.parse(conversationEntity.id),
             title = conversationEntity.title,
@@ -571,8 +569,7 @@ class ConversationRepository(
             isPinned = conversationEntity.isPinned,
             customSystemPrompt = conversationEntity.customSystemPrompt.ifEmpty { null },
             modeInjectionIds = JsonInstant.decodeFromString(conversationEntity.modeInjectionIds),
-            workspaceId = workspaceId,
-            workspaceCwd = workspaceId?.let { conversationEntity.workspaceCwd.ifEmpty { null } },
+            workspaceCwd = conversationEntity.workspaceCwd.ifEmpty { null },
             folderId = conversationEntity.folderId.ifEmpty { null }?.let { Uuid.parse(it) },
             conversationNumber = conversationEntity.conversationNumber,
             summarySourceAssistantId = conversationEntity.summarySourceAssistantId
@@ -614,7 +611,6 @@ class ConversationRepository(
     }
 
     private fun conversationSummaryToConversation(entity: LightConversationEntity): Conversation {
-        val workspaceId = parsePersistedWorkspaceId(entity.workspaceId)
         return Conversation(
             id = Uuid.parse(entity.id),
             assistantId = Uuid.parse(entity.assistantId),
@@ -624,9 +620,18 @@ class ConversationRepository(
             updateAt = Instant.ofEpochMilli(entity.updateAt),
             conversationNumber = entity.conversationNumber,
             messageNodes = emptyList(),
-            workspaceId = workspaceId,
             folderId = entity.folderId.ifEmpty { null }?.let { Uuid.parse(it) },
         )
+    }
+
+    suspend fun updateConversationWorkspaceCwd(conversationId: Uuid, workspaceCwd: String?) {
+        conversationDAO.updateWorkspaceCwd(conversationId.toString(), workspaceCwd.orEmpty())
+    }
+
+    suspend fun moveConversationToAssistant(conversationId: Uuid, assistantId: Uuid) {
+        require(conversationDAO.moveToAssistant(conversationId.toString(), assistantId.toString()) == 1) {
+            "Conversation not found"
+        }
     }
 
     private suspend fun loadMessageNodes(conversationId: String): List<MessageNode> {
@@ -696,17 +701,9 @@ data class LightConversationEntity(
     val updateAt: Long,
     val conversationNumber: Long = 0,
     val folderId: String = "",
-    val workspaceId: String? = null,
 )
 
 data class ConversationPageResult(
     val items: List<Conversation>,
     val nextOffset: Int?,
 )
-
-private fun parsePersistedWorkspaceId(value: String?): Uuid? = value
-    ?.takeIf { it.isNotBlank() }
-    ?.let { runCatching { Uuid.parse(it) }.getOrNull() }
-
-private fun Conversation.normalizeWorkspaceState(): Conversation =
-    if (workspaceId == null && workspaceCwd != null) copy(workspaceCwd = null) else this

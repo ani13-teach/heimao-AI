@@ -33,6 +33,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.SheetValue
 import androidx.compose.material3.rememberBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -81,6 +82,8 @@ import me.rerere.rikkahub.ui.components.ui.permission.rememberPermissionState
 import me.rerere.rikkahub.ui.context.LocalNavController
 import me.rerere.rikkahub.ui.context.LocalSettings
 import me.rerere.rikkahub.ui.hooks.ChatInputState
+import me.rerere.rikkahub.ui.workspace.WorkspaceBindingUiState
+import me.rerere.rikkahub.ui.workspace.messageResource
 import me.rerere.workspace.WorkspaceShellStatus
 import org.koin.compose.koinInject
 import kotlin.uuid.Uuid
@@ -94,6 +97,9 @@ internal fun FilesPicker(
     onCompressContext: (additionalPrompt: String, targetTokens: Int, keepRecentMessages: Int) -> Job,
     onUpdateAssistant: (Assistant) -> Unit,
     onUpdateConversation: (Conversation) -> Unit,
+    onUpdateWorkspaceCwd: (String?) -> Unit,
+    workspaceBinding: WorkspaceBindingUiState,
+    onSetWorkspaceBinding: (Uuid?) -> Unit,
     showInjectionSheet: Boolean,
     onShowInjectionSheetChange: (Boolean) -> Unit,
     showCompressDialog: Boolean,
@@ -140,9 +146,10 @@ internal fun FilesPicker(
 
         if (workspaces.isNotEmpty()) {
             WorkspacePickerListItem(
-                conversation = conversation,
+                assistant = assistant,
                 workspaces = workspaces,
-                onUpdateConversation = onUpdateConversation,
+                workspaceBinding = workspaceBinding,
+                onSetWorkspaceBinding = onSetWorkspaceBinding,
                 onNavigateToDetail = { id ->
                     onDismiss()
                     navController.navigate(Screen.WorkspaceDetail(id))
@@ -156,6 +163,13 @@ internal fun FilesPicker(
                     navController.navigate(Screen.Workspaces)
                 },
             )
+            workspaceBinding.error?.let { error ->
+                Text(
+                    text = stringResource(error.messageResource()),
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
         }
 
         if (settings.mcpServers.isNotEmpty()) {
@@ -234,13 +248,15 @@ internal fun FilesPicker(
                 },
         )
 
-        // Workspace CWD is owned by the conversation, not the assistant's current binding.
-        val conversationWorkspaceId = conversation.workspaceId?.toString()
+        val conversationWorkspaceId = assistant.workspaceId?.toString()
         val boundWorkspace = remember(workspaces, conversationWorkspaceId) {
             workspaces.find { it.id == conversationWorkspaceId }
         }
         if (boundWorkspace != null && boundWorkspace.shellStatus == WorkspaceShellStatus.READY.name) {
-            var showCwdSheet by remember { mutableStateOf(false) }
+            var showCwdSheet by remember(boundWorkspace.id) { mutableStateOf(false) }
+            LaunchedEffect(boundWorkspace.id) {
+                showCwdSheet = false
+            }
             TextButton(
                 onClick = { showCwdSheet = true },
                 modifier = Modifier.fillMaxWidth(),
@@ -262,9 +278,7 @@ internal fun FilesPicker(
                 WorkspaceCwdPickerSheet(
                     workspaceId = boundWorkspace.id,
                     currentCwd = conversation.workspaceCwd,
-                    onSelectCwd = { newCwd ->
-                        onUpdateConversation(conversation.copy(workspaceCwd = newCwd))
-                    },
+                    onSelectCwd = onUpdateWorkspaceCwd,
                     onDismiss = { showCwdSheet = false },
                 )
             }
@@ -297,17 +311,19 @@ internal fun FilesPicker(
 
 @Composable
 private fun WorkspacePickerListItem(
-    conversation: Conversation,
+    assistant: Assistant,
     workspaces: List<WorkspaceEntity>,
-    onUpdateConversation: (Conversation) -> Unit,
+    workspaceBinding: WorkspaceBindingUiState,
+    onSetWorkspaceBinding: (Uuid?) -> Unit,
     onNavigateToDetail: (String) -> Unit,
     onNavigateToTerminal: (String) -> Unit,
     onNavigateToManage: () -> Unit,
 ) {
     var showSheet by remember { mutableStateOf(false) }
-    val conversationWorkspaceId = conversation.workspaceId?.toString()
-    val boundWorkspace = remember(workspaces, conversationWorkspaceId) {
-        workspaces.find { it.id == conversationWorkspaceId }
+    var hasPendingRequest by remember { mutableStateOf(false) }
+    val assistantWorkspaceId = assistant.workspaceId?.toString()
+    val boundWorkspace = remember(workspaces, assistantWorkspaceId) {
+        workspaces.find { it.id == assistantWorkspaceId }
     }
 
     ListItem(
@@ -358,19 +374,27 @@ private fun WorkspacePickerListItem(
     )
 
     if (showSheet) {
+        LaunchedEffect(workspaceBinding.isSubmitting, workspaceBinding.error, assistantWorkspaceId) {
+            if (hasPendingRequest && !workspaceBinding.isSubmitting && workspaceBinding.error == null &&
+                workspaceBinding.committedWorkspaceId?.toString() == assistantWorkspaceId
+            ) {
+                hasPendingRequest = false
+                showSheet = false
+            }
+        }
         WorkspaceSelectSheet(
-            selectedWorkspaceId = conversationWorkspaceId,
+            selectedWorkspaceId = assistantWorkspaceId,
             workspaces = workspaces,
             onSelect = { workspaceId ->
-                val newId = workspaceId?.let { Uuid.parse(it) }
-                onUpdateConversation(conversation.withWorkspaceId(newId))
-                showSheet = false
+                hasPendingRequest = true
+                onSetWorkspaceBinding(workspaceId?.let { Uuid.parse(it) })
             },
             onManage = {
                 showSheet = false
                 onNavigateToManage()
             },
             onDismiss = { showSheet = false },
+            enabled = !workspaceBinding.isSubmitting,
         )
     }
 }

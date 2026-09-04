@@ -1,13 +1,11 @@
 package me.rerere.rikkahub.data.datastore
 
 import android.content.Context
-import android.util.Log
 import androidx.datastore.core.IOException
 import androidx.datastore.preferences.SharedPreferencesMigration
 import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
-import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -15,8 +13,10 @@ import androidx.datastore.preferences.preferencesDataStoreFile
 import io.pebbletemplates.pebble.PebbleEngine
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
@@ -52,8 +52,6 @@ import org.koin.core.component.KoinComponent
 import org.koin.core.component.get
 import java.io.File
 import kotlin.uuid.Uuid
-
-private const val TAG = "PreferencesStore"
 
 internal const val SETTINGS_DATASTORE_NAME = "settings"
 
@@ -196,15 +194,10 @@ class SettingsStore(
     }
 
     private val dataStore = context.settingsStore
+    private val writeMutex = Mutex()
 
-    val settingsFlowRaw = dataStore.data
-        .catch { exception ->
-            if (exception is IOException) {
-                emit(emptyPreferences())
-            } else {
-                throw exception
-            }
-        }.map { preferences ->
+    private val settingsFlowFailFast = dataStore.data
+        .map { preferences ->
             Settings(
                 favoriteModels = preferences[FAVORITE_MODELS]?.let {
                     JsonInstant.decodeFromString(it)
@@ -296,7 +289,7 @@ class SettingsStore(
             it.copy(
                 providers = providers,
                 assistants = assistants,
-            )
+            ).resolveLegacyModelTransports()
         }
         .map { settings ->
             // 去重并清理无效引用
@@ -336,33 +329,70 @@ class SettingsStore(
                 modeInjections = settings.modeInjections.distinctBy { it.id },
             )
         }
-        .onEach {
-            get<PebbleEngine>().templateCache.invalidateAll()
+
+    val settingsFlowRaw = settingsFlowFailFast.catch { exception ->
+        if (exception is IOException) {
+            emit(Settings())
+        } else {
+            throw exception
         }
+    }
 
     val settingsFlow = settingsFlowRaw
         .distinctUntilChanged()
         .toMutableStateFlow(scope, Settings.dummy())
 
-    suspend fun update(settings: Settings) {
-        if(settings.init) {
-            Log.w(TAG, "Cannot update dummy settings")
-            return
+    /** Reads decoded persisted settings without replacing I/O or serialization failures with defaults. */
+    suspend fun readPersistedSettingsFailFast(): Settings = settingsFlowFailFast.first()
+
+    /** Serializes runtime writers and applies [transform] to the latest persisted value. */
+    suspend fun transformLatest(transform: (Settings) -> Settings): Settings = writeMutex.withLock {
+        val current = readPersistedSettingsFailFast()
+        val updated = transform(current)
+        if (updated == current) return@withLock current
+        require(!updated.init) { "Cannot persist dummy settings" }
+        dataStore.edit { preferences ->
+            preferences.writeSettings(updated)
         }
-        settingsFlow.value = settings
+        get<PebbleEngine>().templateCache.invalidateAll()
+        updated
+    }
+
+    class AuthoritativeRestoreTransaction internal constructor(
+        private val store: SettingsStore,
+    ) {
+        suspend fun replace(settings: Settings) {
+            store.replaceAuthoritativelyForRestoreLocked(settings)
+        }
+    }
+
+    /**
+     * Holds the settings writer lock from rollback-baseline capture through restore commit or
+     * compensation. This prevents an unrelated settings edit from being lost to an old snapshot.
+     */
+    suspend fun <T> withAuthoritativeRestoreTransaction(
+        block: suspend AuthoritativeRestoreTransaction.(Settings) -> T,
+    ): T = writeMutex.withLock {
+        AuthoritativeRestoreTransaction(this).block(readPersistedSettingsFailFast())
+    }
+
+    /** Quiesced restore-only replacement; normal runtime code must use [transformLatest]. */
+    suspend fun replaceAuthoritativelyForRestore(settings: Settings) = writeMutex.withLock {
+        replaceAuthoritativelyForRestoreLocked(settings)
+    }
+
+    private suspend fun replaceAuthoritativelyForRestoreLocked(settings: Settings) {
+        require(!settings.init) { "Cannot persist dummy settings" }
         dataStore.edit { preferences ->
             preferences.writeSettings(settings)
         }
+        get<PebbleEngine>().templateCache.invalidateAll()
     }
 
-    suspend fun update(fn: (Settings) -> Settings) {
-        update(fn(settingsFlow.value))
-    }
+    suspend fun update(fn: (Settings) -> Settings): Settings = transformLatest(fn)
 
     suspend fun updateAssistant(assistantId: Uuid) {
-        dataStore.edit { preferences ->
-            preferences[SELECT_ASSISTANT] = assistantId.toString()
-        }
+        transformLatest { settings -> settings.copy(assistantId = assistantId) }
     }
 
     suspend fun updateAssistantModel(assistantId: Uuid, modelId: Uuid) {
@@ -439,6 +469,34 @@ class SettingsStore(
             )
         }
     }
+}
+
+internal fun Settings.resolveLegacyModelTransports(): Settings {
+    if (providers.none { provider -> provider.models.any { it.streamOutput == null } }) {
+        return this
+    }
+
+    val legacyTransportByModelId = assistants
+        .groupBy { assistant -> assistant.chatModelId ?: chatModelId }
+        .mapValues { (_, modelAssistants) ->
+            // A model can now have only one transport. If old assistants disagreed,
+            // non-streaming is the conservative choice for relay compatibility.
+            modelAssistants.all { assistant -> assistant.streamOutput }
+        }
+
+    return copy(
+        providers = providers.map { provider ->
+            provider.copyProvider(
+                models = provider.models.map { model ->
+                    model.copy(
+                        streamOutput = model.streamOutput
+                            ?: legacyTransportByModelId[model.id]
+                            ?: true,
+                    )
+                }
+            )
+        }
+    )
 }
 
 @Serializable

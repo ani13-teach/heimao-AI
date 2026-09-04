@@ -807,6 +807,10 @@
   <string name="setting_provider_page_model_id_placeholder">例如：gpt-3.5-turbo</string>
   <string name="setting_provider_page_model_name">模型名称</string>
   <string name="setting_provider_page_model_type">模型类型</string>
+  <string name="setting_provider_page_transport_mode">传输方式</string>
+  <string name="setting_provider_page_transport_mode_desc">仅对当前模型生效</string>
+  <string name="setting_provider_page_transport_streaming">流式</string>
+  <string name="setting_provider_page_transport_non_streaming">非流式</string>
   <string name="setting_provider_page_models">模型</string>
   <string name="setting_provider_page_name">名称</string>
   <string name="setting_provider_page_no_models">暂无模型</string>
@@ -958,6 +962,13 @@
   <string name="assistant_page_workspace">工作区</string>
   <string name="assistant_page_workspace_desc">绑定后，Agent 可以使用此工作区的文件和沙盒功能</string>
   <string name="assistant_page_workspace_unbound">未绑定</string>
+  <string name="workspace_catalog_loading">正在加载工作区…</string>
+  <string name="workspace_catalog_error">工作区加载失败。目录恢复前不能创建助手。</string>
+  <string name="workspace_catalog_empty_create_unbound">暂无工作区，将创建为未绑定助手。</string>
+  <string name="workspace_binding_conflict">工作区绑定已在其他位置发生变化，现已显示最新绑定；如有需要请重试。</string>
+  <string name="workspace_binding_assistant_not_found">该助手已不存在。</string>
+  <string name="workspace_binding_workspace_not_found">该工作区已不存在，请选择其他工作区或未绑定。</string>
+  <string name="workspace_binding_failed">工作区绑定更新失败，请重试。</string>
   <string name="workspace_page_title">工作区</string>
   <string name="workspace_page_create">创建工作区</string>
   <string name="workspace_page_rename">重命名工作区</string>

@@ -26,12 +26,11 @@ import me.rerere.ai.provider.Provider
 import me.rerere.ai.provider.ProviderManager
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.provider.TextGenerationParams
+import me.rerere.ai.provider.generateTextWithModelTransport
 import me.rerere.ai.registry.ModelRegistry
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.ToolApprovalState
-import me.rerere.ai.ui.StreamChunkHandler
-import me.rerere.ai.ui.handleTextGenerationResult
 import me.rerere.ai.ui.limitContext
 import me.rerere.rikkahub.data.ai.transformers.InputMessageTransformer
 import me.rerere.rikkahub.data.ai.transformers.MessageTransformer
@@ -49,6 +48,7 @@ import me.rerere.rikkahub.data.model.AssistantMemory
 import me.rerere.rikkahub.data.repository.LayeredMemoryContext
 import me.rerere.rikkahub.data.repository.MemoryRepository
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.rikkahub.data.workspace.AssistantWorkspaceAccessGate
 import me.rerere.rikkahub.utils.applyPlaceholders
 import java.util.Locale
 import java.util.LinkedHashMap
@@ -244,6 +244,7 @@ class GenerationHandler(
     private val json: Json,
     private val memoryRepo: MemoryRepository,
     private val workspaceRepository: WorkspaceRepository,
+    private val workspaceAccessGate: AssistantWorkspaceAccessGate,
 ) {
     private val memorySnapshots = object : LinkedHashMap<String, MemorySnapshotState>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, MemorySnapshotState>): Boolean =
@@ -267,6 +268,8 @@ class GenerationHandler(
         conversationModeInjectionIds: Set<Uuid> = emptySet(),
         workspaceId: String? = null,
         workspaceCwd: String? = null,
+        workspaceAssistantId: String? = null,
+        workspaceConversationId: String? = null,
         useLayeredMemory: Boolean = false,
     ): Flow<GenerationChunk> = flow {
         val provider = model.findProvider(settings.providers) ?: error("Provider not found")
@@ -407,7 +410,6 @@ class GenerationHandler(
                     claudeMemoryCacheBlocks = memoryResolution.claudeCacheBlocks,
                     memoryDelta = memoryResolution.delta,
                     layeredMemoryContext = layeredMemoryContext,
-                    stream = assistant.streamOutput,
                     processingStatus = processingStatus,
                     conversationSystemPrompt = conversationSystemPrompt,
                     conversationModeInjectionIds = conversationModeInjectionIds,
@@ -558,6 +560,8 @@ class GenerationHandler(
                                     output = result,
                                     hasShellAccess = hasShellAccess,
                                     workspaceId = workspaceId,
+                                    assistantId = workspaceAssistantId,
+                                    conversationId = workspaceConversationId,
                                 )
                             )
                         }.onFailure {
@@ -639,7 +643,6 @@ class GenerationHandler(
         memorySnapshot: List<AssistantMemory>,
         claudeMemoryCacheBlocks: List<ClaudeMemoryCacheBlock>?,
         memoryDelta: List<UIMessage>,
-        stream: Boolean,
         processingStatus: MutableStateFlow<String?> = MutableStateFlow(null),
         conversationSystemPrompt: String? = null,
         conversationModeInjectionIds: Set<Uuid> = emptySet(),
@@ -743,25 +746,13 @@ class GenerationHandler(
             promptCacheKey = promptCacheKey,
             logicalPrompt = logicalPrompt,
         )
-        if (stream) {
-            val streamChunkHandler = StreamChunkHandler(model)
-            providerImpl.streamText(
-                providerSetting = provider,
-                messages = internalMessages,
-                params = params
-            ).collect {
-                messages = streamChunkHandler.handle(messages, it)
-                onUpdateMessages(messages)
-            }
-        } else {
-            val result = providerImpl.generateText(
-                providerSetting = provider,
-                messages = internalMessages,
-                params = params,
-            )
-            messages = messages.handleTextGenerationResult(result = result, model = model)
-            onUpdateMessages(messages)
-        }
+        messages = providerImpl.generateTextWithModelTransport(
+            providerSetting = provider,
+            messages = internalMessages,
+            params = params,
+            responseMessages = messages,
+            onUpdateMessages = onUpdateMessages,
+        )
     }
 
     private suspend fun maybeTruncateToolOutput(
@@ -769,6 +760,8 @@ class GenerationHandler(
         output: List<UIMessagePart>,
         hasShellAccess: Boolean,
         workspaceId: String?,
+        assistantId: String?,
+        conversationId: String?,
     ): List<UIMessagePart> {
         val textParts = output.filterIsInstance<UIMessagePart.Text>()
         val nonTextParts = output.filter { it !is UIMessagePart.Text }
@@ -783,12 +776,15 @@ class GenerationHandler(
         val safeId = toolCallId.replace(Regex("[^A-Za-z0-9._-]"), "_").take(120)
         val relativePath = ".rikkahub/tool_outputs/$safeId.txt"
         val saved = try {
-            workspaceRepository.writeText(
-                id = workspaceId,
-                path = relativePath,
-                text = fullText,
-                overwrite = true,
-            )
+            if (assistantId == null || conversationId == null) return output
+            workspaceAccessGate.withWorkspaceAccess(assistantId, conversationId, workspaceId) {
+                workspaceRepository.writeText(
+                    id = workspaceId,
+                    path = relativePath,
+                    text = fullText,
+                    overwrite = true,
+                )
+            }
         } catch (error: Throwable) {
             Log.w(TAG, "Failed to save full tool output inside workspace", error)
             return output
@@ -829,30 +825,26 @@ class GenerationHandler(
                 "target_lang" to targetLanguage.toString(),
             )
 
-            var messages = listOf(UIMessage.user(prompt))
-            var translatedText = ""
-            val streamChunkHandler = StreamChunkHandler(model)
-
-            providerHandler.streamText(
+            val messages = listOf(UIMessage.user(prompt))
+            providerHandler.generateTextWithModelTransport(
                 providerSetting = provider,
                 messages = messages,
                 params = TextGenerationParams(
                     model = model,
                     reasoningLevel = ReasoningLevel.fromBudgetTokens(settings.translateThinkingBudget),
                 ),
-            ).collect { chunk ->
-                messages = streamChunkHandler.handle(messages, chunk)
-                translatedText = messages.lastOrNull()?.toText() ?: ""
-
-                if (translatedText.isNotBlank()) {
-                    onStreamUpdate?.invoke(translatedText)
-                    emit(translatedText)
-                }
-            }
+                onUpdateMessages = { updatedMessages ->
+                    val translatedText = updatedMessages.lastOrNull()?.toText().orEmpty()
+                    if (translatedText.isNotBlank()) {
+                        onStreamUpdate?.invoke(translatedText)
+                        emit(translatedText)
+                    }
+                },
+            )
         } else {
             // Use Qwen MT model with special translation options
             val messages = listOf(UIMessage.user(sourceText))
-            val result = providerHandler.generateText(
+            val resultMessages = providerHandler.generateTextWithModelTransport(
                 providerSetting = provider,
                 messages = messages,
                 params = TextGenerationParams(
@@ -873,7 +865,7 @@ class GenerationHandler(
                     )
                 ),
             )
-            val translatedText = result.message.toText()
+            val translatedText = resultMessages.last().toText()
 
             if (translatedText.isNotBlank()) {
                 onStreamUpdate?.invoke(translatedText)

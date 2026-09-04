@@ -48,6 +48,7 @@ import me.rerere.rikkahub.ui.components.ui.TagsInput
 import me.rerere.rikkahub.ui.components.ui.UIAvatar
 import me.rerere.rikkahub.ui.hooks.heroAnimation
 import me.rerere.rikkahub.ui.theme.CustomColors
+import me.rerere.rikkahub.ui.workspace.messageResource
 import me.rerere.rikkahub.utils.toFixed
 import org.koin.androidx.compose.koinViewModel
 import org.koin.core.parameter.parametersOf
@@ -66,6 +67,7 @@ fun AssistantBasicPage(id: String) {
     val providers by vm.providers.collectAsStateWithLifecycle()
     val tags by vm.tags.collectAsStateWithLifecycle()
     val workspaces by vm.workspaces.collectAsStateWithLifecycle()
+    val workspaceBinding by vm.workspaceBinding.collectAsStateWithLifecycle()
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
 
     Scaffold(
@@ -90,7 +92,9 @@ fun AssistantBasicPage(id: String) {
             providers = providers,
             tags = tags,
             workspaces = workspaces,
+            workspaceBinding = workspaceBinding,
             onUpdate = { vm.update(it) },
+            onSetWorkspace = vm::setWorkspaceBinding,
             vm = vm
         )
     }
@@ -103,7 +107,9 @@ internal fun AssistantBasicContent(
     providers: List<me.rerere.ai.provider.ProviderSetting>,
     tags: List<DataTag>,
     workspaces: List<WorkspaceEntity>,
+    workspaceBinding: me.rerere.rikkahub.ui.workspace.WorkspaceBindingUiState,
     onUpdate: (Assistant) -> Unit,
+    onSetWorkspace: (Uuid?) -> Unit,
     vm: AssistantDetailVM
 ) {
     Column(
@@ -194,17 +200,21 @@ internal fun AssistantBasicContent(
                     options = listOf<WorkspaceEntity?>(null) + workspaces,
                     selectedOption = selectedWorkspace,
                     onOptionSelected = { workspace ->
-                        onUpdate(
-                            assistant.copy(
-                                workspaceId = workspace?.id?.let { Uuid.parse(it) }
-                            )
-                        )
+                        onSetWorkspace(workspace?.id?.let { Uuid.parse(it) })
                     },
+                    enabled = !workspaceBinding.isSubmitting,
                     modifier = Modifier.fillMaxWidth(),
                     optionToString = { workspace ->
                         workspace?.name ?: stringResource(R.string.workspace_no_binding)
                     },
                 )
+                workspaceBinding.error?.let { error ->
+                    Text(
+                        text = stringResource(error.messageResource()),
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
             }
 
             HorizontalDivider()
@@ -407,28 +417,6 @@ internal fun AssistantBasicContent(
                     )
                 }
             }
-            HorizontalDivider()
-            FormItem(
-                modifier = Modifier.padding(8.dp),
-                label = {
-                    Text(stringResource(R.string.assistant_page_stream_output))
-                },
-                description = {
-                    Text(stringResource(R.string.assistant_page_stream_output_desc))
-                },
-                tail = {
-                    Switch(
-                        checked = assistant.streamOutput,
-                        onCheckedChange = {
-                            onUpdate(
-                                assistant.copy(
-                                    streamOutput = it
-                                )
-                            )
-                        }
-                    )
-                }
-            )
             HorizontalDivider()
             FormItem(
                 modifier = Modifier.padding(8.dp),

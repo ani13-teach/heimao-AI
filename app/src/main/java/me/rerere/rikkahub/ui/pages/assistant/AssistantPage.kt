@@ -23,6 +23,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -64,16 +65,15 @@ import me.rerere.rikkahub.data.datastore.DEFAULT_ASSISTANTS_IDS
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.AssistantMemory
+import me.rerere.rikkahub.data.workspace.AssistantWorkspaceBindingResult
 import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.components.ui.FormItem
+import me.rerere.rikkahub.ui.components.ui.Select
 import me.rerere.rikkahub.ui.components.ui.Tag
 import me.rerere.rikkahub.ui.components.ui.TagType
 import me.rerere.rikkahub.ui.components.ui.UIAvatar
 import me.rerere.rikkahub.ui.context.LocalNavController
-import me.rerere.rikkahub.ui.hooks.EditState
-import me.rerere.rikkahub.ui.hooks.EditStateContent
 import me.rerere.rikkahub.ui.hooks.heroAnimation
-import me.rerere.rikkahub.ui.hooks.useEditState
 import me.rerere.rikkahub.ui.modifier.onClick
 import me.rerere.rikkahub.ui.theme.CustomColors
 import org.koin.androidx.compose.koinViewModel
@@ -85,9 +85,10 @@ import androidx.compose.foundation.lazy.items as lazyItems
 @Composable
 fun AssistantPage(vm: AssistantVM = koinViewModel()) {
     val settings by vm.settings.collectAsStateWithLifecycle()
-    val createState = useEditState<Assistant> {
-        vm.addAssistant(it)
-    }
+    val workspaceCatalog by vm.workspaceCatalog.collectAsStateWithLifecycle()
+    val creatingAssistant by vm.creatingAssistant.collectAsStateWithLifecycle()
+    var createDraft by remember { mutableStateOf<Assistant?>(null) }
+    var createError by remember { mutableStateOf<Int?>(null) }
     val navController = LocalNavController.current
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
 
@@ -121,7 +122,9 @@ fun AssistantPage(vm: AssistantVM = koinViewModel()) {
                 actions = {
                     IconButton(
                         onClick = {
-                            createState.open(Assistant())
+                            createError = null
+                            createDraft = Assistant()
+
                         }) {
                         Icon(HugeIcons.Add01, stringResource(R.string.assistant_page_add))
                     }
@@ -236,7 +239,27 @@ fun AssistantPage(vm: AssistantVM = koinViewModel()) {
         }
     }
 
-    AssistantCreationSheet(createState)
+    createDraft?.let { draft ->
+        AssistantCreationSheet(
+            assistant = draft,
+            catalog = workspaceCatalog,
+            submitting = creatingAssistant,
+            errorResource = createError,
+            onUpdate = { createDraft = it },
+            onDismiss = { if (!creatingAssistant) createDraft = null },
+            onConfirm = {
+                vm.createAssistant(draft) { result ->
+                    when (result) {
+                        is AssistantWorkspaceBindingResult.Success -> createDraft = null
+                        is AssistantWorkspaceBindingResult.Conflict -> createError = R.string.workspace_binding_conflict
+                        AssistantWorkspaceBindingResult.AssistantNotFound -> createError = R.string.workspace_binding_assistant_not_found
+                        AssistantWorkspaceBindingResult.WorkspaceNotFound -> createError = R.string.workspace_binding_workspace_not_found
+                        AssistantWorkspaceBindingResult.Failed -> createError = R.string.workspace_binding_failed
+                    }
+                }
+            },
+        )
+    }
 
     // 操作菜单 Bottom Sheet
     actionSheetAssistant?.let { assistant ->
@@ -320,60 +343,81 @@ private fun AssistantTagsFilterRow(
 
 @Composable
 private fun AssistantCreationSheet(
-    state: EditState<Assistant>,
+    assistant: Assistant,
+    catalog: WorkspaceCatalogUiState,
+    submitting: Boolean,
+    errorResource: Int?,
+    onUpdate: (Assistant) -> Unit,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
 ) {
-    state.EditStateContent { assistant, update ->
-        ModalBottomSheet(
-            onDismissRequest = {
-                state.dismiss()
-            },
-            sheetState = rememberBottomSheetState(initialValue = SheetValue.Hidden, enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded)),
-            dragHandle = {},
-            sheetGesturesEnabled = false
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberBottomSheetState(initialValue = SheetValue.Hidden, enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded)),
+        dragHandle = {},
+        sheetGesturesEnabled = false
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 32.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 32.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
-            ) {
-                Column(
+            FormItem(label = { Text(stringResource(R.string.assistant_page_name)) }) {
+                OutlinedTextField(
+                    value = assistant.name,
+                    onValueChange = { onUpdate(assistant.copy(name = it)) },
                     modifier = Modifier.fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    FormItem(
-                        label = {
-                            Text(stringResource(R.string.assistant_page_name))
-                        },
+                    enabled = !submitting,
+                )
+            }
+            FormItem(
+                label = { Text(stringResource(R.string.assistant_page_workspace)) },
+                description = { Text(stringResource(R.string.assistant_page_workspace_desc)) },
+            ) {
+                when (catalog) {
+                    WorkspaceCatalogUiState.Loading -> Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        OutlinedTextField(
-                            value = assistant.name, onValueChange = {
-                                update(
-                                    assistant.copy(
-                                        name = it
-                                    )
-                                )
-                            }, modifier = Modifier.fillMaxWidth()
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp))
+                        Text(stringResource(R.string.workspace_catalog_loading))
+                    }
+                    WorkspaceCatalogUiState.Error -> Text(
+                        stringResource(R.string.workspace_catalog_error),
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    is WorkspaceCatalogUiState.Loaded -> if (catalog.workspaces.isEmpty()) {
+                        Text(stringResource(R.string.workspace_catalog_empty_create_unbound))
+                    } else {
+                        val selected = catalog.workspaces.find { it.id == assistant.workspaceId?.toString() }
+                        Select(
+                            options = listOf<me.rerere.rikkahub.data.db.entity.WorkspaceEntity?>(null) + catalog.workspaces,
+                            selectedOption = selected,
+                            onOptionSelected = { workspace ->
+                                onUpdate(assistant.copy(workspaceId = workspace?.id?.let(Uuid::parse)))
+                            },
+                            optionToString = { it?.name ?: stringResource(R.string.workspace_no_binding) },
+                            modifier = Modifier.fillMaxWidth(),
                         )
                     }
                 }
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)
+            }
+            errorResource?.let {
+                Text(stringResource(it), color = MaterialTheme.colorScheme.error)
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)
+            ) {
+                TextButton(onClick = onDismiss, enabled = !submitting) {
+                    Text(stringResource(R.string.assistant_page_cancel))
+                }
+                TextButton(
+                    onClick = onConfirm,
+                    enabled = !submitting && catalog is WorkspaceCatalogUiState.Loaded,
                 ) {
-                    TextButton(
-                        onClick = {
-                            state.dismiss()
-                        }) {
-                        Text(stringResource(R.string.assistant_page_cancel))
-                    }
-                    TextButton(
-                        onClick = {
-                            state.confirm()
-                        }) {
-                        Text(stringResource(R.string.assistant_page_save))
-                    }
+                    Text(stringResource(R.string.assistant_page_save))
                 }
             }
         }

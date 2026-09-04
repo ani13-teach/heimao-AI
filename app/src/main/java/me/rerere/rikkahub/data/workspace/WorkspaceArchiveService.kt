@@ -82,6 +82,7 @@ class WorkspaceArchiveService(
     private val workspaceRepository: WorkspaceRepository,
     private val conversationDAO: ConversationDAO,
     private val database: AppDatabase,
+    private val bindingCoordinator: AssistantWorkspaceBindingCoordinator,
 ) {
     suspend fun createBackupFile(
         includeDatabase: Boolean,
@@ -119,7 +120,7 @@ class WorkspaceArchiveService(
                 "Unable to create archive staging directory"
             }
 
-            val settings = sanitizeWorkspaceArchiveSettings(settingsStore.settingsFlow.value)
+            val settings = sanitizeWorkspaceArchiveSettings(settingsStore.readPersistedSettingsFailFast())
             // Workspace payloads are the portable unit and are always included. The legacy
             // FILES switch only controls upload/skills/fonts compatibility entries.
             val workspaces = workspaceRepository.getAll()
@@ -154,10 +155,12 @@ class WorkspaceArchiveService(
                 }
             }
             val expectedDirectoryRoots = verifyWorkspaceDirectoryCatalog(workspaces)
-            val conversationReferences = databaseSnapshot?.conversationReferences
-                ?: conversationDAO.getWorkspaceReferences().map { reference ->
-                    WorkspaceConversationReference(reference.conversationId, reference.workspaceId)
-                }
+            val conversationReferences = authoritativeArchiveConversationReferences(
+                databaseSnapshot?.conversationReferences
+                    ?: conversationDAO.getWorkspaceReferences().map { reference ->
+                        WorkspaceConversationReference(reference.conversationId, reference.workspaceId)
+                    }
+            )
             val assistantReferences = settings.assistants.map { assistant ->
                 WorkspaceAssistantReference(
                     assistantId = assistant.id.toString(),
@@ -288,6 +291,16 @@ class WorkspaceArchiveService(
                     failure = failure,
                 )
             }
+        }
+    }
+
+    suspend fun recoverPendingIncrementalRoomRollback(workspaceIds: List<String>) {
+        if (workspaceIds.isEmpty()) return
+        workspaceRepository.withWorkspaceCatalogArchiveLock {
+            workspaceIds.distinct().forEach { workspaceId ->
+                workspaceRepository.deleteRestoredWorkspace(workspaceId)
+            }
+            WorkspaceArchiveRecovery.completeIncrementalRoomRollback(context)
         }
     }
 
@@ -523,7 +536,7 @@ class WorkspaceArchiveService(
         }
         return DatabaseSnapshot(
             source = ArchiveSource(destination, "database/rikka_hub.db"),
-            conversationReferences = conversationReferences,
+            conversationReferences = authoritativeArchiveConversationReferences(conversationReferences),
             workspaceCatalog = workspaceCatalog,
             snapshotsExcluded = true,
         )
@@ -762,11 +775,13 @@ class WorkspaceArchiveService(
         require(actualCatalog == expectedDatabaseCatalog.sorted()) {
             "Workspace catalog changed while creating archive"
         }
-        val actualAssistantReferences = workspaceAssistantReferences(settingsStore.settingsFlow.value)
+        val actualAssistantReferences = workspaceAssistantReferences(settingsStore.readPersistedSettingsFailFast())
         verifySettingsWorkspaceReferences(manifest.references.assistants)
-        val actualConversationReferences = conversationDAO.getWorkspaceReferences().map { reference ->
-            WorkspaceConversationReference(reference.conversationId, reference.workspaceId)
-        }
+        val actualConversationReferences = authoritativeArchiveConversationReferences(
+            conversationDAO.getWorkspaceReferences().map { reference ->
+                WorkspaceConversationReference(reference.conversationId, reference.workspaceId)
+            }
+        )
         require(
             workspaceArchiveCatalogIsConsistent(
                 WorkspaceArchiveCatalogConsistency(
@@ -799,7 +814,7 @@ class WorkspaceArchiveService(
     private suspend fun verifySettingsWorkspaceReferences(
         expected: List<WorkspaceAssistantReference>,
     ) {
-        val actualSettingsReferences = workspaceAssistantReferences(settingsStore.settingsFlow.value)
+        val actualSettingsReferences = workspaceAssistantReferences(settingsStore.readPersistedSettingsFailFast())
         val sort: (WorkspaceAssistantReference) -> String = {
             "${it.assistantId}\u0000${it.workspaceId ?: ""}"
         }
@@ -1481,7 +1496,6 @@ class WorkspaceArchiveService(
             val prepared = extractPortableArchive(file, staging, includeDatabase, budget)
             val warnings = mutableListOf<String>()
             val preparedWorkspaces = prepareWorkspaceStaging(prepared, staging, warnings, budget)
-            val currentSettings = settingsStore.settingsFlow.value
             val restoredSettings = prepared.settingsFile.let { settingsFile ->
                 decodeArchiveSettings(settingsFile.readText(Charsets.UTF_8))
             }
@@ -1525,18 +1539,33 @@ class WorkspaceArchiveService(
             val workspaceIds = (currentWorkspaces.map { it.id } + preparedWorkspaces.map { it.manifest.id })
                 .distinct()
                 .sorted()
-            val result = withWorkspaceLocks(workspaceIds) {
-                applyPortableRestore(
-                    prepared = prepared,
-                    preparedWorkspaces = preparedWorkspaces,
-                    restoredSettings = restoredSettings,
-                    currentSettings = currentSettings,
-                    warnings = warnings,
-                    includeDatabase = includeDatabase,
-                    includeFiles = includeFiles,
-                    workspacesRoot = workspacesRoot,
-                    archiveCleanupFile = archiveCleanupFile,
-                )
+            val replacementSettings = restoredSettings
+            val fullRestoreAssistantIds = if (databaseRestoreRequested) {
+                replacementSettings.assistants.map { it.id.toString() } +
+                    settingsStore.readPersistedSettingsFailFast().assistants.map { it.id.toString() }
+            } else {
+                emptyList()
+            }
+            val result = bindingCoordinator.quiesceForSettingsReplacementWhileLocked(
+                replacement = replacementSettings,
+                additionalAssistantIds = fullRestoreAssistantIds,
+            ) { _ ->
+                settingsStore.withAuthoritativeRestoreTransaction { currentSettings ->
+                    withWorkspaceLocks(workspaceIds) {
+                        applyPortableRestore(
+                            prepared = prepared,
+                            preparedWorkspaces = preparedWorkspaces,
+                            restoredSettings = restoredSettings,
+                            currentSettings = currentSettings,
+                            settingsTransaction = this@withAuthoritativeRestoreTransaction,
+                        warnings = warnings,
+                        includeDatabase = includeDatabase,
+                        includeFiles = includeFiles,
+                        workspacesRoot = workspacesRoot,
+                        archiveCleanupFile = archiveCleanupFile,
+                    )
+                }
+            }
             }
             restoreResult = result
             return result
@@ -1827,6 +1856,7 @@ class WorkspaceArchiveService(
         preparedWorkspaces: List<PreparedWorkspace>,
         restoredSettings: Settings?,
         currentSettings: Settings,
+        settingsTransaction: SettingsStore.AuthoritativeRestoreTransaction,
         warnings: MutableList<String>,
         includeDatabase: Boolean,
         includeFiles: Boolean,
@@ -1854,19 +1884,40 @@ class WorkspaceArchiveService(
                 require(databaseRecoveryDirectory.mkdirs() || databaseRecoveryDirectory.isDirectory) {
                     "Unable to create database recovery directory"
                 }
-                recoveryJournal = beginRecoveryJournal(
-                    currentSettings = currentSettings,
-                    recoveryRoot = recoveryRoot,
-                    databaseRecoveryDirectory = databaseRecoveryDirectory,
-                    workspacesRoot = workspacesRoot,
-                    legacyStaging = prepared.legacyDirectory,
-                    includeFiles = includeFiles,
-                    cleanupArtifacts = listOf(
-                        prepared.staging,
-                        recoveryRoot,
-                        databaseRecoveryDirectory,
-                    ) + listOfNotNull(archiveCleanupFile),
-                )
+            }
+            val incrementalDirectories = if (databaseRestoreRequested) {
+                emptyList()
+            } else {
+                preparedWorkspaces.map { candidate ->
+                    WorkspaceArchiveDirectoryRecovery(
+                        newRoot = File(workspacesRoot, candidate.manifest.root).absolutePath,
+                        oldRootRecovery = File(recoveryRoot, candidate.manifest.root).absolutePath,
+                        oldRootExisted = false,
+                    )
+                }
+            }
+            recoveryJournal = beginRecoveryJournal(
+                currentSettings = currentSettings,
+                recoveryRoot = recoveryRoot,
+                databaseRecoveryDirectory = databaseRecoveryDirectory.takeIf { databaseRestoreRequested },
+                workspacesRoot = workspacesRoot.takeIf { databaseRestoreRequested },
+                incrementalDirectories = incrementalDirectories,
+                incrementalWorkspaceIds = if (databaseRestoreRequested) {
+                    emptyList()
+                } else {
+                    preparedWorkspaces.map { it.manifest.id }
+                },
+                legacyStaging = prepared.legacyDirectory,
+                includeFiles = includeFiles,
+                cleanupArtifacts = listOf(
+                    prepared.staging,
+                    recoveryRoot,
+                ) + listOfNotNull(
+                    databaseRecoveryDirectory.takeIf { databaseRestoreRequested },
+                    archiveCleanupFile,
+                ),
+            )
+            if (databaseRestoreRequested) {
                 val stagedDatabase = prepared.databaseFiles["database/rikka_hub.db"]
                     ?: error("Requested database restore has no staged main database")
                 validateDatabasePayload(
@@ -1957,7 +2008,9 @@ class WorkspaceArchiveService(
                     recoveryJournal = applying
                 }
                 settingsApplied = true
-                settingsStore.update(mergeLocalCredentials(currentSettings, it))
+                settingsTransaction.replace(
+                    mergeLocalCredentials(currentSettings, it)
+                )
                 recoveryJournal?.let { journal ->
                     val applied = journal.copy(phase = WorkspaceArchiveRecoveryPhase.SETTINGS_APPLIED)
                     WorkspaceArchiveRecovery.writeJournal(
@@ -1991,12 +2044,24 @@ class WorkspaceArchiveService(
                 )
             }
 
-            // No database was closed in the incremental path, so it is safe to finish the small
-            // transaction and clean its recovery tree before returning to the caller.
+            // No database was closed in the incremental path. Persist the commit decision before
+            // deleting rollback material; a process death after this point completes cleanup on
+            // the next launch instead of rolling back a successful import.
+            val committedJournal = requireNotNull(recoveryJournal).copy(
+                phase = WorkspaceArchiveRecoveryPhase.COMMITTED,
+                commitState = WorkspaceArchiveCommitState.COMMITTED,
+                settingsNeedsCompensation = false,
+            )
+            WorkspaceArchiveRecovery.writeJournal(
+                WorkspaceArchiveRecovery.journalFile(context),
+                committedJournal,
+            )
+            recoveryJournal = committedJournal
             val committedWarnings = mutableListOf<String>()
             movedWorkspaces.flatMapTo(committedWarnings) { it.commitBestEffort("workspace") }
             legacyMoves.flatMapTo(committedWarnings) { it.commitBestEffort("legacy") }
             cleanupRecoveryRoot(recoveryRoot, committedWarnings)
+            WorkspaceArchiveRecovery.finishCommitted(context)
             return WorkspaceArchiveRestoreResult(
                 portable = true,
                 restoredWorkspaceIds = preparedWorkspaces.map { it.manifest.id },
@@ -2006,6 +2071,10 @@ class WorkspaceArchiveService(
                 databaseRestoreStatus = WorkspaceArchiveDatabaseRestoreStatus.NOT_REQUESTED,
             )
         } catch (error: Throwable) {
+            if (recoveryJournal?.commitState == WorkspaceArchiveCommitState.COMMITTED) {
+                // The durable decision is authoritative. Startup will retry cleanup.
+                throw error
+            }
             // Once close starts there is intentionally no application-level compensation path:
             // scheduling relaunch is the only safe continuation. All restore artifacts remain
             // behind the marker for the next process.
@@ -2022,7 +2091,9 @@ class WorkspaceArchiveService(
                         compensationFailures += rollbackError
                     }
                 }
-                if (settingsApplied) compensate { settingsStore.update(currentSettings) }
+                if (settingsApplied) compensate {
+                    settingsTransaction.replace(currentSettings)
+                }
                 legacyMoves.asReversed().forEach { moved -> compensate { moved.rollback() } }
                 movedWorkspaces.asReversed().forEach { moved -> compensate { moved.rollback() } }
                 insertedIds.asReversed().forEach { id ->
@@ -2034,9 +2105,6 @@ class WorkspaceArchiveService(
                 if (cleanupMarker == null) {
                     compensate { deleteDirectoryIfPresent(databaseRecoveryDirectory) }
                 }
-                if (compensationFailures.isEmpty() && error.suppressed.isEmpty()) {
-                    compensate { deleteDirectoryIfPresent(recoveryRoot) }
-                }
                 if (
                     recoveryJournal != null &&
                     !databaseCloseAttempted &&
@@ -2046,14 +2114,17 @@ class WorkspaceArchiveService(
                     val rolledBack = recoveryJournal!!.copy(
                         phase = WorkspaceArchiveRecoveryPhase.ROLLED_BACK,
                         commitState = WorkspaceArchiveCommitState.ROLLED_BACK,
+                        settingsApplied = false,
                         settingsNeedsCompensation = false,
+                        incrementalWorkspaceIds = emptyList(),
                     )
                     compensate {
                         WorkspaceArchiveRecovery.writeJournal(
                             WorkspaceArchiveRecovery.journalFile(context),
                             rolledBack,
                         )
-                        WorkspaceArchiveRecovery.clearJournal(WorkspaceArchiveRecovery.journalFile(context))
+                        recoveryJournal = rolledBack
+                        WorkspaceArchiveRecovery.finishRolledBack(context)
                     }
                 }
             }
@@ -2146,7 +2217,7 @@ class WorkspaceArchiveService(
                 "Legacy archive contains database WAL/SHM without its main database"
             }
             budget.checkStagingDirectory(staging)
-            val currentSettings = settingsStore.settingsFlow.value
+            val currentSettings = settingsStore.readPersistedSettingsFailFast()
             val restoredSettings = if (settingsFile.isFile) {
                 decodeArchiveSettings(settingsFile.readText(Charsets.UTF_8))
             } else null
@@ -2179,7 +2250,24 @@ class WorkspaceArchiveService(
             var databaseCloseAttempted = false
             var cleanupMarker: File? = null
             var recoveryJournal: WorkspaceArchiveRecoveryJournal? = null
-            try {
+            val replacementSettings = restoredSettings
+                ?.let { mergeLocalCredentials(currentSettings, it) }
+                ?: currentSettings
+            val fullRestoreAssistantIds = if (databaseRestoreRequested) {
+                (currentSettings.assistants + replacementSettings.assistants)
+                    .map { it.id.toString() }
+            } else {
+                emptyList()
+            }
+            return bindingCoordinator.quiesceForSettingsReplacementWhileLocked(
+                replacement = replacementSettings,
+                additionalAssistantIds = fullRestoreAssistantIds,
+            ) restore@{ _ ->
+                settingsStore.withAuthoritativeRestoreTransaction { gatedCurrentSettings ->
+                val gatedReplacementSettings = restoredSettings
+                    ?.let { mergeLocalCredentials(gatedCurrentSettings, it) }
+                    ?: gatedCurrentSettings
+                try {
                 // Validate and prepare all legacy folders/settings before Room is closed. Legacy
                 // archives have no workspace catalog, so only their historical folder strategy is
                 // applied here; database compatibility is enforced by the isolated Room 30 upgrade above.
@@ -2201,20 +2289,22 @@ class WorkspaceArchiveService(
                     require(databaseRecoveryDirectory.mkdirs() || databaseRecoveryDirectory.isDirectory) {
                         "Unable to create database recovery directory"
                     }
-                    recoveryJournal = beginRecoveryJournal(
-                        currentSettings = currentSettings,
-                        recoveryRoot = databaseRecoveryRoot,
-                        databaseRecoveryDirectory = databaseRecoveryDirectory,
-                        workspacesRoot = null,
-                        legacyStaging = legacyDirectory,
-                        includeFiles = includeFiles,
-                        cleanupArtifacts = listOf(
-                            staging,
-                            databaseRecoveryRoot,
-                            databaseRecoveryDirectory,
-                        ) + listOfNotNull(archiveCleanupFile),
-                    )
                 }
+                recoveryJournal = beginRecoveryJournal(
+                    currentSettings = gatedCurrentSettings,
+                    recoveryRoot = databaseRecoveryRoot,
+                    databaseRecoveryDirectory = databaseRecoveryDirectory.takeIf { databaseRestoreRequested },
+                    workspacesRoot = null,
+                    legacyStaging = legacyDirectory,
+                    includeFiles = includeFiles,
+                    cleanupArtifacts = listOf(
+                        staging,
+                        databaseRecoveryRoot,
+                    ) + listOfNotNull(
+                        databaseRecoveryDirectory.takeIf { databaseRestoreRequested },
+                        archiveCleanupFile,
+                    ),
+                )
                 if (includeFiles) {
                     legacyMoves += replaceLegacyDirectories(legacyDirectory, databaseRecoveryRoot)
                     recoveryJournal?.let { journal ->
@@ -2240,7 +2330,7 @@ class WorkspaceArchiveService(
                         recoveryJournal = applying
                     }
                     settingsApplied = true
-                    settingsStore.update(mergeLocalCredentials(currentSettings, it))
+                    this@withAuthoritativeRestoreTransaction.replace(gatedReplacementSettings)
                     recoveryJournal?.let { journal ->
                         val applied = journal.copy(phase = WorkspaceArchiveRecoveryPhase.SETTINGS_APPLIED)
                         WorkspaceArchiveRecovery.writeJournal(
@@ -2272,8 +2362,19 @@ class WorkspaceArchiveService(
                     )
                 }
 
+                val committedJournal = requireNotNull(recoveryJournal).copy(
+                    phase = WorkspaceArchiveRecoveryPhase.COMMITTED,
+                    commitState = WorkspaceArchiveCommitState.COMMITTED,
+                    settingsNeedsCompensation = false,
+                )
+                WorkspaceArchiveRecovery.writeJournal(
+                    WorkspaceArchiveRecovery.journalFile(context),
+                    committedJournal,
+                )
+                recoveryJournal = committedJournal
                 val warnings = legacyMoves.flatMap { it.commitBestEffort("legacy") }.toMutableList()
                 cleanupRecoveryRoot(databaseRecoveryRoot, warnings)
+                WorkspaceArchiveRecovery.finishCommitted(context)
                 val result = WorkspaceArchiveRestoreResult(
                     portable = false,
                     warnings = warnings.distinct(),
@@ -2282,8 +2383,12 @@ class WorkspaceArchiveService(
                     databaseRestoreStatus = WorkspaceArchiveDatabaseRestoreStatus.NOT_REQUESTED,
                 )
                 restoreResult = result
-                return result
+                return@withAuthoritativeRestoreTransaction result
             } catch (error: Throwable) {
+                if (recoveryJournal?.commitState == WorkspaceArchiveCommitState.COMMITTED) {
+                    // The durable decision is authoritative. Startup will retry cleanup.
+                    throw error
+                }
                 if (databaseCloseAttempted) {
                     WorkspaceArchiveRestart.scheduleAndExit(context)
                 }
@@ -2296,16 +2401,15 @@ class WorkspaceArchiveService(
                             compensationFailures += rollbackError
                         }
                     }
-                    if (settingsApplied) compensate { settingsStore.update(currentSettings) }
+                    if (settingsApplied) compensate {
+                        this@withAuthoritativeRestoreTransaction.replace(gatedCurrentSettings)
+                    }
                     legacyMoves.asReversed().forEach { moved -> compensate { moved.rollback() } }
                     cleanupMarker?.let { marker ->
                         if (marker.exists()) compensate { WorkspaceArchiveCleanup.removeMarker(marker) }
                     }
                     if (cleanupMarker == null) {
                         compensate { deleteDirectoryIfPresent(databaseRecoveryDirectory) }
-                    }
-                    if (compensationFailures.isEmpty() && error.suppressed.isEmpty()) {
-                        compensate { deleteDirectoryIfPresent(databaseRecoveryRoot) }
                     }
                     if (
                         recoveryJournal != null &&
@@ -2316,6 +2420,7 @@ class WorkspaceArchiveService(
                         val rolledBack = recoveryJournal!!.copy(
                             phase = WorkspaceArchiveRecoveryPhase.ROLLED_BACK,
                             commitState = WorkspaceArchiveCommitState.ROLLED_BACK,
+                            settingsApplied = false,
                             settingsNeedsCompensation = false,
                         )
                         compensate {
@@ -2323,12 +2428,15 @@ class WorkspaceArchiveService(
                                 WorkspaceArchiveRecovery.journalFile(context),
                                 rolledBack,
                             )
-                            WorkspaceArchiveRecovery.clearJournal(WorkspaceArchiveRecovery.journalFile(context))
+                            recoveryJournal = rolledBack
+                            WorkspaceArchiveRecovery.finishRolledBack(context)
                         }
                     }
                 }
                 compensationFailures.forEach(error::addSuppressed)
                 throw error
+            }
+            }
             }
         } catch (error: Throwable) {
             failure = error
@@ -2343,8 +2451,10 @@ class WorkspaceArchiveService(
     private fun beginRecoveryJournal(
         currentSettings: Settings,
         recoveryRoot: File,
-        databaseRecoveryDirectory: File,
+        databaseRecoveryDirectory: File?,
         workspacesRoot: File?,
+        incrementalDirectories: List<WorkspaceArchiveDirectoryRecovery> = emptyList(),
+        incrementalWorkspaceIds: List<String> = emptyList(),
         legacyStaging: File?,
         includeFiles: Boolean,
         cleanupArtifacts: List<File>,
@@ -2352,12 +2462,16 @@ class WorkspaceArchiveService(
         val databaseDirectory = context.getDatabasePath("rikka_hub").parentFile
             ?: error("Database directory is unavailable")
         val targetNames = listOf("rikka_hub", "rikka_hub-wal", "rikka_hub-shm", "rikka_hub-journal")
-        val oldExistingNames = targetNames.filter { name ->
-            val target = File(databaseDirectory, name)
-            require(!Files.isSymbolicLink(target.toPath())) {
-                "Database file is a symbolic link: $name"
+        val oldExistingNames = if (databaseRecoveryDirectory != null) {
+            targetNames.filter { name ->
+                val target = File(databaseDirectory, name)
+                require(!Files.isSymbolicLink(target.toPath())) {
+                    "Database file is a symbolic link: $name"
+                }
+                target.exists()
             }
-            target.exists()
+        } else {
+            emptyList()
         }
         val workspaces = workspacesRoot?.let { root ->
             WorkspaceArchiveDirectoryRecovery(
@@ -2398,13 +2512,16 @@ class WorkspaceArchiveService(
             phase = WorkspaceArchiveRecoveryPhase.PREPARED,
             commitState = WorkspaceArchiveCommitState.PENDING,
             workspaces = workspaces,
-            legacyDirectories = legacyDirectories,
-            database = WorkspaceArchiveDatabaseRecovery(
-                databaseDirectory = databaseDirectory.absolutePath,
-                oldDatabaseRecovery = databaseRecoveryDirectory.absolutePath,
-                targetNames = targetNames,
-                oldExistingNames = oldExistingNames,
-            ),
+            legacyDirectories = incrementalDirectories + legacyDirectories,
+            database = databaseRecoveryDirectory?.let { recoveryDirectory ->
+                WorkspaceArchiveDatabaseRecovery(
+                    databaseDirectory = databaseDirectory.absolutePath,
+                    oldDatabaseRecovery = recoveryDirectory.absolutePath,
+                    targetNames = targetNames,
+                    oldExistingNames = oldExistingNames,
+                )
+            },
+            incrementalWorkspaceIds = incrementalWorkspaceIds.distinct(),
             settingsBackup = settingsBackup.absolutePath,
             settingsDataStoreBackup = settingsDataStoreBackup.absolutePath,
             settingsDataStoreExisted = settingsDataStoreExisted,

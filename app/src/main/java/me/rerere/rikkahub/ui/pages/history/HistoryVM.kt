@@ -77,7 +77,6 @@ class HistoryVM(
             summarizerAssistantId = summarizerAssistantId,
             sourceConversationIds = sourceConversationIds,
             title = title,
-            workspaceId = settings.value.getAssistantById(summarizerAssistantId)?.workspaceId,
         )
     }
 

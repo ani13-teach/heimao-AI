@@ -200,6 +200,87 @@ class WorkspaceArchiveRecoveryTest {
     }
 
     @Test
+    fun `interrupted incremental restore rolls back directory and retains Room cleanup ids`() {
+        val filesDir = temporaryFolder.newFolder("files")
+        val databaseDir = temporaryFolder.newFolder("databases")
+        val activated = File(filesDir, "workspaces/imported").apply {
+            mkdirs()
+            resolve("state.txt").writeText("new")
+        }
+        val recovery = File(filesDir, ".incremental-recovery/imported")
+        val journalFile = File(filesDir, WorkspaceArchiveRecovery.JOURNAL_FILE_NAME)
+        WorkspaceArchiveRecovery.writeJournal(
+            journalFile,
+            WorkspaceArchiveRecoveryJournal(
+                phase = WorkspaceArchiveRecoveryPhase.WORKSPACES_ACTIVATED,
+                commitState = WorkspaceArchiveCommitState.PENDING,
+                legacyDirectories = listOf(
+                    WorkspaceArchiveDirectoryRecovery(
+                        newRoot = activated.absolutePath,
+                        oldRootRecovery = recovery.absolutePath,
+                        oldRootExisted = false,
+                    )
+                ),
+                incrementalWorkspaceIds = listOf("imported-id"),
+                cleanupArtifacts = listOf(File(filesDir, ".incremental-recovery").absolutePath),
+            ),
+        )
+
+        val outcome = WorkspaceArchiveRecovery.recoverPendingJournal(journalFile, filesDir, databaseDir)
+
+        assertFalse(activated.exists())
+        assertEquals(listOf("imported-id"), outcome.incrementalWorkspaceIdsToDelete)
+        assertTrue(journalFile.exists())
+        assertEquals(
+            WorkspaceArchiveCommitState.ROLLED_BACK,
+            WorkspaceArchiveRecovery.readJournal(journalFile)?.commitState,
+        )
+
+        val repeatedOutcome = WorkspaceArchiveRecovery.recoverPendingJournal(
+            journalFile,
+            filesDir,
+            databaseDir,
+        )
+        assertEquals(listOf("imported-id"), repeatedOutcome.incrementalWorkspaceIdsToDelete)
+        assertTrue(journalFile.exists())
+    }
+
+    @Test
+    fun `committed incremental restore keeps activated directory and cleans recovery journal`() {
+        val filesDir = temporaryFolder.newFolder("files")
+        val databaseDir = temporaryFolder.newFolder("databases")
+        val activated = File(filesDir, "workspaces/imported").apply {
+            mkdirs()
+            resolve("state.txt").writeText("new")
+        }
+        val recoveryRoot = File(filesDir, ".incremental-recovery").apply { mkdirs() }
+        val journalFile = File(filesDir, WorkspaceArchiveRecovery.JOURNAL_FILE_NAME)
+        WorkspaceArchiveRecovery.writeJournal(
+            journalFile,
+            WorkspaceArchiveRecoveryJournal(
+                phase = WorkspaceArchiveRecoveryPhase.COMMITTED,
+                commitState = WorkspaceArchiveCommitState.COMMITTED,
+                legacyDirectories = listOf(
+                    WorkspaceArchiveDirectoryRecovery(
+                        newRoot = activated.absolutePath,
+                        oldRootRecovery = File(recoveryRoot, "imported").absolutePath,
+                        oldRootExisted = false,
+                    )
+                ),
+                incrementalWorkspaceIds = listOf("imported-id"),
+                cleanupArtifacts = listOf(recoveryRoot.absolutePath),
+            ),
+        )
+
+        val outcome = WorkspaceArchiveRecovery.recoverPendingJournal(journalFile, filesDir, databaseDir)
+
+        assertFalse(outcome.settingsNeedsCompensation)
+        assertTrue(activated.isDirectory)
+        assertFalse(recoveryRoot.exists())
+        assertFalse(journalFile.exists())
+    }
+
+    @Test
     fun `failed recovery rename leaves journal and old root untouched for a later process`() {
         val filesDir = temporaryFolder.newFolder("files")
         val databaseDir = temporaryFolder.newFolder("databases")

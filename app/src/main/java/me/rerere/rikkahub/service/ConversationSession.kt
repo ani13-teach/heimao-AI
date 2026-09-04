@@ -86,14 +86,36 @@ class ConversationSession(
         }
     }
 
-    fun setJob(job: Job?) {
-        _generationJob.value?.cancel()
-        _generationJob.value = job
+    @Volatile
+    private var acceptsGenerationJobs = true
+    private val generationJobLock = Any()
+
+    fun setJob(job: Job?): Boolean {
+        val previous = synchronized(generationJobLock) {
+            if (job != null && !acceptsGenerationJobs) {
+                job.cancel()
+                return false
+            }
+            _generationJob.value.also { _generationJob.value = job }
+        }
+        previous?.cancel()
         job?.invokeOnCompletion {
-            _generationJob.value = null
+            _generationJob.compareAndSet(job, null)
             if (refCount.get() <= 0) {
                 scheduleIdleCheck()
             }
+        }
+        return true
+    }
+
+    fun pauseGeneration(): Job? = synchronized(generationJobLock) {
+        acceptsGenerationJobs = false
+        _generationJob.value?.also(Job::cancel)
+    }
+
+    fun resumeGeneration() {
+        synchronized(generationJobLock) {
+            acceptsGenerationJobs = true
         }
     }
 

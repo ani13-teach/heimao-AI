@@ -196,6 +196,25 @@ class WorkspaceArchiveSecurityTest {
     }
 
     @Test
+    fun `manifest accepts legacy conversation workspace reference for restore`() {
+        val payload = WorkspaceArchivePayload(
+            path = "workspaces/id/files.tar",
+            length = 1,
+            sha256 = "0".repeat(64),
+        )
+        val manifest = WorkspaceArchiveManifest(
+            createdAt = 1,
+            workspaces = listOf(WorkspaceArchiveWorkspace("id", "one", "id", files = payload)),
+            references = WorkspaceArchiveReferences(
+                assistants = listOf(WorkspaceAssistantReference("assistant", null)),
+                conversations = listOf(WorkspaceConversationReference("conversation", "id")),
+            ),
+        )
+
+        assertTrue(runCatching { manifest.validate() }.isSuccess)
+    }
+
+    @Test
     fun `manifest rejects duplicate conversation references`() {
         val payload = WorkspaceArchivePayload(
             path = "workspaces/id/files.tar",

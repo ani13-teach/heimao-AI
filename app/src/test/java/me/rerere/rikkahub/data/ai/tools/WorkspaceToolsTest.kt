@@ -1,5 +1,8 @@
 package me.rerere.rikkahub.data.ai.tools
 
+import kotlinx.coroutines.runBlocking
+import me.rerere.rikkahub.data.workspace.AssistantWorkspaceAccessGate
+import me.rerere.rikkahub.data.workspace.WorkspaceAccessRevokedException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -8,6 +11,38 @@ import me.rerere.rikkahub.data.workspace.MAX_WORKSPACE_SHELL_COMMAND_CHARS
 import org.junit.Test
 
 class WorkspaceToolsTest {
+
+    @Test
+    fun `workspace gate rejects stale owner and binding`() = runBlocking {
+        var owner = "assistant-a"
+        var binding: String? = "workspace-a"
+        val gate = AssistantWorkspaceAccessGate(
+            readConversationOwner = { owner },
+            readAssistantBinding = { binding },
+        )
+
+        assertEquals(
+            "ok",
+            gate.withWorkspaceAccess("assistant-a", "conversation-a", "workspace-a") { "ok" },
+        )
+
+        binding = "workspace-b"
+        assertThrows(WorkspaceAccessRevokedException::class.java) {
+            runBlocking {
+                gate.withWorkspaceAccess("assistant-a", "conversation-a", "workspace-a") { "unexpected" }
+            }
+        }
+
+        binding = "workspace-a"
+        owner = "assistant-b"
+        assertThrows(WorkspaceAccessRevokedException::class.java) {
+            runBlocking {
+                gate.withWorkspaceAccess("assistant-a", "conversation-a", "workspace-a") { "unexpected" }
+            }
+        }
+        Unit
+    }
+
     @Test
     fun `workspace shell exposes one unified schema without a mode parameter`() {
         val schema = workspaceShellParametersSchema()

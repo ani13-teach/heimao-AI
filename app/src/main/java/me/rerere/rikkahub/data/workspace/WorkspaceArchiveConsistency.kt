@@ -58,15 +58,20 @@ internal fun workspaceArchiveCatalogIsConsistent(
     val manifestConversationReferences =
         state.manifestConversationReferences.sortedWith(CONVERSATION_REFERENCE_ORDER)
     if (databaseConversationReferences != manifestConversationReferences) return false
-    if (databaseConversationReferences.any {
-            it.workspaceId != null && it.workspaceId !in databaseIds
-        }
+    if (
+        databaseConversationReferences.any { it.workspaceId != null } ||
+        manifestConversationReferences.any { it.workspaceId != null }
     ) {
         return false
     }
 
     return state.actualDirectoryRoots == databaseRoots.toSet()
 }
+
+/** New archives retain conversation IDs only; workspace ownership lives in assistant settings. */
+internal fun authoritativeArchiveConversationReferences(
+    references: List<WorkspaceConversationReference>,
+): List<WorkspaceConversationReference> = references.map { it.copy(workspaceId = null) }
 
 /**
  * A restore that touched the Room database must never return control to the current process.

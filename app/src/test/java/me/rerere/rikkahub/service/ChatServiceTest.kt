@@ -1,5 +1,10 @@
 package me.rerere.rikkahub.service
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.yield
 import kotlinx.serialization.json.JsonPrimitive
 import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.provider.BuiltInTools
@@ -7,9 +12,12 @@ import me.rerere.ai.provider.CustomBody
 import me.rerere.ai.provider.CustomHeader
 import me.rerere.ai.provider.Model
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.rikkahub.data.datastore.Settings
+import me.rerere.rikkahub.data.datastore.getAssistantById
 import me.rerere.rikkahub.data.db.dao.MessageNodeContentVersion
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.Conversation
+import me.rerere.rikkahub.data.workspace.AssistantWorkspaceAccessGate
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -19,6 +27,52 @@ import java.time.Instant
 import kotlin.uuid.Uuid
 
 class ChatServiceTest {
+    @Test
+    fun `move target revalidation fails after target is deleted while move waits for gate`() = runBlocking {
+        val currentId = Uuid.parse("11111111-1111-1111-1111-111111111111")
+        val targetId = Uuid.parse("22222222-2222-2222-2222-222222222222")
+        var persistedSettings = Settings(
+            assistants = listOf(Assistant(id = currentId), Assistant(id = targetId))
+        )
+        var persistenceReached = false
+        val targetGateHeld = CompletableDeferred<Unit>()
+        val releaseTargetGate = CompletableDeferred<Unit>()
+        val moveStarted = CompletableDeferred<Unit>()
+        val gate = AssistantWorkspaceAccessGate(
+            readConversationOwner = { currentId.toString() },
+            readAssistantBinding = { null },
+        )
+
+        val deletion = launch {
+            gate.withAssistantMutation(targetId.toString()) {
+                targetGateHeld.complete(Unit)
+                releaseTargetGate.await()
+            }
+        }
+        targetGateHeld.await()
+        val move = async {
+            moveStarted.complete(Unit)
+            runCatching {
+                gate.withAssistantMutations(listOf(currentId.toString(), targetId.toString())) {
+                    persistedSettings.getAssistantById(targetId)
+                        ?: error("Target assistant not found")
+                    persistenceReached = true
+                }
+            }
+        }
+        moveStarted.await()
+        yield()
+
+        persistedSettings = Settings(assistants = listOf(Assistant(id = currentId)))
+        releaseTargetGate.complete(Unit)
+        deletion.join()
+
+        val failure = move.await().exceptionOrNull()
+        assertTrue(failure is IllegalStateException)
+        assertEquals("Target assistant not found", failure?.message)
+        assertFalse(persistenceReached)
+    }
+
     @Test
     fun `background generation params include model custom request configuration`() {
         val headers = listOf(CustomHeader(name = "X-Gateway-Token", value = "test-token"))
@@ -38,11 +92,10 @@ class ChatServiceTest {
     }
 
     @Test
-    fun `new conversation captures assistant workspace during initialization`() {
+    fun `new conversation keeps only assistant ownership during initialization`() {
         val conversationId = Uuid.parse("11111111-1111-1111-1111-111111111111")
         val assistantId = Uuid.parse("22222222-2222-2222-2222-222222222222")
-        val workspaceId = Uuid.parse("33333333-3333-3333-3333-333333333333")
-        val assistant = Assistant(id = assistantId, workspaceId = workspaceId)
+        val assistant = Assistant(id = assistantId)
 
         val initialized = resolveConversationForInitialization(
             conversationId = conversationId,
@@ -52,30 +105,30 @@ class ChatServiceTest {
 
         assertEquals(conversationId, initialized.id)
         assertEquals(assistantId, initialized.assistantId)
-        assertEquals(workspaceId, initialized.workspaceId)
         assertTrue(initialized.newConversation)
     }
 
     @Test
-    fun `existing conversation does not inherit current assistant workspace`() {
-        val conversationId = Uuid.parse("11111111-1111-1111-1111-111111111111")
-        val assistantId = Uuid.parse("22222222-2222-2222-2222-222222222222")
-        val workspaceId = Uuid.parse("33333333-3333-3333-3333-333333333333")
-        val persisted = Conversation(
-            id = conversationId,
-            assistantId = assistantId,
+    fun `effective assistant is resolved by exact conversation owner`() {
+        val owner = Assistant(id = Uuid.parse("22222222-2222-2222-2222-222222222222"))
+        val current = Assistant(id = Uuid.parse("33333333-3333-3333-3333-333333333333"))
+        val conversation = Conversation(
+            assistantId = owner.id,
             messageNodes = emptyList(),
-            workspaceId = null,
         )
 
-        val initialized = resolveConversationForInitialization(
-            conversationId = conversationId,
-            persistedConversation = persisted,
-            assistant = Assistant(id = assistantId, workspaceId = workspaceId),
+        assertEquals(owner, Settings(assistants = listOf(current, owner)).getAssistantById(conversation.assistantId))
+    }
+
+    @Test
+    fun `missing conversation owner fails closed instead of using current assistant`() {
+        val current = Assistant(id = Uuid.parse("33333333-3333-3333-3333-333333333333"))
+        val conversation = Conversation(
+            assistantId = Uuid.parse("22222222-2222-2222-2222-222222222222"),
+            messageNodes = emptyList(),
         )
 
-        assertEquals(persisted, initialized)
-        assertNull(initialized.workspaceId)
+        assertNull(Settings(assistants = listOf(current)).getAssistantById(conversation.assistantId))
     }
 
     @Test

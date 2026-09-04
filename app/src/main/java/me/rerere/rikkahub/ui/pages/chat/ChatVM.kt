@@ -12,7 +12,9 @@ import androidx.core.net.toUri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.firebase.analytics.FirebaseAnalytics
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -38,10 +40,16 @@ import me.rerere.rikkahub.data.model.MessageNode
 import me.rerere.rikkahub.data.model.NodeFavoriteTarget
 import me.rerere.rikkahub.data.repository.ConversationRepository
 import me.rerere.rikkahub.data.repository.FavoriteRepository
+import me.rerere.rikkahub.data.workspace.AssistantWorkspaceBindingCoordinator
 import me.rerere.rikkahub.service.ChatError
 import me.rerere.rikkahub.service.ChatService
 import me.rerere.rikkahub.ui.hooks.writeStringPreference
 import me.rerere.rikkahub.ui.hooks.ChatInputState
+import me.rerere.rikkahub.ui.workspace.WorkspaceBindingUiState
+import me.rerere.rikkahub.ui.workspace.applyBindingFailure
+import me.rerere.rikkahub.ui.workspace.applyBindingResult
+import me.rerere.rikkahub.ui.workspace.mergeAssistantSnapshot
+import me.rerere.rikkahub.ui.workspace.startBinding
 import java.util.Locale
 import kotlin.uuid.Uuid
 
@@ -56,6 +64,7 @@ class ChatVM(
     private val analytics: FirebaseAnalytics,
     private val filesManager: FilesManager,
     private val favoriteRepository: FavoriteRepository,
+    private val bindingCoordinator: AssistantWorkspaceBindingCoordinator,
 ) : ViewModel() {
     private val _conversationId: Uuid = Uuid.parse(id)
     val conversation: StateFlow<Conversation> = chatService.getConversationFlow(_conversationId)
@@ -146,7 +155,37 @@ class ChatVM(
             val oldSettings = settings.value
             // 检查用户头像是否有变化，如果有则删除旧头像
             checkUserAvatarDelete(oldSettings, newSettings)
-            settingsStore.update(newSettings)
+            settingsStore.transformLatest { current ->
+                current.copy(
+                    displaySetting = newSettings.displaySetting,
+                    assistantId = newSettings.assistantId,
+                    assistants = mergeAssistantSnapshot(current.assistants, newSettings.assistants),
+                    searchServiceSelected = newSettings.searchServiceSelected,
+                )
+            }
+        }
+    }
+
+    private val _workspaceBinding = MutableStateFlow(WorkspaceBindingUiState(null))
+    val workspaceBinding: StateFlow<WorkspaceBindingUiState> = _workspaceBinding
+
+    fun setWorkspaceBinding(assistant: Assistant, workspaceId: Uuid?) {
+        if (_workspaceBinding.value.isSubmitting) return
+        val expectedCurrent = assistant.workspaceId
+        _workspaceBinding.value = WorkspaceBindingUiState(expectedCurrent).startBinding()
+        viewModelScope.launch {
+            try {
+                val result = bindingCoordinator.setBinding(assistant.id, expectedCurrent, workspaceId)
+                _workspaceBinding.value = _workspaceBinding.value.applyBindingResult(result)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                _workspaceBinding.value = _workspaceBinding.value.applyBindingFailure()
+            } finally {
+                if (_workspaceBinding.value.isSubmitting) {
+                    _workspaceBinding.value = _workspaceBinding.value.copy(isSubmitting = false)
+                }
+            }
         }
     }
 
@@ -295,20 +334,9 @@ class ChatVM(
 
     fun moveConversationToAssistant(conversation: Conversation, targetAssistantId: Uuid) {
         viewModelScope.launch {
-            val conversationFull = conversationRepo.getConversationById(conversation.id) ?: return@launch
-            // 文件夹是助手内分组，切换助手后原文件夹在新助手下不可见，需清空归属避免会话丢失
-            val updatedConversation = conversationFull.copy(
-                assistantId = targetAssistantId,
-                folderId = null,
-                // Moving assistants does not rebind the session workspace or its CWD.
-                workspaceId = conversationFull.workspaceId,
-                workspaceCwd = conversationFull.workspaceCwd,
-            )
+            chatService.moveConversationToAssistant(conversation.id, targetAssistantId)
             if (conversation.id == _conversationId) {
-                chatService.saveConversation(_conversationId, updatedConversation)
                 settingsStore.updateAssistant(targetAssistantId)
-            } else {
-                conversationRepo.updateConversation(updatedConversation)
             }
         }
     }
@@ -332,6 +360,12 @@ class ChatVM(
 
     fun clearTranslationField(messageId: Uuid) {
         chatService.clearTranslationField(_conversationId, messageId)
+    }
+
+    fun updateWorkspaceCwd(workspaceCwd: String?) {
+        viewModelScope.launch {
+            chatService.updateConversationWorkspaceCwd(_conversationId, workspaceCwd)
+        }
     }
 
     fun updateConversation(newConversation: Conversation) {

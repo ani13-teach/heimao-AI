@@ -832,6 +832,10 @@
   <string name="setting_provider_page_model_id_placeholder">e.g.: gpt-3.5-turbo</string>
   <string name="setting_provider_page_model_name">Model Name</string>
   <string name="setting_provider_page_model_type">Model Type</string>
+  <string name="setting_provider_page_transport_mode">Transport Mode</string>
+  <string name="setting_provider_page_transport_mode_desc">Applies only to this model</string>
+  <string name="setting_provider_page_transport_streaming">Streaming</string>
+  <string name="setting_provider_page_transport_non_streaming">Non-streaming</string>
   <string name="setting_provider_page_models">Models</string>
   <string name="setting_provider_page_name">Name</string>
   <string name="setting_provider_page_no_models">No models</string>
@@ -968,6 +972,13 @@
   <string name="assistant_page_workspace">Workspace</string>
   <string name="assistant_page_workspace_desc">After binding, the Agent can use this workspace\'s files and sandbox capabilities</string>
   <string name="assistant_page_workspace_unbound">Not bound</string>
+  <string name="workspace_catalog_loading">Loading workspaces…</string>
+  <string name="workspace_catalog_error">Workspaces could not be loaded. Creation is unavailable until the catalog is available.</string>
+  <string name="workspace_catalog_empty_create_unbound">No workspaces yet. This assistant will be created without a binding.</string>
+  <string name="workspace_binding_conflict">The workspace binding changed elsewhere. The latest binding is shown; try again if needed.</string>
+  <string name="workspace_binding_assistant_not_found">This assistant no longer exists.</string>
+  <string name="workspace_binding_workspace_not_found">That workspace no longer exists. Choose another workspace or no binding.</string>
+  <string name="workspace_binding_failed">Could not update the workspace binding. Try again.</string>
   <string name="workspace_page_title">Workspace</string>
   <string name="workspace_page_create">Create Workspace</string>
   <string name="workspace_page_rename">Rename Workspace</string>

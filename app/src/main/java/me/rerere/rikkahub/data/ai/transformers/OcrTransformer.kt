@@ -11,6 +11,7 @@ import me.rerere.ai.provider.Modality
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ProviderManager
 import me.rerere.ai.provider.TextGenerationParams
+import me.rerere.ai.provider.generateTextWithModelTransport
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.common.cache.LruCache
@@ -90,7 +91,7 @@ object OcrTransformer : InputMessageTransformer, KoinComponent {
         val model = settings.findModelById(settings.ocrModelId) ?: return "[Image]"
         val providerSetting = model.findProvider(settings.providers) ?: return "[Image]"
         val provider = get<ProviderManager>().getProviderByType(providerSetting)
-        val result = provider.generateText(
+        val resultMessages = provider.generateTextWithModelTransport(
             providerSetting = providerSetting,
             messages = listOf(
                 UIMessage.system(settings.ocrPrompt),
@@ -105,7 +106,7 @@ object OcrTransformer : InputMessageTransformer, KoinComponent {
                 customBody = model.customBodies,
             ),
         )
-        val content = result.message.toText().ifBlank { "[ERROR, OCR failed]" }
+        val content = resultMessages.last().toText().ifBlank { "[ERROR, OCR failed]" }
         Log.i(TAG, "performOcr: $content")
         val ocrResult = """
             <image_file_ocr>

@@ -1,5 +1,6 @@
 package me.rerere.rikkahub.data.workspace
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -7,7 +8,7 @@ import org.junit.Test
 class WorkspaceArchiveConsistencyTest {
     private val workspace = WorkspaceArchiveWorkspaceKey("workspace", "workspace-root")
     private val assistantReference = WorkspaceAssistantReference("assistant", "workspace")
-    private val conversationReference = WorkspaceConversationReference("conversation", "workspace")
+    private val conversationReference = WorkspaceConversationReference("conversation", null)
 
     private fun consistentState() = WorkspaceArchiveCatalogConsistency(
         stagedDatabaseWorkspaces = listOf(workspace),
@@ -47,7 +48,7 @@ class WorkspaceArchiveConsistencyTest {
             workspaceArchiveCatalogIsConsistent(
                 consistentState().copy(
                     stagedDatabaseConversationReferences = listOf(
-                        conversationReference.copy(workspaceId = null),
+                        conversationReference.copy(workspaceId = "workspace"),
                     ),
                 )
             )
@@ -55,6 +56,38 @@ class WorkspaceArchiveConsistencyTest {
         assertFalse(
             workspaceArchiveCatalogIsConsistent(
                 consistentState().copy(actualDirectoryRoots = setOf("workspace-root", "orphan-root")),
+            )
+        )
+    }
+
+    @Test
+    fun `new archive conversation references retain ids but clear legacy workspace values`() {
+        assertEquals(
+            listOf(
+                WorkspaceConversationReference("legacy", null),
+                WorkspaceConversationReference("current", null),
+            ),
+            authoritativeArchiveConversationReferences(
+                listOf(
+                    WorkspaceConversationReference("legacy", "workspace"),
+                    WorkspaceConversationReference("current", null),
+                )
+            ),
+        )
+    }
+
+    @Test
+    fun `new archive consistency rejects legacy conversation workspace values`() {
+        assertFalse(
+            workspaceArchiveCatalogIsConsistent(
+                consistentState().copy(
+                    stagedDatabaseConversationReferences = listOf(
+                        conversationReference.copy(workspaceId = "workspace"),
+                    ),
+                    manifestConversationReferences = listOf(
+                        conversationReference.copy(workspaceId = "workspace"),
+                    ),
+                )
             )
         )
     }

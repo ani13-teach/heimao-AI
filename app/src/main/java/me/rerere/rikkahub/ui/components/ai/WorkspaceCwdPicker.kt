@@ -54,23 +54,30 @@ fun WorkspaceCwdPickerSheet(
 ) {
     val workspaceRepository: WorkspaceRepository = koinInject()
 
-    var browsePath by remember { mutableStateOf(fromAbsolutePath(currentCwd)) }
-    var entries by remember { mutableStateOf<List<WorkspaceFileEntry>>(emptyList()) }
-    var loading by remember { mutableStateOf(true) }
+    var browsePath by remember(workspaceId, currentCwd) { mutableStateOf(fromAbsolutePath(currentCwd)) }
+    var entries by remember(workspaceId) { mutableStateOf<List<WorkspaceFileEntry>>(emptyList()) }
+    var loading by remember(workspaceId) { mutableStateOf(true) }
+    var activeLoadKey by remember(workspaceId) { mutableStateOf<Pair<String, String>?>(null) }
 
-    LaunchedEffect(browsePath) {
+    LaunchedEffect(workspaceId, browsePath) {
+        val loadKey = workspaceId to browsePath
+        activeLoadKey = loadKey
         loading = true
         try {
             val result = withContext(Dispatchers.IO) {
                 workspaceRepository.listFiles(workspaceId, WorkspaceStorageArea.FILES, browsePath)
             }
-            entries = result.sortedWith(compareByDescending<WorkspaceFileEntry> { it.isDirectory }.thenBy { it.name })
-            loading = false
+            if (activeLoadKey == loadKey) {
+                entries = result.sortedWith(compareByDescending<WorkspaceFileEntry> { it.isDirectory }.thenBy { it.name })
+                loading = false
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
-            entries = emptyList()
-            loading = false
+            if (activeLoadKey == loadKey) {
+                entries = emptyList()
+                loading = false
+            }
         }
     }
 

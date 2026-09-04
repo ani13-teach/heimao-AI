@@ -40,9 +40,10 @@ internal fun WorkspaceSelectSheet(
     onSelect: (String?) -> Unit,
     onManage: () -> Unit,
     onDismiss: () -> Unit,
+    enabled: Boolean = true,
 ) {
     ModalBottomSheet(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { if (enabled) onDismiss() },
         sheetState = rememberBottomSheetState(
             initialValue = SheetValue.Hidden,
             enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded)
@@ -72,6 +73,7 @@ internal fun WorkspaceSelectSheet(
                     title = stringResource(R.string.workspace_no_binding),
                     selected = selectedWorkspaceId == null,
                     onClick = { onSelect(null) },
+                    enabled = enabled,
                 )
                 workspaces.forEach { workspace ->
                     WorkspaceSelectRow(
@@ -79,6 +81,7 @@ internal fun WorkspaceSelectSheet(
                         status = workspace.shellStatus.toShellStatusLabel(),
                         selected = workspace.id == selectedWorkspaceId,
                         onClick = { onSelect(workspace.id) },
+                        enabled = enabled,
                     )
                 }
             }
@@ -103,7 +106,7 @@ internal fun WorkspaceSelectSheet(
                 colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                 modifier = Modifier
                     .clip(MaterialTheme.shapes.large)
-                    .clickable { onManage() },
+                    .clickable(enabled = enabled) { onManage() },
             )
         }
     }
@@ -115,6 +118,7 @@ private fun WorkspaceSelectRow(
     selected: Boolean,
     onClick: () -> Unit,
     status: String? = null,
+    enabled: Boolean = true,
 ) {
     ListItem(
         leadingContent = {
@@ -156,6 +160,6 @@ private fun WorkspaceSelectRow(
         ),
         modifier = Modifier
             .clip(MaterialTheme.shapes.large)
-            .clickable { onClick() },
+            .clickable(enabled = enabled) { onClick() },
     )
 }

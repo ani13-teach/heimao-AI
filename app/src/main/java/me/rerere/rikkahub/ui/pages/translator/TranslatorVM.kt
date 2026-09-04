@@ -47,7 +47,9 @@ class TranslatorVM(
 
     fun updateSettings(settings: Settings) {
         viewModelScope.launch {
-            settingsStore.update(settings)
+            settingsStore.transformLatest { current ->
+                current.copy(translateModeId = settings.translateModeId)
+            }
         }
     }
 

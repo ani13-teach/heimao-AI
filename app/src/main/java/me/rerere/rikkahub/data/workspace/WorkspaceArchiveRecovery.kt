@@ -68,7 +68,9 @@ internal data class WorkspaceArchiveRecoveryJournal(
     val commitState: WorkspaceArchiveCommitState = WorkspaceArchiveCommitState.PENDING,
     val workspaces: WorkspaceArchiveDirectoryRecovery? = null,
     val legacyDirectories: List<WorkspaceArchiveDirectoryRecovery> = emptyList(),
-    val database: WorkspaceArchiveDatabaseRecovery,
+    val database: WorkspaceArchiveDatabaseRecovery? = null,
+    /** IDs proven absent before an incremental restore and safe to delete during rollback. */
+    val incrementalWorkspaceIds: List<String> = emptyList(),
     /** Legacy JSON settings snapshot retained for journals written before raw snapshots. */
     val settingsBackup: String? = null,
     /** Exact Preferences DataStore file snapshot used for pre-Koin compensation. */
@@ -87,6 +89,7 @@ internal data class WorkspaceArchiveRecoveryJournal(
 
 internal data class WorkspaceArchiveRecoveryOutcome(
     val settingsNeedsCompensation: Boolean,
+    val incrementalWorkspaceIdsToDelete: List<String> = emptyList(),
 )
 
 /** Journal IO and pre-Koin recovery for full archive restores. */
@@ -227,11 +230,19 @@ internal object WorkspaceArchiveRecovery {
             }
 
             WorkspaceArchiveCommitState.ROLLED_BACK -> {
-                if (state.settingsNeedsCompensation) {
-                    WorkspaceArchiveRecoveryOutcome(true)
-                } else {
-                    finishConfirmedTransaction(journal, state, filesDir, databaseDirectory)
-                    WorkspaceArchiveRecoveryOutcome(false)
+                when {
+                    state.settingsNeedsCompensation -> WorkspaceArchiveRecoveryOutcome(
+                        settingsNeedsCompensation = true,
+                        incrementalWorkspaceIdsToDelete = state.incrementalWorkspaceIds,
+                    )
+                    state.incrementalWorkspaceIds.isNotEmpty() -> WorkspaceArchiveRecoveryOutcome(
+                        settingsNeedsCompensation = false,
+                        incrementalWorkspaceIdsToDelete = state.incrementalWorkspaceIds,
+                    )
+                    else -> {
+                        finishConfirmedTransaction(journal, state, filesDir, databaseDirectory)
+                        WorkspaceArchiveRecoveryOutcome(false)
+                    }
                 }
             }
 
@@ -268,7 +279,12 @@ internal object WorkspaceArchiveRecovery {
         restoreJson: (suspend (Settings) -> Unit)? = null,
     ): WorkspaceArchiveRecoveryOutcome {
         val state = readJournal(journal) ?: return WorkspaceArchiveRecoveryOutcome(false)
-        if (!state.settingsNeedsCompensation) return WorkspaceArchiveRecoveryOutcome(false)
+        if (!state.settingsNeedsCompensation) {
+            return WorkspaceArchiveRecoveryOutcome(
+                settingsNeedsCompensation = false,
+                incrementalWorkspaceIdsToDelete = state.incrementalWorkspaceIds,
+            )
+        }
         validateJournalPaths(state, journal, filesDir, databaseDirectory)
         validateDataStorePath(dataStoreFile, filesDir)
 
@@ -320,7 +336,57 @@ internal object WorkspaceArchiveRecovery {
         )
         // Keep every recovery artifact protected until this durable state transition succeeds.
         writeJournal(journal, compensated)
+        if (compensated.incrementalWorkspaceIds.isNotEmpty()) {
+            return WorkspaceArchiveRecoveryOutcome(
+                settingsNeedsCompensation = false,
+                incrementalWorkspaceIdsToDelete = compensated.incrementalWorkspaceIds,
+            )
+        }
         return finishConfirmedTransaction(journal, compensated, filesDir, databaseDirectory)
+    }
+
+    /** Finishes the Room half of an interrupted incremental rollback after Koin has opened Room. */
+    fun completeIncrementalRoomRollback(context: Context): WorkspaceArchiveRecoveryOutcome {
+        val journal = journalFile(context)
+        val state = readJournal(journal) ?: return WorkspaceArchiveRecoveryOutcome(false)
+        require(state.commitState == WorkspaceArchiveCommitState.ROLLED_BACK) {
+            "Incremental Room rollback requires a rolled-back journal"
+        }
+        require(!state.settingsNeedsCompensation) {
+            "Settings compensation must finish before Room rollback"
+        }
+        val databaseDirectory = context.getDatabasePath("rikka_hub").parentFile
+            ?: error("Database directory is unavailable")
+        val completed = state.copy(incrementalWorkspaceIds = emptyList())
+        writeJournal(journal, completed)
+        return finishConfirmedTransaction(journal, completed, context.filesDir, databaseDirectory)
+    }
+
+    /** Retries cleanup after application-level compensation durably reached ROLLED_BACK. */
+    fun finishRolledBack(context: Context): WorkspaceArchiveRecoveryOutcome {
+        val journal = journalFile(context)
+        val state = readJournal(journal) ?: return WorkspaceArchiveRecoveryOutcome(false)
+        require(state.commitState == WorkspaceArchiveCommitState.ROLLED_BACK) {
+            "Workspace archive transaction is not rolled back"
+        }
+        require(!state.settingsNeedsCompensation && state.incrementalWorkspaceIds.isEmpty()) {
+            "Workspace archive rollback still needs compensation"
+        }
+        val databaseDirectory = context.getDatabasePath("rikka_hub").parentFile
+            ?: error("Database directory is unavailable")
+        return finishConfirmedTransaction(journal, state, context.filesDir, databaseDirectory)
+    }
+
+    /** Cleans a transaction only after its durable COMMITTED marker has been written. */
+    fun finishCommitted(context: Context): WorkspaceArchiveRecoveryOutcome {
+        val journal = journalFile(context)
+        val state = readJournal(journal) ?: return WorkspaceArchiveRecoveryOutcome(false)
+        require(state.commitState == WorkspaceArchiveCommitState.COMMITTED) {
+            "Workspace archive transaction is not committed"
+        }
+        val databaseDirectory = context.getDatabasePath("rikka_hub").parentFile
+            ?: error("Database directory is unavailable")
+        return finishConfirmedTransaction(journal, state, context.filesDir, databaseDirectory)
     }
 
     /**
@@ -360,7 +426,7 @@ internal object WorkspaceArchiveRecovery {
         // are restored to the same pre-transaction generation as the old workspace root.
         state.workspaces?.let(::rollbackDirectory)
         state.legacyDirectories.asReversed().forEach(::rollbackDirectory)
-        rollbackDatabase(state.database)
+        state.database?.let(::rollbackDatabase)
 
         val rolledBack = state.copy(
             phase = WorkspaceArchiveRecoveryPhase.ROLLED_BACK,
@@ -369,7 +435,16 @@ internal object WorkspaceArchiveRecovery {
         )
         writeJournal(journal, rolledBack)
         if (rolledBack.settingsNeedsCompensation) {
-            return WorkspaceArchiveRecoveryOutcome(true)
+            return WorkspaceArchiveRecoveryOutcome(
+                settingsNeedsCompensation = true,
+                incrementalWorkspaceIdsToDelete = rolledBack.incrementalWorkspaceIds,
+            )
+        }
+        if (rolledBack.incrementalWorkspaceIds.isNotEmpty()) {
+            return WorkspaceArchiveRecoveryOutcome(
+                settingsNeedsCompensation = false,
+                incrementalWorkspaceIdsToDelete = rolledBack.incrementalWorkspaceIds,
+            )
         }
         finishConfirmedTransaction(journal, rolledBack, filesDir, databaseDirectory)
         return WorkspaceArchiveRecoveryOutcome(false)
@@ -493,19 +568,27 @@ internal object WorkspaceArchiveRecovery {
             requireFilesPath(record.newRoot, "New legacy directory")
             requireFilesPath(record.oldRootRecovery, "Old legacy directory recovery")
         }
-        requirePath(state.database.databaseDirectory, databaseRoot, "Database directory")
-        requireFilesPath(state.database.oldDatabaseRecovery, "Old database recovery")
+        state.database?.let { database ->
+            requirePath(database.databaseDirectory, databaseRoot, "Database directory")
+            requireFilesPath(database.oldDatabaseRecovery, "Old database recovery")
+            database.targetNames.forEach { name ->
+                require(isSafeDatabaseName(name)) { "Invalid database recovery file name: $name" }
+            }
+            require(database.oldExistingNames.all { it in database.targetNames }) {
+                "Database recovery contains an unknown old file"
+            }
+        }
+        require(state.incrementalWorkspaceIds.distinct().size == state.incrementalWorkspaceIds.size) {
+            "Incremental recovery contains duplicate workspace IDs"
+        }
+        require(state.incrementalWorkspaceIds.all { id ->
+            id.isNotBlank() && id.none { it == '/' || it == '\\' }
+        }) { "Incremental recovery contains an invalid workspace ID" }
         state.settingsBackup?.let { requireFilesPath(it, "Legacy settings recovery snapshot") }
         state.settingsDataStoreBackup?.let {
             requireFilesPath(it, "Settings DataStore recovery snapshot")
         }
         state.cleanupArtifacts.forEach { requireFilesPath(it, "Recovery cleanup artifact") }
-        state.database.targetNames.forEach { name ->
-            require(isSafeDatabaseName(name)) { "Invalid database recovery file name: $name" }
-        }
-        require(state.database.oldExistingNames.all { it in state.database.targetNames }) {
-            "Database recovery contains an unknown old file"
-        }
         requireFilesPath(journal.path, "Recovery journal")
     }
 

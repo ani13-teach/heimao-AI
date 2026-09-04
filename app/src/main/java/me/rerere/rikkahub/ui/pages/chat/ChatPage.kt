@@ -73,6 +73,7 @@ import me.rerere.hugeicons.stroke.NoteEdit
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.findProvider
+import me.rerere.rikkahub.data.datastore.getAssistantById
 import me.rerere.rikkahub.data.datastore.getCurrentAssistant
 import me.rerere.rikkahub.data.datastore.getCurrentChatModel
 import me.rerere.rikkahub.data.files.FilesManager
@@ -294,11 +295,12 @@ private fun ChatPageContent(
     val workspaceRepository: WorkspaceRepository = koinInject()
     var previewMode by rememberSaveable { mutableStateOf(false) }
     val hazeState = rememberHazeState()
-    val assistant = setting.getCurrentAssistant()
+    val assistant = setting.getAssistantById(conversation.assistantId)
+        ?: Assistant(id = conversation.assistantId)
     var showFilesSheet by remember { mutableStateOf(false) }
 
-    val completionProviders = remember(conversation.workspaceId, conversation.workspaceCwd, workspaceRepository) {
-        conversation.workspaceId?.let { workspaceId ->
+    val completionProviders = remember(assistant.workspaceId, conversation.workspaceCwd, workspaceRepository) {
+        assistant.workspaceId?.let { workspaceId ->
             listOf(
                 WorkspaceCompletionProvider(
                     workspaceId = workspaceId.toString(),
@@ -610,6 +612,7 @@ private fun ChatFilesPickerSheet(
     val context = LocalContext.current
     val toaster = LocalToaster.current
     val filesManager: FilesManager = koinInject()
+    val workspaceBinding by vm.workspaceBinding.collectAsStateWithLifecycle()
     var showInjectionSheet by remember { mutableStateOf(false) }
     var showCompressDialog by remember { mutableStateOf(false) }
 
@@ -789,6 +792,9 @@ private fun ChatFilesPickerSheet(
                 vm.updateConversation(it)
                 vm.saveConversationAsync()
             },
+            onUpdateWorkspaceCwd = vm::updateWorkspaceCwd,
+            workspaceBinding = workspaceBinding,
+            onSetWorkspaceBinding = { vm.setWorkspaceBinding(assistant, it) },
             showInjectionSheet = showInjectionSheet,
             onShowInjectionSheetChange = { showInjectionSheet = it },
             showCompressDialog = showCompressDialog,

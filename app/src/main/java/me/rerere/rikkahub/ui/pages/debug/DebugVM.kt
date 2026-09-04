@@ -45,7 +45,12 @@ class DebugVM(
 
     fun updateSettings(settings: Settings) {
         viewModelScope.launch {
-            settingsStore.update(settings)
+            settingsStore.transformLatest { current ->
+                current.copy(
+                    chatModelId = settings.chatModelId,
+                    launchCount = settings.launchCount,
+                )
+            }
         }
     }
 

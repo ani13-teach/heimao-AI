@@ -36,6 +36,33 @@ class ConversationSummaryDAOTest {
     }
 
     @Test
+    fun legacyWorkspaceConsumptionIsAtomicAndRetrySafe() = runBlocking {
+        dao.insert(
+            conversation(id = "conversation-a", assistantId = "assistant-a", number = 1).copy(
+                workspaceId = "workspace-a",
+                workspaceCwd = "/workspace/project",
+            )
+        )
+        dao.insert(
+            conversation(id = "conversation-b", assistantId = "assistant-b", number = 2).copy(
+                workspaceId = "workspace-b",
+                workspaceCwd = "/workspace/other",
+            )
+        )
+
+        val bindings = mapOf("assistant-a" to "workspace-a", "assistant-b" to null)
+        dao.consumeAllLegacyWorkspaceReferences(bindings)
+        dao.consumeAllLegacyWorkspaceReferences(bindings)
+
+        val conversationA = dao.getConversationById("conversation-a")!!
+        assertNull(conversationA.workspaceId)
+        assertEquals("/workspace/project", conversationA.workspaceCwd)
+        val conversationB = dao.getConversationById("conversation-b")!!
+        assertNull(conversationB.workspaceId)
+        assertEquals("", conversationB.workspaceCwd)
+    }
+
+    @Test
     fun numberLookupNeverCrossesAssistantBoundary() = runBlocking {
         dao.insert(conversation(id = "conversation-a", assistantId = "assistant-a", number = 1))
         dao.insert(conversation(id = "conversation-b", assistantId = "assistant-b", number = 2))

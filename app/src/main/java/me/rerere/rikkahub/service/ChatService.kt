@@ -5,6 +5,7 @@ import android.content.Context
 import android.util.Log
 import androidx.core.net.toUri
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -27,6 +28,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.jsonObject
 import me.rerere.ai.core.MessageRole
@@ -38,6 +41,7 @@ import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.PromptCacheKey
 import me.rerere.ai.provider.ProviderManager
 import me.rerere.ai.provider.TextGenerationParams
+import me.rerere.ai.provider.generateTextWithModelTransport
 import me.rerere.ai.ui.ToolApprovalState
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
@@ -86,6 +90,8 @@ import me.rerere.rikkahub.data.repository.ConversationRepository
 import me.rerere.rikkahub.data.repository.FolderRepository
 import me.rerere.rikkahub.data.repository.MemoryRepository
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.rikkahub.data.workspace.AssistantWorkspaceAccessGate
+import me.rerere.rikkahub.data.workspace.AssistantWorkspaceSessionInvalidator
 import me.rerere.rikkahub.data.summary.buildConversationSummarySource
 import me.rerere.rikkahub.data.summary.splitConversationSummarySource
 import me.rerere.rikkahub.data.summary.toSummarySource
@@ -149,7 +155,6 @@ internal fun resolveConversationForInitialization(
         id = conversationId,
         assistantId = assistant.id,
         newConversation = true,
-        workspaceId = assistant.workspaceId,
     ).updateCurrentMessages(assistant.presetMessages)
 }
 
@@ -233,12 +238,18 @@ class ChatService(
     private val skillManager: SkillManager,
     private val workspaceRepository: WorkspaceRepository,
     private val folderRepository: FolderRepository,
+    private val workspaceAccessGate: AssistantWorkspaceAccessGate,
+    private val workspaceSessionInvalidator: AssistantWorkspaceSessionInvalidator,
 ) {
+    init {
+        workspaceSessionInvalidator.register(::invalidateAssistantSessions)
+    }
     // workspace 系统提示注入 (依赖 workspaceRepository, 故在类内构造)
     private val workspaceReminderTransformer = WorkspaceReminderTransformer(workspaceRepository)
 
     // 统一会话管理
     private val sessions = ConcurrentHashMap<Uuid, ConversationSession>()
+    private val conversationMoveLocks = ConcurrentHashMap<Uuid, Mutex>()
     private val _sessionsVersion = MutableStateFlow(0L)
 
     // 错误状态
@@ -363,25 +374,34 @@ class ChatService(
     // ---- 初始化对话 ----
 
     suspend fun initializeConversation(conversationId: Uuid) {
-        val session = getOrCreateSession(conversationId) // 确保 session 存在
+        val session = getOrCreateSession(conversationId)
         try {
-            val persistedConversation = conversationRepo.getConversationById(conversationId)
-            // 只有真正的新会话捕获助手默认 workspace；旧会话直接使用持久化值，
-            // 即使当前助手有绑定，旧会话的 null workspaceId 也不会回退到该绑定。
-            val initializedConversation = persistedConversation ?: run {
-                val assistant = settingsStore.settingsFlowRaw.first().getCurrentAssistant()
-                resolveConversationForInitialization(
-                    conversationId = conversationId,
-                    persistedConversation = null,
-                    assistant = assistant,
-                )
+            val initialPersisted = conversationRepo.getConversationById(conversationId)
+            val initialOwner = initialPersisted?.assistantId
+                ?: settingsStore.settingsFlowRaw.first().getCurrentAssistant().id
+            workspaceAccessGate.withAssistantMutation(initialOwner.toString()) {
+                conversationMoveLocks.computeIfAbsent(conversationId) { Mutex() }.withLock {
+                    val persistedConversation = conversationRepo.getConversationById(conversationId)
+                    check(persistedConversation == null || persistedConversation.assistantId == initialOwner) {
+                        "Conversation owner changed while waiting to initialize"
+                    }
+                    val initializedConversation = persistedConversation ?: run {
+                        val assistant = settingsStore.settingsFlowRaw.first()
+                            .getAssistantById(initialOwner)
+                            ?: error("Conversation assistant not found")
+                        resolveConversationForInitialization(
+                            conversationId = conversationId,
+                            persistedConversation = null,
+                            assistant = assistant,
+                        )
+                    }
+                    session.state.value = initializedConversation
+                    if (persistedConversation != null) {
+                        settingsStore.updateAssistant(initializedConversation.assistantId)
+                    }
+                    session.completeInitialization()
+                }
             }
-            updateConversation(conversationId, initializedConversation)
-            if (persistedConversation != null) {
-                settingsStore.updateAssistant(initializedConversation.assistantId)
-            }
-            // Complete only after the persisted/new-conversation decision and state update.
-            session.completeInitialization()
         } catch (error: Throwable) {
             session.failInitialization(error)
             throw error
@@ -397,7 +417,7 @@ class ChatService(
         val previousJob = session.getJob()
         previousJob?.cancel()
 
-        val job = appScope.launch {
+        val job = appScope.launch(start = CoroutineStart.LAZY) {
             try {
                 // ChatVM starts initialization asynchronously. Do not inspect or persist the
                 // temporary session state until the new-vs-existing decision is complete.
@@ -408,7 +428,7 @@ class ChatService(
                 val currentConversation = session.state.value
                 val settings = settingsStore.settingsFlow.first()
                 val assistant = settings.getAssistantById(currentConversation.assistantId)
-                    ?: settings.getCurrentAssistant()
+                    ?: error("Conversation assistant not found")
                 val processedContent = preprocessUserInputParts(content, assistant)
 
                 // 添加消息到列表
@@ -431,7 +451,7 @@ class ChatService(
                 addError(e, conversationId, title = context.getString(R.string.error_title_send_message))
             }
         }
-        session.setJob(job)
+        if (session.setJob(job)) job.start()
     }
 
     private fun preprocessUserInputParts(parts: List<UIMessagePart>, assistant: Assistant): List<UIMessagePart> {
@@ -462,7 +482,7 @@ class ChatService(
         val session = getOrCreateSession(conversationId)
         session.getJob()?.cancel()
 
-        val job = appScope.launch {
+        val job = appScope.launch(start = CoroutineStart.LAZY) {
             try {
                 val conversation = session.state.value
 
@@ -491,7 +511,7 @@ class ChatService(
             }
         }
 
-        session.setJob(job)
+        if (session.setJob(job)) job.start()
     }
 
     // ---- 处理工具调用审批 ----
@@ -506,7 +526,7 @@ class ChatService(
         val session = getOrCreateSession(conversationId)
         session.getJob()?.cancel()
 
-        val job = appScope.launch {
+        val job = appScope.launch(start = CoroutineStart.LAZY) {
             try {
                 val conversation = session.state.value
                 val newApprovalState = when {
@@ -554,7 +574,7 @@ class ChatService(
             }
         }
 
-        session.setJob(job)
+        if (session.setJob(job)) job.start()
     }
 
     // ---- 历史对话总结上下文 ----
@@ -720,13 +740,13 @@ class ChatService(
                             --- END SOURCE CHUNK ---
                         """.trimIndent()
                     }
-                    val result = providerHandler.generateText(
+                    val resultMessages = providerHandler.generateTextWithModelTransport(
                         providerSetting = provider,
                         messages = listOf(UIMessage.user(prompt)),
                         params = params,
                     )
                     currentCoroutineContext().ensureActive()
-                    val summary = result.message.toText().trim()
+                    val summary = resultMessages.last().toText().trim()
                     require(summary.isNotBlank()) { "Failed to prepare conversation summary context" }
                     summaries += "[digest ${index + 1}/${chunks.size}]\n$summary"
                 }
@@ -767,7 +787,7 @@ class ChatService(
         val settings = settingsStore.settingsFlow.first()
         val initialConversation = getConversationFlow(conversationId).value
         val assistant = settings.getAssistantById(initialConversation.assistantId)
-            ?: settings.getCurrentAssistant()
+            ?: error("Conversation assistant not found")
         val model = settings.findModelById(assistant.chatModelId ?: settings.chatModelId)
         val senderName = if (assistant.useAssistantAvatar) {
             assistant.name.ifEmpty { context.getString(R.string.assistant_page_default_assistant) }
@@ -834,8 +854,10 @@ class ChatService(
                 promptCacheKey = PromptCacheKey.forSession(conversationId.toString()),
                 conversationSystemPrompt = conversation.customSystemPrompt,
                 conversationModeInjectionIds = conversation.modeInjectionIds,
-                workspaceId = conversation.workspaceId?.toString(),
-                workspaceCwd = conversation.workspaceId?.let { conversation.workspaceCwd },
+                workspaceId = assistant.workspaceId?.toString(),
+                workspaceCwd = assistant.workspaceId?.let { conversation.workspaceCwd },
+                workspaceAssistantId = assistant.id.toString(),
+                workspaceConversationId = conversationId.toString(),
                 memories = if (!assistant.enableMemory || assistant.useLayeredMemory) {
                     emptyList()
                 } else if (assistant.useGlobalMemory) {
@@ -860,7 +882,7 @@ class ChatService(
                     }
                     addAll(
                         createWorkspaceToolsIfReady(
-                            workspaceId = conversation.workspaceId?.toString(),
+                            workspaceId = assistant.workspaceId?.toString(),
                             cwd = conversation.workspaceCwd,
                             assistantId = assistant.id.toString(),
                             conversationId = conversationId.toString(),
@@ -989,6 +1011,7 @@ class ChatService(
             cwd = cwd,
             assistantId = assistantId,
             conversationId = conversationId,
+            accessGate = workspaceAccessGate,
         )
     }
 
@@ -1093,7 +1116,7 @@ class ChatService(
             val provider = model.findProvider(settings.providers) ?: return@runCatching
 
             val providerHandler = providerManager.getProviderByType(provider)
-            val result = providerHandler.generateText(
+            val resultMessages = providerHandler.generateTextWithModelTransport(
                 providerSetting = provider,
                 messages = listOf(
                     UIMessage.user(
@@ -1110,7 +1133,7 @@ class ChatService(
             conversationRepo.getConversationById(conversation.id)?.let {
                 saveConversation(
                     conversationId,
-                    it.copy(title = result.message.toText().trim())
+                    it.copy(title = resultMessages.last().toText().trim())
                 )
             }
         }.onFailure {
@@ -1145,7 +1168,7 @@ class ChatService(
             }
 
             val providerHandler = providerManager.getProviderByType(provider)
-            val result = providerHandler.generateText(
+            val resultMessages = providerHandler.generateTextWithModelTransport(
                 providerSetting = provider,
                 messages = listOf(
                     UIMessage.user(
@@ -1158,7 +1181,7 @@ class ChatService(
                 params = backgroundTextGenerationParams(model),
             )
             val suggestions =
-                result.message.toText().split("\n").map { it.trim() }
+                resultMessages.last().toText().split("\n").map { it.trim() }
                     .filter { it.isNotBlank() }
 
             val latestConversation = conversationRepo.getConversationById(conversationId)
@@ -1232,13 +1255,13 @@ class ChatService(
                 "locale" to Locale.getDefault().displayName
             )
 
-            val result = providerHandler.generateText(
+            val resultMessages = providerHandler.generateTextWithModelTransport(
                 providerSetting = provider,
                 messages = listOf(UIMessage.user(prompt)),
                 params = backgroundTextGenerationParams(model),
             )
 
-            return result.message.toText().trim().takeIf { it.isNotBlank() }
+            return resultMessages.last().toText().trim().takeIf { it.isNotBlank() }
                 ?: throw IllegalStateException("Failed to generate compressed summary")
         }
 
@@ -1268,13 +1291,113 @@ class ChatService(
     private fun updateConversation(conversationId: Uuid, conversation: Conversation) {
         if (conversation.id != conversationId) return
         val session = getOrCreateSession(conversationId)
-        checkFilesDelete(conversation, session.state.value)
-        session.state.value = conversation
+        val before = session.state.value
+        session.state.update { current ->
+            conversation.copy(
+                assistantId = current.assistantId,
+                workspaceCwd = current.workspaceCwd,
+                folderId = current.folderId,
+            )
+        }
+        checkFilesDelete(session.state.value, before)
     }
 
     fun updateConversationState(conversationId: Uuid, update: (Conversation) -> Conversation) {
-        val current = getConversationFlow(conversationId).value
-        updateConversation(conversationId, update(current))
+        getOrCreateSession(conversationId).state.update { current ->
+            update(current).copy(
+                assistantId = current.assistantId,
+                workspaceCwd = current.workspaceCwd,
+                folderId = current.folderId,
+            )
+        }
+    }
+
+    suspend fun updateConversationWorkspaceCwd(conversationId: Uuid, workspaceCwd: String?) {
+        val conversation = conversationRepo.getConversationById(conversationId)
+            ?: error("Conversation not found")
+        val settings = settingsStore.readPersistedSettingsFailFast()
+        val assistant = settings.getAssistantById(conversation.assistantId)
+            ?: error("Conversation assistant not found")
+        val workspaceId = assistant.workspaceId?.toString()
+            ?: error("Assistant is not bound to a workspace")
+        workspaceAccessGate.withWorkspaceAccess(
+            assistantId = assistant.id.toString(),
+            conversationId = conversationId.toString(),
+            workspaceId = workspaceId,
+        ) {
+            val validatedCwd = workspaceCwd?.let {
+                workspaceRepository.requireWorkspaceDirectory(workspaceId, it)
+            }
+            conversationRepo.updateConversationWorkspaceCwd(conversationId, validatedCwd)
+            sessions[conversationId]?.let { session ->
+                session.state.update { it.copy(workspaceCwd = validatedCwd) }
+            }
+        }
+    }
+
+    suspend fun moveConversationToAssistant(conversationId: Uuid, targetAssistantId: Uuid) {
+        val initial = conversationRepo.getConversationById(conversationId)
+            ?: error("Conversation not found")
+        workspaceAccessGate.withAssistantMutations(
+            listOf(initial.assistantId.toString(), targetAssistantId.toString())
+        ) {
+            conversationMoveLocks.computeIfAbsent(conversationId) { Mutex() }.withLock {
+                // Re-read ownership after acquiring both lock classes. Every path uses the global
+                // assistant-gate -> conversation-lock order, so binding revocation cannot wait in
+                // a cycle with a generation save.
+                val current = conversationRepo.getConversationById(conversationId)
+                    ?: error("Conversation not found")
+                check(current.assistantId == initial.assistantId) {
+                    "Conversation owner changed outside the move coordinator"
+                }
+                settingsStore.readPersistedSettingsFailFast()
+                    .getAssistantById(targetAssistantId)
+                    ?: error("Target assistant not found")
+                if (current.assistantId == targetAssistantId) return@withLock
+
+                val session = sessions[conversationId]
+                val job = session?.pauseGeneration()
+                try {
+                    job?.join()
+                    val previousSessionState = session?.state?.value
+                    if (session != null) {
+                        session.state.value = session.state.value.copy(
+                            assistantId = targetAssistantId,
+                            folderId = null,
+                            workspaceCwd = null,
+                        )
+                    }
+                    try {
+                        conversationRepo.moveConversationToAssistant(conversationId, targetAssistantId)
+                        session?.let {
+                            val persisted = conversationRepo.getConversationById(conversationId)
+                                ?: error("Conversation not found after move")
+                            updateConversation(conversationId, persisted)
+                        }
+                    } catch (error: Throwable) {
+                        if (session != null && previousSessionState != null) {
+                            session.state.value = previousSessionState
+                        }
+                        throw error
+                    }
+                } finally {
+                    session?.resumeGeneration()
+                }
+            }
+        }
+    }
+
+    private suspend fun invalidateAssistantSessions(assistantId: String) {
+        val affected = sessions.values.filter { it.state.value.assistantId.toString() == assistantId }
+        val paused = affected.map { session -> session to session.pauseGeneration() }
+        try {
+            paused.forEach { (_, job) -> job?.join() }
+            affected.forEach { session ->
+                session.state.update { it.copy(workspaceCwd = null) }
+            }
+        } finally {
+            affected.forEach(ConversationSession::resumeGeneration)
+        }
     }
 
     /**
@@ -1286,9 +1409,7 @@ class ChatService(
      * 先改内存可确保这段窗口内的整对象保存也带上新 folderId。
      */
     suspend fun moveConversationToFolder(conversationId: Uuid, folderId: Uuid?) {
-        if (sessions.containsKey(conversationId)) {
-            updateConversationState(conversationId) { it.copy(folderId = folderId) }
-        }
+        sessions[conversationId]?.state?.update { it.copy(folderId = folderId) }
         conversationRepo.updateConversationFolderId(conversationId, folderId)
     }
 
@@ -1310,7 +1431,7 @@ class ChatService(
     suspend fun deleteFolder(folderId: Uuid) {
         sessions.values
             .filter { it.state.value.folderId == folderId }
-            .forEach { updateConversationState(it.id) { c -> c.copy(folderId = null) } }
+            .forEach { session -> session.state.update { it.copy(folderId = null) } }
         folderRepository.deleteFolder(folderId)
     }
 
@@ -1327,14 +1448,27 @@ class ChatService(
     }
 
     suspend fun saveConversation(conversationId: Uuid, conversation: Conversation) {
+        val initialOwner = conversationRepo.getConversationById(conversation.id)?.assistantId
+            ?: conversation.assistantId
+        workspaceAccessGate.withAssistantMutation(initialOwner.toString()) {
+            conversationMoveLocks.computeIfAbsent(conversationId) { Mutex() }.withLock {
+                val currentOwner = conversationRepo.getConversationById(conversation.id)?.assistantId
+                    ?: conversation.assistantId
+                check(currentOwner == initialOwner) {
+                    "Conversation owner changed while waiting to save"
+                }
+                saveConversationLocked(conversationId, conversation)
+            }
+        }
+    }
+
+    private suspend fun saveConversationLocked(conversationId: Uuid, conversation: Conversation) {
         val exists = conversationRepo.existsConversationById(conversation.id)
         if (!exists && conversation.title.isBlank() && conversation.messageNodes.isEmpty()) {
             return // 新会话且为空时不保存
         }
 
         val updatedConversation = conversation.copy()
-        updateConversation(conversationId, updatedConversation)
-
         val persistedConversation = if (!exists) {
             conversationRepo.insertConversation(updatedConversation)
         } else {
@@ -1419,7 +1553,7 @@ class ChatService(
         val currentConversation = getConversationFlow(conversationId).value
         val settings = settingsStore.settingsFlow.first()
         val assistant = settings.getAssistantById(currentConversation.assistantId)
-            ?: settings.getCurrentAssistant()
+            ?: error("Conversation assistant not found")
         val processedParts = preprocessUserInputParts(parts, assistant)
         var edited = false
 
@@ -1476,7 +1610,6 @@ class ChatService(
             messageNodes = copiedNodes,
             customSystemPrompt = currentConversation.customSystemPrompt,
             modeInjectionIds = currentConversation.modeInjectionIds,
-            workspaceId = currentConversation.workspaceId,
             workspaceCwd = currentConversation.workspaceCwd,
         )
 

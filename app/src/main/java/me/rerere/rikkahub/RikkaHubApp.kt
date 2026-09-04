@@ -16,7 +16,6 @@ import java.io.File
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import me.rerere.common.android.appTempFolder
 import com.whl.quickjs.android.QuickJSLoader
@@ -29,8 +28,10 @@ import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.utils.CrashHandler
 import me.rerere.rikkahub.utils.DatabaseUtil
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.rikkahub.data.workspace.AssistantWorkspaceBindingCoordinator
 import me.rerere.rikkahub.data.workspace.WorkspaceArchiveCleanup
 import me.rerere.rikkahub.data.workspace.WorkspaceArchiveRecovery
+import me.rerere.rikkahub.data.workspace.WorkspaceArchiveService
 import me.rerere.rikkahub.data.workspace.WorkspaceSnapshotRecovery
 import me.rerere.rikkahub.data.workspace.WorkspaceSnapshotService
 import me.rerere.workspace.WorkspaceManager
@@ -51,7 +52,7 @@ class RikkaHubApp : Application() {
 
         // Recover the database and workspace root before Koin can open a half-restored Room
         // graph. A failure is intentionally allowed to escape and stop normal startup.
-        val recoveryOutcome = WorkspaceArchiveRecovery.recoverBeforeKoin(this)
+        var recoveryOutcome = WorkspaceArchiveRecovery.recoverBeforeKoin(this)
         // Snapshot recovery is a separate local transaction. Its filesystem half is repaired
         // before Room opens, while the Room status half is repaired immediately after Koin.
         WorkspaceSnapshotRecovery.recoverBeforeKoin(this)
@@ -59,7 +60,9 @@ class RikkaHubApp : Application() {
             // This is deliberately the only pre-Koin DataStore/journal phase. It restores the
             // exact old settings file before eager SettingsStore/ChatNotificationManager creation.
             runBlocking(Dispatchers.IO) {
-                WorkspaceArchiveRecovery.compensatePendingSettingsBeforeKoin(this@RikkaHubApp)
+                recoveryOutcome = WorkspaceArchiveRecovery.compensatePendingSettingsBeforeKoin(
+                    this@RikkaHubApp
+                )
             }
         }
 
@@ -73,7 +76,11 @@ class RikkaHubApp : Application() {
         // Do this synchronously and before checkWorkspaceIntegrity: integrity must observe only
         // READY/FAILED snapshot rows and a directory exchange whose journal is already settled.
         runBlocking(Dispatchers.IO) {
+            get<WorkspaceArchiveService>().recoverPendingIncrementalRoomRollback(
+                recoveryOutcome.incrementalWorkspaceIdsToDelete
+            )
             get<WorkspaceSnapshotService>().recoverPendingTransaction()
+            get<AssistantWorkspaceBindingCoordinator>().reconcileLegacyBindings()
         }
 
         this.createNotificationChannel()
@@ -116,9 +123,10 @@ class RikkaHubApp : Application() {
         get<AppScope>().launch {
             runCatching {
                 val store = get<SettingsStore>()
-                val current = store.settingsFlowRaw.first()
-                store.update(current.copy(launchCount = current.launchCount + 1))
-                Log.i(TAG, "incrementLaunchCount: ${store.settingsFlowRaw.first().launchCount}")
+                val updated = store.transformLatest { settings ->
+                    settings.copy(launchCount = settings.launchCount + 1)
+                }
+                Log.i(TAG, "incrementLaunchCount: ${updated.launchCount}")
             }.onFailure {
                 Log.e(TAG, "incrementLaunchCount failed", it)
             }

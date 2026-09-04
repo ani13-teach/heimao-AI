@@ -36,7 +36,11 @@ import me.rerere.rikkahub.data.db.migrations.Migration_28_29
 import me.rerere.rikkahub.data.db.migrations.Migration_29_30
 import me.rerere.rikkahub.data.ai.mcp.McpManager
 import me.rerere.rikkahub.data.sync.webdav.WebDavSync
+import me.rerere.rikkahub.data.workspace.AssistantWorkspaceAccessGate
+import me.rerere.rikkahub.data.workspace.AssistantWorkspaceBindingCoordinator
+import me.rerere.rikkahub.data.workspace.AssistantWorkspaceSessionInvalidator
 import me.rerere.rikkahub.data.workspace.BackupPasswordStore
+import me.rerere.rikkahub.data.workspace.WorkspaceCatalogMutationLock
 import me.rerere.rikkahub.data.workspace.WorkspaceArchiveService
 import me.rerere.rikkahub.data.workspace.WorkspaceSnapshotService
 import me.rerere.search.SearchService
@@ -51,6 +55,8 @@ import java.util.concurrent.TimeUnit
 
 val dataSourceModule = module {
     single { BackupPasswordStore(context = get()) }
+    single { WorkspaceCatalogMutationLock() }
+    single { AssistantWorkspaceSessionInvalidator() }
 
     single {
         SettingsStore(context = get(), scope = get())
@@ -159,6 +165,24 @@ val dataSourceModule = module {
     }
 
     single {
+        AssistantWorkspaceAccessGate(
+            settingsStore = get(),
+            conversationDao = get(),
+        )
+    }
+
+    single {
+        AssistantWorkspaceBindingCoordinator(
+            settingsStore = get(),
+            workspaceDao = get(),
+            conversationDao = get(),
+            catalogMutationLock = get(),
+            accessGate = get(),
+            sessionInvalidator = get(),
+        )
+    }
+
+    single {
         get<AppDatabase>().folderDao()
     }
 
@@ -175,6 +199,7 @@ val dataSourceModule = module {
             json = get(),
             memoryRepo = get(),
             workspaceRepository = get(),
+            workspaceAccessGate = get(),
         )
     }
 
@@ -232,6 +257,7 @@ val dataSourceModule = module {
             workspaceRepository = get(),
             conversationDAO = get(),
             database = get(),
+            bindingCoordinator = get(),
         )
     }
 

@@ -35,6 +35,7 @@ val viewModelModule = module {
             analytics = get(),
             filesManager = get(),
             favoriteRepository = get(),
+            bindingCoordinator = get(),
         )
     }
     viewModelOf(::ChatDrawerVM)
@@ -50,6 +51,7 @@ val viewModelModule = module {
             filesManager = get(),
             skillManager = get(),
             workspaceRepository = get(),
+            bindingCoordinator = get(),
         )
     }
     viewModelOf(::TranslatorVM)

@@ -9,13 +9,14 @@ import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.db.dao.WorkspaceAuditDAO
 import me.rerere.rikkahub.data.db.dao.WorkspaceDAO
 import me.rerere.rikkahub.data.db.entity.WorkspaceAuditEvent
 import me.rerere.rikkahub.data.db.entity.WorkspaceEntity
 import me.rerere.rikkahub.data.model.redactWorkspaceUrl
 import me.rerere.rikkahub.data.model.toWorkspaceRuntimeMetadata
+import me.rerere.rikkahub.data.workspace.AssistantWorkspaceBindingCoordinator
+import me.rerere.rikkahub.data.workspace.WorkspaceCatalogMutationLock
 import me.rerere.rikkahub.data.workspace.sanitizeWorkspaceAuditEvent
 import me.rerere.rikkahub.utils.JsonInstant
 import me.rerere.workspace.RootfsInstallProgress
@@ -37,11 +38,11 @@ class WorkspaceRepository(
     private val dao: WorkspaceDAO,
     private val manager: WorkspaceManager,
     private val rootfsInstaller: RootfsInstaller,
-    private val settingsStore: SettingsStore,
+    private val assistantWorkspaceBindingCoordinator: AssistantWorkspaceBindingCoordinator,
     private val auditDao: WorkspaceAuditDAO,
+    private val workspaceCatalogMutationLock: WorkspaceCatalogMutationLock,
 ) {
     private val rootfsOperationLocks = ConcurrentHashMap<String, Mutex>()
-    private val workspaceCatalogArchiveLock = Mutex()
 
     fun listFlow(): Flow<List<WorkspaceEntity>> = dao.listFlow()
 
@@ -114,7 +115,7 @@ class WorkspaceRepository(
      */
     suspend fun <T> withWorkspaceCatalogArchiveLock(
         block: suspend () -> T,
-    ): T = workspaceCatalogArchiveLock.withLock { block() }
+    ): T = workspaceCatalogMutationLock.withLock { block() }
 
     /**
      * Shared coordination point for portable backup/restore. Rootfs installation, package
@@ -283,6 +284,18 @@ class WorkspaceRepository(
             manager.listFiles(workspace.root, path, area)
         }
     }
+
+    /** Validates an AI cwd through the workspace file API and returns its canonical UI form. */
+    suspend fun requireWorkspaceDirectory(id: String, absolutePath: String): String =
+        withStorageAreaLock(id, WorkspaceStorageArea.FILES) {
+            withContext(Dispatchers.IO) {
+                val relative = normalizeWorkspaceDirectoryPath(absolutePath)
+                val workspace = dao.getById(id) ?: error("Workspace not found: $id")
+                manager.ensureWorkspaceFiles(workspace.root)
+                manager.listFiles(workspace.root, relative, WorkspaceStorageArea.FILES)
+                if (relative.isBlank()) "/workspace" else "/workspace/$relative"
+            }
+        }
 
     suspend fun readText(
         id: String,
@@ -504,32 +517,16 @@ class WorkspaceRepository(
     }
 
     suspend fun delete(id: String): Boolean = withWorkspaceCatalogArchiveLock {
-        val workspace = rootfsOperationLock(id).withLock {
-            val current = dao.getById(id) ?: return@withLock null
-            dao.deleteById(id)
-            withContext(Dispatchers.IO) {
-                manager.deleteWorkspace(current.root)
-            }
-            current
-        } ?: return@withWorkspaceCatalogArchiveLock false
-        // Keep assistant references inside the same catalog lock. Otherwise a backup could
-        // capture settings pointing at a workspace after its row and directory were deleted.
-        cleanupAssistantReferences(workspace.id)
-        true
-    }
-
-    private suspend fun cleanupAssistantReferences(workspaceId: String) {
-        settingsStore.update { settings ->
-            settings.copy(
-                assistants = settings.assistants.map { assistant ->
-                    if (assistant.workspaceId?.toString() == workspaceId) {
-                        assistant.copy(workspaceId = null)
-                    } else {
-                        assistant
-                    }
+        assistantWorkspaceBindingCoordinator.clearDeletedWorkspaceWhileLocked(id) {
+            rootfsOperationLock(id).withLock {
+                val current = dao.getById(id) ?: return@withLock null
+                dao.deleteById(id)
+                withContext(Dispatchers.IO) {
+                    manager.deleteWorkspace(current.root)
                 }
-            )
-        }
+                current
+            }
+        } != null
     }
 
     private suspend fun <T> withStorageAreaLock(
@@ -569,11 +566,23 @@ class WorkspaceRepository(
             updatedAt = System.currentTimeMillis(),
         )
     }
-
     companion object {
         private const val TAG = "WorkspaceRepository"
         private const val MAX_PREVIEW_BYTES = 512L * 1024
         private const val DEFAULT_AUDIT_LIMIT = 50
         private const val MAX_AUDIT_LIMIT = 200
     }
+}
+
+internal fun normalizeWorkspaceDirectoryPath(path: String): String {
+    val normalized = path.replace('\\', '/').trim().trimEnd('/')
+    require(normalized == "/workspace" || normalized.startsWith("/workspace/")) {
+        "Workspace directory must be under /workspace"
+    }
+    val relative = normalized.removePrefix("/workspace").trimStart('/')
+    require(relative.split('/').none { it == ".." || it == "." }) {
+        "Workspace directory traversal is not allowed"
+    }
+    require(!relative.contains('\u0000')) { "Workspace directory contains an invalid character" }
+    return relative
 }

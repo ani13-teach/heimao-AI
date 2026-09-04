@@ -5,6 +5,7 @@ import androidx.core.net.toUri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -25,6 +26,11 @@ import me.rerere.rikkahub.data.model.Avatar
 import me.rerere.rikkahub.data.model.Tag
 import me.rerere.rikkahub.data.repository.MemoryRepository
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.rikkahub.data.workspace.AssistantWorkspaceBindingCoordinator
+import me.rerere.rikkahub.ui.workspace.WorkspaceBindingUiState
+import me.rerere.rikkahub.ui.workspace.applyBindingFailure
+import me.rerere.rikkahub.ui.workspace.applyBindingResult
+import me.rerere.rikkahub.ui.workspace.startBinding
 import kotlin.uuid.Uuid
 
 private const val TAG = "AssistantDetailVM"
@@ -36,6 +42,7 @@ class AssistantDetailVM(
     private val filesManager: FilesManager,
     private val skillManager: SkillManager,
     private val workspaceRepository: WorkspaceRepository,
+    private val bindingCoordinator: AssistantWorkspaceBindingCoordinator,
 ) : ViewModel() {
     private val assistantId = Uuid.parse(id)
 
@@ -102,14 +109,34 @@ class AssistantDetailVM(
             initialValue = emptyList(),
         )
 
+    private val _workspaceBinding = MutableStateFlow(WorkspaceBindingUiState(null))
+    val workspaceBinding = _workspaceBinding.asStateFlow()
+
+    fun setWorkspaceBinding(workspaceId: Uuid?) {
+        if (_workspaceBinding.value.isSubmitting) return
+        val expectedCurrent = assistant.value.workspaceId
+        _workspaceBinding.value = WorkspaceBindingUiState(expectedCurrent).startBinding()
+        viewModelScope.launch {
+            try {
+                val result = bindingCoordinator.setBinding(assistantId, expectedCurrent, workspaceId)
+                _workspaceBinding.value = _workspaceBinding.value.applyBindingResult(result)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                _workspaceBinding.value = _workspaceBinding.value.applyBindingFailure()
+            } finally {
+                if (_workspaceBinding.value.isSubmitting) {
+                    _workspaceBinding.value = _workspaceBinding.value.copy(isSubmitting = false)
+                }
+            }
+        }
+    }
+
     fun updateTags(tagIds: List<Uuid>, tags: List<Tag>) {
         viewModelScope.launch {
-            val settings = settings.value
-            settingsStore.update(
-                settings = settings.copy(
-                    assistantTags = tags
-                )
-            )
+            settingsStore.transformLatest { current ->
+                current.copy(assistantTags = tags)
+            }
             update(
                 assistant.value.copy(
                     tags = tagIds.toList()
@@ -150,31 +177,34 @@ class AssistantDetailVM(
             val needUpdateTags = cleanedTags.size != settings.assistantTags.size
 
             if (needUpdateAssistants || needUpdateTags) {
-                settingsStore.update(
-                    settings = settings.copy(
-                        assistants = cleanedAssistants,
-                        assistantTags = cleanedTags
+                settingsStore.transformLatest { current ->
+                    val validTagIds = cleanedTags.map { it.id }.toSet()
+                    current.copy(
+                        assistants = current.assistants.map { assistant ->
+                            assistant.copy(tags = assistant.tags.filter(validTagIds::contains))
+                        },
+                        assistantTags = cleanedTags,
                     )
-                )
+                }
             }
         }
     }
 
     fun update(assistant: Assistant) {
         viewModelScope.launch {
-            val settings = settings.value
-            settingsStore.update(
-                settings = settings.copy(
-                    assistants = settings.assistants.map {
+            settingsStore.transformLatest { current ->
+                current.copy(
+                    assistants = current.assistants.map {
                         if (it.id == assistant.id) {
-                            checkAvatarDelete(old = it, new = assistant) // 删除旧头像
-                            checkBackgroundDelete(old = it, new = assistant) // 删除旧背景
-                            assistant
+                            checkAvatarDelete(old = it, new = assistant)
+                            checkBackgroundDelete(old = it, new = assistant)
+                            assistant.copy(workspaceId = it.workspaceId)
                         } else {
                             it
                         }
-                    })
-            )
+                    }
+                )
+            }
         }
     }
 

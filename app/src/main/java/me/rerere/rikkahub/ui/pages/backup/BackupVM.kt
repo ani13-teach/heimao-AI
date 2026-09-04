@@ -52,7 +52,14 @@ class BackupVM(
 
     fun updateSettings(settings: Settings) {
         viewModelScope.launch {
-            settingsStore.update(settings)
+            settingsStore.transformLatest { current ->
+                current.copy(
+                    webDavConfig = settings.webDavConfig,
+                    s3Config = settings.s3Config,
+                    backupReminderConfig = settings.backupReminderConfig,
+                    providers = settings.providers,
+                )
+            }
         }
     }
 
@@ -148,10 +155,10 @@ class BackupVM(
         )
 
         val targetAssistantId = settings.value.assistantId
-        settingsStore.update(
-            settings.value.copy(
-                providers = result.providers + settings.value.providers,
-                assistants = settings.value.assistants.map { assistant ->
+        settingsStore.transformLatest { current ->
+            current.copy(
+                providers = result.providers + current.providers,
+                assistants = current.assistants.map { assistant ->
                     if (result.hasConversationSystemPrompt && assistant.id == targetAssistantId) {
                         assistant.copy(allowConversationSystemPrompt = true)
                     } else {
@@ -159,7 +166,7 @@ class BackupVM(
                     }
                 }
             )
-        )
+        }
 
         Log.i(
             TAG,

@@ -10,7 +10,9 @@ import me.rerere.ai.core.TokenUsage
 import me.rerere.ai.ui.ImageGenSize
 import me.rerere.ai.ui.ImageGenerationItem
 import me.rerere.ai.ui.StreamChunk
+import me.rerere.ai.ui.StreamChunkHandler
 import me.rerere.ai.ui.UIMessage
+import me.rerere.ai.ui.handleTextGenerationResult
 
 // 提供商实现
 // 采用无状态设计，使用时除了需要传入需要的参数外，还需要传入provider setting作为参数
@@ -53,6 +55,47 @@ interface Provider<T : ProviderSetting> {
     ): Flow<ImageGenerationItem> {
         error("Image edit is not supported")
     }
+}
+
+/**
+ * Generates text using the transport selected on [TextGenerationParams.model].
+ *
+ * The setting belongs to the model, so two models under the same provider can use
+ * different transports. [onUpdateMessages] receives progressive streaming updates
+ * and one final update for non-streaming responses.
+ */
+suspend fun <T : ProviderSetting> Provider<T>.generateTextWithModelTransport(
+    providerSetting: T,
+    messages: List<UIMessage>,
+    params: TextGenerationParams,
+    responseMessages: List<UIMessage> = messages,
+    onUpdateMessages: suspend (List<UIMessage>) -> Unit = {},
+): List<UIMessage> {
+    // The explicit model setting is authoritative; a legacy custom body must not
+    // force the opposite transport and desynchronize the response parser.
+    val transportParams = if (params.customBody.any { it.key.equals("stream", ignoreCase = true) }) {
+        params.copy(
+            customBody = params.customBody.filterNot { it.key.equals("stream", ignoreCase = true) },
+        )
+    } else {
+        params
+    }
+    if (params.model.streamOutput == false) {
+        val updatedMessages = responseMessages.handleTextGenerationResult(
+            result = generateText(providerSetting, messages, transportParams),
+            model = params.model,
+        )
+        onUpdateMessages(updatedMessages)
+        return updatedMessages
+    }
+
+    var updatedMessages = responseMessages
+    val streamChunkHandler = StreamChunkHandler(params.model)
+    streamText(providerSetting, messages, transportParams).collect { chunk ->
+        updatedMessages = streamChunkHandler.handle(updatedMessages, chunk)
+        onUpdateMessages(updatedMessages)
+    }
+    return updatedMessages
 }
 
 @Serializable

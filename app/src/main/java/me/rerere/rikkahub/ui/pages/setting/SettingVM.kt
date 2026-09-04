@@ -20,7 +20,37 @@ class SettingVM(
 
     fun updateSettings(settings: Settings) {
         viewModelScope.launch {
-            settingsStore.update(settings)
+            settingsStore.transformLatest { current ->
+                current.copy(
+                    dynamicColor = settings.dynamicColor,
+                    themeId = settings.themeId,
+                    customThemes = settings.customThemes,
+                    developerMode = settings.developerMode,
+                    displaySetting = settings.displaySetting,
+                    promptCacheEnabled = settings.promptCacheEnabled,
+                    favoriteModels = settings.favoriteModels,
+                    chatModelId = settings.chatModelId,
+                    fastModelId = settings.fastModelId,
+                    titleModelId = settings.titleModelId,
+                    imageGenerationModelId = settings.imageGenerationModelId,
+                    titlePrompt = settings.titlePrompt,
+                    translateModeId = settings.translateModeId,
+                    translatePrompt = settings.translatePrompt,
+                    translateThinkingBudget = settings.translateThinkingBudget,
+                    enableSuggestion = settings.enableSuggestion,
+                    suggestionModelId = settings.suggestionModelId,
+                    suggestionPrompt = settings.suggestionPrompt,
+                    ocrModelId = settings.ocrModelId,
+                    ocrPrompt = settings.ocrPrompt,
+                    compressModelId = settings.compressModelId,
+                    compressPrompt = settings.compressPrompt,
+                    providers = settings.providers,
+                    searchServices = settings.searchServices,
+                    searchCommonOptions = settings.searchCommonOptions,
+                    searchServiceSelected = settings.searchServiceSelected,
+                    mcpServers = settings.mcpServers,
+                )
+            }
         }
     }
 }

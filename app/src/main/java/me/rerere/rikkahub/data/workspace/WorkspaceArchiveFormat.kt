@@ -211,7 +211,12 @@ data class WorkspaceArchivePayload(
 
 @Serializable
 data class WorkspaceArchiveReferences(
+    /** Authoritative workspace ownership for archives created by current versions. */
     val assistants: List<WorkspaceAssistantReference> = emptyList(),
+    /**
+     * Conversation IDs are retained for structural compatibility. A non-null workspace ID is
+     * accepted only as legacy restore input and is reconciled after a full database replacement.
+     */
     val conversations: List<WorkspaceConversationReference> = emptyList(),
 )
 
