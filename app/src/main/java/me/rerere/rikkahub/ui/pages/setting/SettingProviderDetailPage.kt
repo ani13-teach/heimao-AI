@@ -604,6 +604,43 @@ private fun ModelSettingsForm(
                             }
                         )
 
+                        if (model.type == ModelType.CHAT) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = stringResource(R.string.setting_provider_page_transport_mode),
+                                        style = MaterialTheme.typography.bodyLarge,
+                                    )
+                                    Text(
+                                        text = stringResource(
+                                            if (model.streamOutput != false) {
+                                                R.string.setting_provider_page_transport_streaming
+                                            } else {
+                                                R.string.setting_provider_page_transport_non_streaming
+                                            }
+                                        ),
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    Text(
+                                        text = stringResource(R.string.setting_provider_page_transport_mode_desc),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                Switch(
+                                    checked = model.streamOutput != false,
+                                    onCheckedChange = {
+                                        onModelChange(model.copy(streamOutput = it))
+                                    },
+                                )
+                            }
+                        }
+
                         ModelModalitySelector(
                             model = model,
                             inputModalities = model.inputModalities,
