@@ -48,6 +48,7 @@ import me.rerere.ai.ui.UIMessageAnnotation
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.metadataAs
 import me.rerere.ai.ui.toMetadata
+import me.rerere.ai.util.HttpException
 import me.rerere.ai.util.KeyRoulette
 import me.rerere.ai.util.configureReferHeaders
 import me.rerere.ai.util.encodeBase64
@@ -101,7 +102,7 @@ class ChatCompletionsAPI(
 
         val response = client.newCall(request).await()
         if (!response.isSuccessful) {
-            throw Exception("Failed to get response: ${response.code} ${response.body?.string()}")
+            throw HttpException("Failed to get response: ${response.code} ${response.body?.string()}", response.code)
         }
 
         val bodyStr = response.body?.string() ?: ""
@@ -195,7 +196,7 @@ class ChatCompletionsAPI(
                     if (!bodyRaw.isNullOrBlank()) {
                         val bodyElement = Json.parseToJsonElement(bodyRaw)
                         println(bodyElement)
-                        exception = bodyElement.parseErrorDetail()
+                        exception = bodyElement.parseErrorDetail(response?.code)
                         Log.i(TAG, "onFailure: $exception")
                     }
                 } catch (e: Throwable) {

@@ -25,6 +25,7 @@ import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.Provider
 import me.rerere.ai.provider.ProviderManager
 import me.rerere.ai.provider.ProviderSetting
+import me.rerere.ai.provider.RetryStatus
 import me.rerere.ai.provider.TextGenerationParams
 import me.rerere.ai.provider.generateTextWithModelTransport
 import me.rerere.ai.registry.ModelRegistry
@@ -32,6 +33,7 @@ import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.ToolApprovalState
 import me.rerere.ai.ui.limitContext
+import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.ai.transformers.InputMessageTransformer
 import me.rerere.rikkahub.data.ai.transformers.MessageTransformer
 import me.rerere.rikkahub.data.ai.transformers.OutputMessageTransformer
@@ -751,6 +753,19 @@ class GenerationHandler(
             messages = internalMessages,
             params = params,
             responseMessages = messages,
+            retryPolicy = settings.toRetryPolicy(),
+            onRetryStatus = { status ->
+                // 只在自己写过提示时才清掉，避免盖掉其他流程的状态文案
+                processingStatus.value = when (status) {
+                    is RetryStatus.Waiting -> context.getString(
+                        R.string.chat_generation_retrying,
+                        (status.delayMillis / 1_000L).coerceAtLeast(1L),
+                        status.nextAttempt,
+                    )
+
+                    RetryStatus.Recovered -> null
+                }
+            },
             onUpdateMessages = onUpdateMessages,
         )
     }

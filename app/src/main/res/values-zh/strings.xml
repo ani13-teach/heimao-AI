@@ -212,6 +212,7 @@
   <string name="cancel_edit">取消编辑</string>
   <string name="chain_of_thought_collapse">收起</string>
   <string name="chain_of_thought_show_more_steps">再显示 %d 步</string>
+  <string name="chat_generation_retrying">生成中断，%1$d 秒后重试（第 %2$d 次）</string>
   <string name="chat_input_placeholder">输入消息与AI聊天</string>
   <string name="chat_input_unsupported_file_type">不支持的文件类型：%s</string>
   <string name="chat_input_file_read_failed">文件读取失败：%s</string>
@@ -562,6 +563,15 @@
   <string name="setting_display_page_amoled_dark_mode_title">AMOLED 暗色模式</string>
   <string name="setting_display_page_auto_collapse_thinking_desc">思考完成自动折叠思考内容</string>
   <string name="setting_display_page_auto_collapse_thinking_title">自动折叠思考</string>
+  <string name="setting_display_page_auto_retry">自动重试</string>
+  <string name="setting_display_page_auto_retry_enabled_desc">生成失败或没有返回内容时自动重试，直到用完最大重试时间</string>
+  <string name="setting_display_page_auto_retry_enabled_title">生成失败时自动重试</string>
+  <string name="setting_display_page_auto_retry_interval_desc">两次尝试同一个请求之间等待多久</string>
+  <string name="setting_display_page_auto_retry_interval_title">重试间隔</string>
+  <string name="setting_display_page_auto_retry_interval_value">%1$d 秒</string>
+  <string name="setting_display_page_auto_retry_max_duration_desc">一次生成允许用于重试的总时长，用完就停止重试</string>
+  <string name="setting_display_page_auto_retry_max_duration_title">最大重试时间</string>
+  <string name="setting_display_page_auto_retry_max_duration_value">%1$d 分钟</string>
   <string name="setting_display_page_chat_font_family_default">默认</string>
   <string name="setting_display_page_chat_font_family_custom">自定义</string>
   <string name="setting_display_page_chat_font_family_monospace">等宽字体</string>

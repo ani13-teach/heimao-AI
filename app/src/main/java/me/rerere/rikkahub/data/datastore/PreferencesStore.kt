@@ -77,6 +77,9 @@ private fun MutablePreferences.writeSettings(settings: Settings) {
     this[SettingsStore.DEVELOPER_MODE] = settings.developerMode
     this[SettingsStore.DISPLAY_SETTING] = JsonInstant.encodeToString(settings.displaySetting)
     this[SettingsStore.PROMPT_CACHE_ENABLED] = settings.promptCacheEnabled
+    this[SettingsStore.AUTO_RETRY_ENABLED] = settings.autoRetryEnabled
+    this[SettingsStore.AUTO_RETRY_INTERVAL_SECONDS] = settings.autoRetryIntervalSeconds
+    this[SettingsStore.AUTO_RETRY_MAX_DURATION_MINUTES] = settings.autoRetryMaxDurationMinutes
 
     this[SettingsStore.FAVORITE_MODELS] = JsonInstant.encodeToString(settings.favoriteModels)
     this[SettingsStore.SELECT_MODEL] = settings.chatModelId.toString()
@@ -142,6 +145,11 @@ class SettingsStore(
         val DISPLAY_SETTING = stringPreferencesKey("display_setting")
         val DEVELOPER_MODE = booleanPreferencesKey("developer_mode")
         val PROMPT_CACHE_ENABLED = booleanPreferencesKey("prompt_cache_enabled")
+
+        // 自动重试
+        val AUTO_RETRY_ENABLED = booleanPreferencesKey("auto_retry_enabled")
+        val AUTO_RETRY_INTERVAL_SECONDS = intPreferencesKey("auto_retry_interval_seconds")
+        val AUTO_RETRY_MAX_DURATION_MINUTES = intPreferencesKey("auto_retry_max_duration_minutes")
 
         // 模型选择
         val FAVORITE_MODELS = stringPreferencesKey("favorite_models")
@@ -258,6 +266,11 @@ class SettingsStore(
                     JsonInstant.decodeFromString(it)
                 } ?: BackupReminderConfig(),
                 launchCount = preferences[LAUNCH_COUNT] ?: 0,
+                autoRetryEnabled = preferences[AUTO_RETRY_ENABLED] != false,
+                autoRetryIntervalSeconds = preferences[AUTO_RETRY_INTERVAL_SECONDS]
+                    ?: Settings.DEFAULT_AUTO_RETRY_INTERVAL_SECONDS,
+                autoRetryMaxDurationMinutes = preferences[AUTO_RETRY_MAX_DURATION_MINUTES]
+                    ?: Settings.DEFAULT_AUTO_RETRY_MAX_DURATION_MINUTES,
             )
         }
         .map {
@@ -509,6 +522,12 @@ data class Settings(
     val developerMode: Boolean = false,
     val displaySetting: DisplaySetting = DisplaySetting(),
     val promptCacheEnabled: Boolean = true,
+    /** 生成失败后是否自动重试。 */
+    val autoRetryEnabled: Boolean = true,
+    /** 两次尝试之间的等待秒数。 */
+    val autoRetryIntervalSeconds: Int = DEFAULT_AUTO_RETRY_INTERVAL_SECONDS,
+    /** 从首次失败算起，允许重试的总分钟数。 */
+    val autoRetryMaxDurationMinutes: Int = DEFAULT_AUTO_RETRY_MAX_DURATION_MINUTES,
     val favoriteModels: List<Uuid> = emptyList(),
     val chatModelId: Uuid = Uuid.random(),
     val fastModelId: Uuid = Uuid.random(),
@@ -540,6 +559,9 @@ data class Settings(
     val launchCount: Int = 0,
 ) {
     companion object {
+        const val DEFAULT_AUTO_RETRY_INTERVAL_SECONDS = 3
+        const val DEFAULT_AUTO_RETRY_MAX_DURATION_MINUTES = 2
+
         // 构造一个用于初始化的settings, 但它不能用于保存，防止使用初始值存储
         fun dummy() = Settings(init = true)
     }

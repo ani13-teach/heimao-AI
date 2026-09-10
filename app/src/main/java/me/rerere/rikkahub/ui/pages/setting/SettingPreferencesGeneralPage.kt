@@ -25,6 +25,10 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.ai.AUTO_RETRY_MAX_DURATION_MINUTES
+import me.rerere.rikkahub.data.ai.AUTO_RETRY_MAX_INTERVAL_SECONDS
+import me.rerere.rikkahub.data.ai.AUTO_RETRY_MIN_DURATION_MINUTES
+import me.rerere.rikkahub.data.ai.AUTO_RETRY_MIN_INTERVAL_SECONDS
 import me.rerere.rikkahub.data.datastore.DisplaySetting
 import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.components.ui.CardGroup
@@ -251,6 +255,101 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
                                     Text(text = "${(displaySetting.volumeKeyScrollRatio * 100).toInt()}%")
                                 }
                             }
+                        )
+                    }
+                }
+            }
+
+            item {
+                var intervalSeconds by remember(settings.autoRetryIntervalSeconds) {
+                    mutableStateOf(settings.autoRetryIntervalSeconds)
+                }
+                var maxDurationMinutes by remember(settings.autoRetryMaxDurationMinutes) {
+                    mutableStateOf(settings.autoRetryMaxDurationMinutes)
+                }
+                CardGroup(
+                    modifier = Modifier.padding(horizontal = 8.dp),
+                    title = { Text(stringResource(R.string.setting_display_page_auto_retry)) },
+                ) {
+                    item(
+                        headlineContent = {
+                            Text(stringResource(R.string.setting_display_page_auto_retry_enabled_title))
+                        },
+                        supportingContent = {
+                            Text(stringResource(R.string.setting_display_page_auto_retry_enabled_desc))
+                        },
+                        trailingContent = {
+                            Switch(
+                                checked = settings.autoRetryEnabled,
+                                onCheckedChange = {
+                                    vm.updateSettings(settings.copy(autoRetryEnabled = it))
+                                },
+                            )
+                        },
+                    )
+                    if (settings.autoRetryEnabled) {
+                        item(
+                            headlineContent = {
+                                Text(stringResource(R.string.setting_display_page_auto_retry_interval_title))
+                            },
+                            supportingContent = {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Slider(
+                                        value = intervalSeconds.toFloat(),
+                                        // 拖动时先动本地状态，松手才写入设置，避免每个滑过位置都落盘
+                                        onValueChange = { intervalSeconds = it.toInt() },
+                                        onValueChangeFinished = {
+                                            vm.updateSettings(
+                                                settings.copy(autoRetryIntervalSeconds = intervalSeconds)
+                                            )
+                                        },
+                                        valueRange = AUTO_RETRY_MIN_INTERVAL_SECONDS.toFloat()..AUTO_RETRY_MAX_INTERVAL_SECONDS.toFloat(),
+                                        steps = AUTO_RETRY_MAX_INTERVAL_SECONDS - AUTO_RETRY_MIN_INTERVAL_SECONDS - 1,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    Text(
+                                        text = stringResource(
+                                            R.string.setting_display_page_auto_retry_interval_value,
+                                            intervalSeconds,
+                                        )
+                                    )
+                                }
+                            },
+                        )
+                        item(
+                            headlineContent = {
+                                Text(stringResource(R.string.setting_display_page_auto_retry_max_duration_title))
+                            },
+                            supportingContent = {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Slider(
+                                        value = maxDurationMinutes.toFloat(),
+                                        onValueChange = { maxDurationMinutes = it.toInt() },
+                                        onValueChangeFinished = {
+                                            vm.updateSettings(
+                                                settings.copy(autoRetryMaxDurationMinutes = maxDurationMinutes)
+                                            )
+                                        },
+                                        valueRange = AUTO_RETRY_MIN_DURATION_MINUTES.toFloat()..AUTO_RETRY_MAX_DURATION_MINUTES.toFloat(),
+                                        steps = AUTO_RETRY_MAX_DURATION_MINUTES - AUTO_RETRY_MIN_DURATION_MINUTES - 1,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    Text(
+                                        text = stringResource(
+                                            R.string.setting_display_page_auto_retry_max_duration_value,
+                                            maxDurationMinutes,
+                                        )
+                                    )
+                                }
+                            },
                         )
                     }
                 }

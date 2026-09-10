@@ -214,6 +214,7 @@
   <string name="cancel_edit">Cancel Edit</string>
   <string name="chain_of_thought_collapse">Collapse</string>
   <string name="chain_of_thought_show_more_steps">Show %d more steps</string>
+  <string name="chat_generation_retrying">Connection failed, retrying in %1$d s (attempt %2$d)</string>
   <string name="chat_input_placeholder">Chat with AI</string>
   <string name="chat_input_unsupported_file_type">Unsupported file type: %s</string>
   <string name="chat_input_file_read_failed">Failed to read file: %s</string>
@@ -571,6 +572,15 @@
   <string name="setting_display_page_amoled_dark_mode_title">AMOLED Dark Mode</string>
   <string name="setting_display_page_auto_collapse_thinking_desc">Automatically collapse thinking content after thinking is complete</string>
   <string name="setting_display_page_auto_collapse_thinking_title">Auto Collapse Thinking</string>
+  <string name="setting_display_page_auto_retry">Automatic retry</string>
+  <string name="setting_display_page_auto_retry_enabled_desc">Retry a generation that fails or returns nothing, for as long as the maximum retry time allows.</string>
+  <string name="setting_display_page_auto_retry_enabled_title">Retry failed generations</string>
+  <string name="setting_display_page_auto_retry_interval_desc">How long to wait before trying the same request again.</string>
+  <string name="setting_display_page_auto_retry_interval_title">Retry interval</string>
+  <string name="setting_display_page_auto_retry_interval_value">%1$d s</string>
+  <string name="setting_display_page_auto_retry_max_duration_desc">Total time allowed for retrying one generation. Retrying stops when it runs out.</string>
+  <string name="setting_display_page_auto_retry_max_duration_title">Maximum retry time</string>
+  <string name="setting_display_page_auto_retry_max_duration_value">%1$d min</string>
   <string name="setting_display_page_chat_font_family_default">Default</string>
   <string name="setting_display_page_chat_font_family_custom">Custom</string>
   <string name="setting_display_page_chat_font_family_monospace">Monospace</string>
