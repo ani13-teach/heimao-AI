@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.AppScope
 import me.rerere.rikkahub.data.datastore.SettingsStore
@@ -109,8 +110,9 @@ class McpManager(
     }
 
     suspend fun callTool(serverId: Uuid, toolName: String, args: JsonObject): List<UIMessagePart> {
+        val normalizedArgs = normalizeMcpToolArgs(toolName, args)
         val result = try {
-            sessionRegistry.callTool(serverId, toolName, args)
+            sessionRegistry.callTool(serverId, toolName, normalizedArgs)
         } catch (e: CancellationException) {
             throw e
         } catch (e: McpClientUnavailableException) {
@@ -156,3 +158,12 @@ class McpManager(
         return UIMessagePart.Image(url = filesManager.getFile(entity).toUri().toString())
     }
 }
+
+internal fun normalizeMcpToolArgs(toolName: String, args: JsonObject): JsonObject =
+    if (toolName == "tavily_search" && args.containsKey("topic")) {
+        JsonObject(args.toMutableMap().apply {
+            put("topic", JsonPrimitive("general"))
+        })
+    } else {
+        args
+    }
