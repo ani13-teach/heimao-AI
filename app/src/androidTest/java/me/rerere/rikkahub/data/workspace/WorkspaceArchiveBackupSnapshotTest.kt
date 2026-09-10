@@ -4,6 +4,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import kotlinx.coroutines.runBlocking
 import me.rerere.rikkahub.data.db.AppDatabase
+import me.rerere.rikkahub.data.db.fts.ensureCurrentMessageFtsSchema
 import me.rerere.rikkahub.utils.JsonInstant
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -15,6 +16,49 @@ import java.util.zip.ZipInputStream
 
 @RunWith(AndroidJUnit4::class)
 class WorkspaceArchiveBackupSnapshotTest {
+    @Test
+    fun legacyMessageFtsIsUpgradedBeforeFullBackup() = runBlocking {
+        val koin = GlobalContext.get()
+        val database = koin.get<AppDatabase>()
+        val service = koin.get<WorkspaceArchiveService>()
+        val databaseHandle = database.openHelper.writableDatabase
+        val password = "legacy-fts-backup-password".toCharArray()
+        var generated: File? = null
+        try {
+            databaseHandle.execSQL("DROP TABLE message_fts")
+            databaseHandle.execSQL(
+                """
+                CREATE VIRTUAL TABLE message_fts USING fts5(
+                    text,
+                    node_id UNINDEXED,
+                    message_id UNINDEXED,
+                    conversation_id UNINDEXED,
+                    role UNINDEXED,
+                    tokenize = 'simple'
+                )
+                """.trimIndent(),
+            )
+
+            ensureCurrentMessageFtsSchema(databaseHandle)
+            assertEquals(
+                listOf("text", "node_id", "message_id", "conversation_id", "title", "update_at"),
+                tableColumns(databaseHandle, "message_fts"),
+            )
+
+            generated = service.createBackupFile(
+                includeDatabase = true,
+                includeFiles = false,
+                password = password,
+            )
+            assertTrue(generated.isFile)
+            assertTrue(WorkspaceArchiveEncryption.inspect(generated).isEncrypted)
+        } finally {
+            ensureCurrentMessageFtsSchema(databaseHandle)
+            password.fill('\u0000')
+            generated?.delete()
+        }
+    }
+
     @Test
     fun fullBackupUsesSanitizedCopyAndKeepsOnlineSnapshotRows() = runBlocking {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
@@ -84,6 +128,15 @@ class WorkspaceArchiveBackupSnapshotTest {
             backup.delete()
             decrypted.delete()
             stagedDatabase.delete()
+        }
+    }
+
+    private fun tableColumns(
+        database: androidx.sqlite.db.SupportSQLiteDatabase,
+        table: String,
+    ): List<String> = buildList {
+        database.query("PRAGMA table_info('$table')").use { cursor ->
+            while (cursor.moveToNext()) add(cursor.getString(1))
         }
     }
 
