@@ -83,7 +83,7 @@ fun ImportExportTab(vm: BackupVM) {
             } catch (error: Throwable) {
                 error.printStackTrace()
                 toaster.show(
-                    context.getString(R.string.backup_page_restore_failed, error.message ?: ""),
+                    context.getString(R.string.backup_page_backup_failed, error.message ?: ""),
                     type = ToastType.Error,
                 )
             } finally {
