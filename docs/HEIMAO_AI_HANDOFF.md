@@ -614,7 +614,8 @@ Gradle 在 Windows 上必须串行运行：`--no-daemon --max-workers=1`。
 
 - 活跃目录：`C:/Users/WJZN/.agents/skills/heimao-ai-maintenance`
 - 包：`C:/Users/WJZN/heimao-ai-maintenance.skill`
-- Skill SHA-256：`df5548f5fbf8c4cfa8b0599ce3070ec432d521d826b9201a98802120ac9ca8da`
+- Skill SHA-256：`d0417003c95a3ffd40714a935c06475cb92d3e418e15e0208706a8c60651de21`（2026-09-10 重新打包：4 个文件，19590 字节，新增 `references/dependency-sources.md` 依赖来源与仓库地址）
+- 作废的旧包哈希：`df5548f5fbf8c4cfa8b0599ce3070ec432d521d826b9201a98802120ac9ca8da`（2026-08-16 打包，内含旧版 SKILL.md；备份在 `C:/Users/WJZN/heimao-AI/evidence/heimao-ai-maintenance.skill.20260816.bak`）
 
 ## 11. 验证要求
 
