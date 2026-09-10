@@ -99,6 +99,15 @@ internal fun buildLayeredMemoryPrompt(context: LayeredMemoryContext) =
         append("- Merge similar records with memory_write (edit) and use memory_consolidate " +
             "for conflict detection, confidence upgrades and archiving.")
         appendLine()
+        append("- Memory updates are local by default: memory_write (edit) takes id plus edits " +
+            "[{old_text, new_text}] copied from the record, so never rewrite a whole record for a small " +
+            "change. Several spots in one record go into one edits array (applied in order, all-or-nothing); " +
+            "separate records may be edited with parallel calls, but calls in the same turn cannot see each " +
+            "other's results, so dependent changes (create then edit) need a later turn.")
+        appendLine()
+        append("- 中文：维护已有记忆默认用局部修改（memory_write edit + edits），不要为一个小改动重写整条记录；" +
+            "同一记录多点放在一次调用的 edits 数组里，不同记录可并行调用；有依赖的修改（先建后改）分轮进行。")
+        appendLine()
         append("[Index]")
         appendLine()
         append(context.indexText)

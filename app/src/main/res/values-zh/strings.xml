@@ -233,6 +233,11 @@
   <string name="chat_message_tool_deny_dialog_hint">原因（可选）</string>
   <string name="chat_message_tool_deny_dialog_title">拒绝工具执行</string>
   <string name="chat_message_tool_edit_memory">更新了记忆</string>
+  <string name="tool_ui_memory_write_create">新建记忆</string>
+  <string name="tool_ui_memory_write_edit">修改记忆 #%1$s</string>
+  <string name="tool_ui_memory_write_edit_default">修改记忆</string>
+  <string name="tool_ui_memory_write_replace">重写记忆 #%1$s</string>
+  <string name="tool_ui_memory_write_replace_default">重写记忆</string>
   <string name="chat_message_tool_get_time">获取时间信息</string>
   <string name="chat_message_tool_scrape_prefix">抓取网站：%1$s</string>
   <string name="chat_message_tool_scrape_web">抓取网页</string>

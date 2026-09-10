@@ -2,6 +2,8 @@ package me.rerere.rikkahub.data.repository
 
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import me.rerere.rikkahub.data.db.dao.MemoryDAO
@@ -37,6 +39,15 @@ data class LayeredMemoryContext(
     val activeMemories: List<AssistantMemory>,
     val indexCount: Int,
     val activeCount: Int,
+)
+
+/**
+ * 分层记忆写入结果：[memory] 为写入后的记录，[previousContent] 为写入前的正文（新建时为 null）。
+ * 工具层用它生成 diff 与回执，不必额外读一次数据库（也避开写后读的竞态）。
+ */
+data class LayeredMemoryWriteResult(
+    val memory: AssistantMemory,
+    val previousContent: String?,
 )
 
 /**
@@ -216,6 +227,8 @@ internal fun isStale(updated: String, now: LocalDate, days: Int): Boolean {
 }
 
 class MemoryRepository(private val memoryDAO: MemoryDAO) {
+    /** 串行化记忆写入：补丁是「读最新正文 → 应用 → 写回」，并发调用必须不丢改动。 */
+    private val writeMutex = Mutex()
     companion object {
         const val GLOBAL_MEMORY_ID = "__global__"
         private const val PROMPT_MEMORY_LIMIT = 200
@@ -326,23 +339,29 @@ class MemoryRepository(private val memoryDAO: MemoryDAO) {
 
     /**
      * 写入/更新分层记忆。
-     * - id == null：新建（category/title/content/confidence_flags 必填非空，updated=今天，status=active）
-     * - id != null：合并旧记录——content 必填覆盖；category/title/confidenceFlags/tags/product
-     *   为 null 表示不修改，非 null（可为空串/空数组）表示显式设置（允许清空）；updated 刷新为今天。
-     *   旧记录不存在或不属于该助手时报错。
+     * - id == null：新建（category/title/content/confidence_flags 必填非空，updated=今天，status=active），
+     *   content 整段写入，不允许携带 [edits]。
+     * - id != null：修改已有记录，正文三种方式互斥：
+     *   [edits] 非空表示按锚点局部修改（在写锁内读取最新正文后顺序应用，任一处失败则整条记录不变）；
+     *   [content] 非 null 表示整段覆盖；两者都不给表示只改字段、正文不动。
+     *   至少要有一个改动点（补丁或任一字段参数非 null），否则拒绝，避免空写刷新 updated。
+     *   category/title/confidenceFlags/tags/product 为 null 表示不修改，非 null（可为空串/空数组）表示显式设置。
+     *   updated 刷新为今天，旧记录不存在或不属于该助手时报错。
      */
     suspend fun writeLayeredMemory(
         assistantId: String,
         id: Int?,
         category: String?,
         title: String?,
-        content: String,
+        content: String? = null,
         confidenceFlags: List<String>?,
         tags: List<String>?,
         product: String?,
-    ): AssistantMemory {
-        require(content.isNotBlank()) { "content is required" }
+        edits: List<MemoryEdit> = emptyList(),
+    ): LayeredMemoryWriteResult = writeMutex.withLock {
         if (id == null) {
+            require(edits.isEmpty()) { "edits are not supported for create" }
+            require(!content.isNullOrBlank()) { "content is required for create" }
             require(!category.isNullOrBlank()) { "category is required for create" }
             require(!title.isNullOrBlank()) { "title is required for create" }
             val flags = confidenceFlags.orEmpty()
@@ -361,17 +380,35 @@ class MemoryRepository(private val memoryDAO: MemoryDAO) {
                 status = "active",
             )
             val newId = memoryDAO.insertMemory(entity).toInt()
-            return entity.copy(id = newId).toAssistantMemory()
+            return@withLock LayeredMemoryWriteResult(entity.copy(id = newId).toAssistantMemory(), null)
         }
+        require(content == null || edits.isEmpty()) {
+            "content and edits cannot be used together; use edits for a local change or content for a full rewrite"
+        }
+        require(
+            edits.isNotEmpty() || content != null ||
+                category != null || title != null || confidenceFlags != null || tags != null || product != null
+        ) { "no change requested: provide edits, content, or at least one field" }
         val old = memoryDAO.getMemoryById(id)
             ?: error("Memory record #$id not found")
         if (old.assistantId != assistantId) {
             error("Memory record #$id does not belong to this assistant")
         }
+        // 补丁在写锁内基于最新正文应用，失败时抛错且不写库；错误信息带上记录 id，模型才知道该重读哪一条
+        val newContent = when {
+            edits.isNotEmpty() -> try {
+                applyMemoryEdits(old.content, edits)
+            } catch (e: IllegalArgumentException) {
+                throw IllegalArgumentException("memory record #$id: ${e.message}")
+            }
+
+            content != null -> content.trim()
+            else -> old.content
+        }
         val merged = old.copy(
             category = category?.takeIf { it.isNotBlank() }?.trim() ?: old.category,
             title = title?.trim() ?: old.title,
-            content = content.trim(),
+            content = newContent,
             confidenceFlags = confidenceFlags?.let {
                 memoryListJson.encodeToString(it.map { f -> f.trim() })
             } ?: old.confidenceFlags,
@@ -382,13 +419,13 @@ class MemoryRepository(private val memoryDAO: MemoryDAO) {
             updated = LocalDate.now().toString(),
         )
         memoryDAO.updateMemory(merged)
-        return merged.toAssistantMemory()
+        LayeredMemoryWriteResult(merged.toAssistantMemory(), old.content)
     }
 
     /**
      * 归档指定 id（须属于该 assistantId），返回实际被置为 archived 的 id 列表。
      */
-    suspend fun archiveMemories(assistantId: String, ids: List<Int>): List<Int> {
+    suspend fun archiveMemories(assistantId: String, ids: List<Int>): List<Int> = writeMutex.withLock {
         val updated = mutableListOf<Int>()
         for (id in ids.distinct()) {
             val old = memoryDAO.getMemoryById(id) ?: continue
@@ -397,7 +434,7 @@ class MemoryRepository(private val memoryDAO: MemoryDAO) {
             memoryDAO.updateMemory(old.copy(status = "archived"))
             updated += id
         }
-        return updated
+        updated
     }
 
     suspend fun deleteMemoriesOfAssistant(assistantId: String) {

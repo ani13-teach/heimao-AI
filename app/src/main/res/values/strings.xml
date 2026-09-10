@@ -235,6 +235,11 @@
   <string name="chat_message_tool_deny_dialog_hint">Reason (optional)</string>
   <string name="chat_message_tool_deny_dialog_title">Deny Tool Execution</string>
   <string name="chat_message_tool_edit_memory">Updated memory</string>
+  <string name="tool_ui_memory_write_create">Created memory</string>
+  <string name="tool_ui_memory_write_edit">Edited memory #%1$s</string>
+  <string name="tool_ui_memory_write_edit_default">Edited memory</string>
+  <string name="tool_ui_memory_write_replace">Rewrote memory #%1$s</string>
+  <string name="tool_ui_memory_write_replace_default">Rewrote memory</string>
   <string name="chat_message_tool_get_time">Get time info</string>
   <string name="chat_message_tool_scrape_prefix">Scrape website: %1$s</string>
   <string name="chat_message_tool_scrape_web">Scrape web page</string>

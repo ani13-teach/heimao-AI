@@ -1,6 +1,11 @@
 package me.rerere.rikkahub.data.ai.tools
 
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -12,62 +17,185 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import me.rerere.ai.core.InputSchema
 import me.rerere.ai.core.Tool
+import me.rerere.ai.ui.DiffMetadata
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.ai.ui.toMetadata
 import me.rerere.rikkahub.data.model.AssistantMemory
+import me.rerere.rikkahub.data.repository.MemoryEdit
 import me.rerere.rikkahub.data.repository.MemoryRepository
 import me.rerere.rikkahub.data.repository.detectConflicts
 import me.rerere.rikkahub.data.repository.suggestConfidenceUpgrades
+import me.rerere.rikkahub.utils.generateUnifiedDiff
 
 private val MEMORY_CATEGORIES = listOf("PARAMS", "SOP", "METHOD", "CASES", "ACTIVE", "GENERAL")
 
+/** 一次调用最多携带的局部修改点，避免单次输出与写入无界。 */
+private const val MAX_EDITS_PER_CALL = 20
+
+/** 返回给模型的 diff 片段长度上限，防止“局部修改”又把大段正文塞回上下文。 */
+private const val RESULT_FRAGMENT_CHAR_LIMIT = 1200
+
 /**
- * memory_write 参数校验（纯函数，JVM 可测）。返回错误信息，合法时返回 null。
+ * memory_write 的解析结果。修改（Update）时正文只有两条互斥路径：
+ * [MemoryWriteCommand.Update.edits] 局部修改，或 [MemoryWriteCommand.Update.content] 整段重写。
  */
-internal fun validateWriteRequest(
-    action: String?,
-    id: Int?,
-    category: String?,
-    title: String?,
-    content: String?,
-    confidenceFlags: List<String>?,
-): String? {
-    if (action != "create" && action != "edit") {
-        return "action is required and must be one of [create, edit]"
-    }
-    if (content.isNullOrBlank()) {
-        return "content is required"
-    }
-    return when (action) {
-        "create" -> {
-            if (category.isNullOrBlank()) return "category is required for create, must be one of $MEMORY_CATEGORIES"
-            if (category !in MEMORY_CATEGORIES) {
-                return "invalid category: $category, must be one of $MEMORY_CATEGORIES"
-            }
-            if (title.isNullOrBlank()) return "title is required for create"
-            val flags = confidenceFlags.orEmpty()
-            if (flags.isEmpty() || flags.any { it.isBlank() }) {
-                return "confidence_flags is required for create and must contain non-empty strings"
-            }
-            null
-        }
+internal sealed interface MemoryWriteCommand {
+    data class Create(
+        val category: String,
+        val title: String,
+        val content: String,
+        val confidenceFlags: List<String>,
+        val tags: List<String>,
+        val product: String?,
+    ) : MemoryWriteCommand
 
-        "edit" -> {
-            if (id == null) return "id is required for edit"
-            if (!category.isNullOrBlank() && category !in MEMORY_CATEGORIES) {
-                return "invalid category: $category, must be one of $MEMORY_CATEGORIES"
-            }
-            val flags = confidenceFlags.orEmpty()
-            if (flags.any { it.isBlank() }) {
-                return "confidence_flags must not contain empty strings"
-            }
-            null
-        }
-
-        else -> null
+    data class Update(
+        val id: Int,
+        val content: String?,
+        val edits: List<MemoryEdit>,
+        val category: String?,
+        val title: String?,
+        val confidenceFlags: List<String>?,
+        val tags: List<String>?,
+        val product: String?,
+    ) : MemoryWriteCommand {
+        /** 回给模型的模式标签：整段重写还是局部修改。 */
+        val mode: String get() = if (content != null) "replace" else "edit"
     }
 }
 
-private fun AssistantMemory.toLayeredJsonObject(): kotlinx.serialization.json.JsonObject = buildJsonObject {
+/**
+ * 解析并校验 memory_write 参数（纯函数，JVM 可测），非法时抛 [IllegalArgumentException]。
+ * 互斥约定：edit 不接受 content（提示改用 replace），replace 不接受 edits，create 不接受 edits。
+ */
+internal fun parseMemoryWriteRequest(params: JsonObject): MemoryWriteCommand {
+    val action = params["action"]?.jsonPrimitive?.contentOrNull
+        ?: throw IllegalArgumentException("action is required and must be one of [create, edit, replace]")
+    val id = params["id"]?.jsonPrimitive?.intOrNull
+    val rawCategory = params["category"]?.jsonPrimitive?.contentOrNull
+    // 空白 category 等于“不改”，不能算作一个改动点（否则空写会刷新 updated）
+    val category = rawCategory?.takeIf { it.isNotBlank() }
+    val title = params["title"]?.jsonPrimitive?.contentOrNull
+    val content = params["content"]?.jsonPrimitive?.contentOrNull
+    val confidenceFlags = params["confidence_flags"].stringArray("confidence_flags")
+    val tags = params["tags"].stringArray("tags")
+    val product = params["product"]?.jsonPrimitive?.contentOrNull
+    val edits = parseMemoryEdits(params["edits"])
+
+    if (category != null && category !in MEMORY_CATEGORIES) {
+        throw IllegalArgumentException("invalid category: $category, must be one of $MEMORY_CATEGORIES")
+    }
+    if (confidenceFlags?.any { it.isBlank() } == true) {
+        throw IllegalArgumentException("confidence_flags must not contain empty strings")
+    }
+
+    return when (action) {
+        "create" -> {
+            if (edits.isNotEmpty()) {
+                throw IllegalArgumentException("edits are not accepted for action=create")
+            }
+            if (content.isNullOrBlank()) throw IllegalArgumentException("content is required for create")
+            if (category == null) {
+                throw IllegalArgumentException("category is required for create, must be one of $MEMORY_CATEGORIES")
+            }
+            if (title.isNullOrBlank()) throw IllegalArgumentException("title is required for create")
+            val flags = confidenceFlags.orEmpty()
+            if (flags.isEmpty()) {
+                throw IllegalArgumentException("confidence_flags is required for create and must contain non-empty strings")
+            }
+            MemoryWriteCommand.Create(
+                category = category,
+                title = title,
+                content = content,
+                confidenceFlags = flags,
+                tags = tags.orEmpty(),
+                product = product,
+            )
+        }
+
+        "edit" -> {
+            if (content != null) {
+                throw IllegalArgumentException(
+                    "content is not accepted for action=edit; use action=replace for a full rewrite " +
+                        "or provide edits for a local change"
+                )
+            }
+            val recordId = id
+                ?: throw IllegalArgumentException("id is required for edit")
+            if (edits.isEmpty() && title == null && confidenceFlags == null && tags == null && product == null && category == null) {
+                throw IllegalArgumentException(
+                    "edit requires at least one change: provide edits, or one of category/title/confidence_flags/tags/product"
+                )
+            }
+            MemoryWriteCommand.Update(
+                id = recordId,
+                content = null,
+                edits = edits,
+                category = category,
+                title = title,
+                confidenceFlags = confidenceFlags,
+                tags = tags,
+                product = product,
+            )
+        }
+
+        "replace" -> {
+            if (edits.isNotEmpty()) {
+                throw IllegalArgumentException(
+                    "edits are not accepted for action=replace; use action=edit for a local change"
+                )
+            }
+            val recordId = id
+                ?: throw IllegalArgumentException("id is required for replace")
+            if (content.isNullOrBlank()) throw IllegalArgumentException("content is required for replace")
+            MemoryWriteCommand.Update(
+                id = recordId,
+                content = content,
+                edits = emptyList(),
+                category = category,
+                title = title,
+                confidenceFlags = confidenceFlags,
+                tags = tags,
+                product = product,
+            )
+        }
+
+        else -> throw IllegalArgumentException(
+            "unknown action: $action, must be one of [create, edit, replace]"
+        )
+    }
+}
+
+private fun JsonElement?.stringArray(field: String): List<String>? {
+    if (this == null || this is JsonNull) return null
+    val array = this as? JsonArray
+        ?: throw IllegalArgumentException("$field must be an array of strings")
+    return array.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+}
+
+private fun parseMemoryEdits(element: JsonElement?): List<MemoryEdit> {
+    if (element == null || element is JsonNull) return emptyList()
+    val array = element as? JsonArray
+        ?: throw IllegalArgumentException("edits must be an array of {old_text, new_text} objects")
+    if (array.size > MAX_EDITS_PER_CALL) {
+        throw IllegalArgumentException("too many edits: ${array.size} (max $MAX_EDITS_PER_CALL per call)")
+    }
+    return array.mapIndexed { index, item ->
+        val obj = item as? JsonObject
+            ?: throw IllegalArgumentException("edits[$index] must be an object with old_text and new_text")
+        val oldText = (obj["old_text"] as? JsonPrimitive)?.contentOrNull
+            ?: throw IllegalArgumentException("edits[$index].old_text is required")
+        val newText = (obj["new_text"] as? JsonPrimitive)?.contentOrNull
+            ?: throw IllegalArgumentException(
+                "edits[$index].new_text is required (pass an empty string to delete the matched text)"
+            )
+        if (oldText.isEmpty()) throw IllegalArgumentException("edits[$index].old_text must not be empty")
+        MemoryEdit(oldText = oldText, newText = newText)
+    }
+}
+
+/** 完整记录（含正文），memory_read 用。 */
+private fun AssistantMemory.toLayeredJsonObject(): JsonObject = buildJsonObject {
     put("id", id)
     put("category", category)
     put("title", title)
@@ -77,6 +205,18 @@ private fun AssistantMemory.toLayeredJsonObject(): kotlinx.serialization.json.Js
     put("product", product)
     put("status", status)
     put("content", content)
+}
+
+/** 摘要（不含正文），memory_write 回执用：模型靠 fragment/diff 自查，不需要再背一遍整条记录。 */
+private fun AssistantMemory.toSummaryJsonObject(): JsonObject = buildJsonObject {
+    put("id", id)
+    put("category", category)
+    put("title", title)
+    put("updated", updated)
+    put("confidence_flags", buildJsonArray { confidenceFlags.forEach { add(it) } })
+    put("tags", buildJsonArray { tags.forEach { add(it) } })
+    put("product", product)
+    put("status", status)
 }
 
 /**
@@ -164,16 +304,27 @@ fun buildLayeredMemoryTools(json: Json, scopeId: String, repo: MemoryRepository)
     Tool(
         name = "memory_write",
         description = """
-            Create or edit a layered memory record. The schema is enforced: create requires
-            category, title, content and confidence_flags; edit requires id and content, and
-            updates only the fields you provide (pass an empty string/array to clear title,
-            tags, product or confidence_flags).
+            Create or update a layered memory record.
+
+            Updating is LOCAL by default: use action=edit with id and edits, where each edit is
+            {"old_text": "...", "new_text": "..."}. Copy old_text exactly from the current record
+            (read it with memory_read first); it must occur exactly once. A missing or ambiguous
+            anchor is rejected and the record stays unchanged. Pass an empty new_text to delete the matched text.
+            Same record, several spots: put them in one edits array (applied in order, all-or-nothing).
+            Different records: call memory_write several times in the same turn. Those calls run one after
+            another and cannot see each other's results, so never chain dependent changes across calls
+            (create first, then edit its id in a later turn).
+            Use action=replace (id + full content) only for restructuring a record, e.g. merging or condensing it.
+            content is not accepted for action=edit.
+
+            Optional field parameters are applied only when present; pass an empty string/array to clear
+            title, tags, product or confidence_flags. create requires category, title, content and confidence_flags.
             Confidence flags recommended values: ✅实测已验证 (verified in practice), ⚠️单板待确认 (single-board, needs confirmation), 🔄待复核 (to recheck).
             Age rule: a record whose updated date is older than 7 days with ⚠️/待确认 confidence must be confirmed with the user first.
             Merge similar records: prefer edit over create to avoid duplicates.
             Do not store sensitive information (ethnicity, religion, political views, sex life, criminal records, etc.).
             Do not show memory content directly in the conversation unless the user explicitly asks.
-            中文：相似记忆优先合并更新；含 ⚠️ 且超过 7 天未更新的记忆，先向用户确认再使用。
+            中文：默认用 action=edit + edits 做局部修改，old_text 必须从 memory_read 的正文里逐字复制且全文只出现一次；同一记录多点放在一次调用的 edits 里（按序、全成或全不成），不同记录才并行调用；只有合并/压缩整条记录才用 action=replace。
         """.trimIndent(),
         parameters = {
             InputSchema.Obj(
@@ -183,12 +334,34 @@ fun buildLayeredMemoryTools(json: Json, scopeId: String, repo: MemoryRepository)
                         put("enum", buildJsonArray {
                             add("create")
                             add("edit")
+                            add("replace")
                         })
-                        put("description", "create a new record or edit an existing one (required)")
+                        put("description", "create a new record, edit an existing one locally, or replace its whole content (required)")
                     })
                     put("id", buildJsonObject {
                         put("type", "integer")
-                        put("description", "Record id (required for edit)")
+                        put("description", "Record id (required for edit and replace)")
+                    })
+                    put("edits", buildJsonObject {
+                        put("type", "array")
+                        put("items", buildJsonObject {
+                            put("type", "object")
+                            put("properties", buildJsonObject {
+                                put("old_text", buildJsonObject {
+                                    put("type", "string")
+                                    put("description", "Exact snippet copied from the record; must occur exactly once")
+                                })
+                                put("new_text", buildJsonObject {
+                                    put("type", "string")
+                                    put("description", "Replacement text; empty string deletes the snippet")
+                                })
+                            })
+                            put("required", buildJsonArray {
+                                add("old_text")
+                                add("new_text")
+                            })
+                        })
+                        put("description", "Local changes for edit (max $MAX_EDITS_PER_CALL per call, applied in order, all-or-nothing)")
                     })
                     put("category", buildJsonObject {
                         put("type", "string")
@@ -201,7 +374,7 @@ fun buildLayeredMemoryTools(json: Json, scopeId: String, repo: MemoryRepository)
                     })
                     put("content", buildJsonObject {
                         put("type", "string")
-                        put("description", "Memory content (required)")
+                        put("description", "Full record body: required for create and replace, not accepted for edit")
                     })
                     put("confidence_flags", buildJsonObject {
                         put("type", "array")
@@ -218,61 +391,56 @@ fun buildLayeredMemoryTools(json: Json, scopeId: String, repo: MemoryRepository)
                         put("description", "Optional related product/model name")
                     })
                 },
-                required = listOf("action", "content")
+                required = listOf("action")
             )
         },
         execute = { input ->
-            val params = input.jsonObject
-            val action = params["action"]?.jsonPrimitive?.contentOrNull
-            val id = params["id"]?.jsonPrimitive?.intOrNull
-            val category = params["category"]?.jsonPrimitive?.contentOrNull
-            val title = params["title"]?.jsonPrimitive?.contentOrNull
-            val content = params["content"]?.jsonPrimitive?.contentOrNull
-            val confidenceFlags = params["confidence_flags"]?.jsonArray
-                ?.mapNotNull { it.jsonPrimitive.contentOrNull }
-            val tags = params["tags"]?.jsonArray
-                ?.mapNotNull { it.jsonPrimitive.contentOrNull }
-            val product = params["product"]?.jsonPrimitive?.contentOrNull
+            var diffMetadata: DiffMetadata? = null
+            val payload = when (val command = parseMemoryWriteRequest(input.jsonObject)) {
+                is MemoryWriteCommand.Create -> {
+                    val result = repo.writeLayeredMemory(
+                        assistantId = scopeId,
+                        id = null,
+                        category = command.category,
+                        title = command.title,
+                        content = command.content,
+                        confidenceFlags = command.confidenceFlags,
+                        tags = command.tags,
+                        product = command.product,
+                    )
+                    buildJsonObject {
+                        put("success", true)
+                        put("mode", "create")
+                        put("memory", result.memory.toSummaryJsonObject())
+                    }
+                }
 
-            validateWriteRequest(
-                action = action,
-                id = id,
-                category = category,
-                title = title,
-                content = content,
-                confidenceFlags = confidenceFlags,
-            )?.let { error("memory_write: $it") }
-
-            val memory = when (action) {
-                "create" -> repo.writeLayeredMemory(
-                    assistantId = scopeId,
-                    id = null,
-                    category = category!!,
-                    title = title!!,
-                    content = content!!,
-                    confidenceFlags = confidenceFlags!!.map { it.trim() }.filter { it.isNotEmpty() },
-                    tags = tags?.map { it.trim() }.orEmpty().filter { it.isNotEmpty() },
-                    product = product,
-                )
-
-                "edit" -> repo.writeLayeredMemory(
-                    assistantId = scopeId,
-                    id = id!!,
-                    category = category?.takeIf { it.isNotBlank() },
-                    title = title,
-                    content = content!!,
-                    confidenceFlags = confidenceFlags?.map { it.trim() },
-                    tags = tags?.map { it.trim() },
-                    product = product,
-                )
-
-                else -> error("unknown action: $action")
+                is MemoryWriteCommand.Update -> {
+                    val result = repo.writeLayeredMemory(
+                        assistantId = scopeId,
+                        id = command.id,
+                        category = command.category,
+                        title = command.title,
+                        content = command.content,
+                        confidenceFlags = command.confidenceFlags,
+                        tags = command.tags,
+                        product = command.product,
+                        edits = command.edits,
+                    )
+                    // 只把“改了哪几行”回给模型，不把整条记录再背一遍
+                    val diff = result.previousContent
+                        ?.let { generateUnifiedDiff(it, result.memory.content, "memory/#${result.memory.id}") }
+                    diffMetadata = diff?.let { DiffMetadata(diff = it) }
+                    buildJsonObject {
+                        put("success", true)
+                        put("mode", command.mode)
+                        put("memory", result.memory.toSummaryJsonObject())
+                        if (command.edits.isNotEmpty()) put("replacements", command.edits.size)
+                        if (diff != null) put("fragment", diff.take(RESULT_FRAGMENT_CHAR_LIMIT))
+                    }
+                }
             }
-            val payload = buildJsonObject {
-                put("success", true)
-                put("memory", memory.toLayeredJsonObject())
-            }
-            listOf(UIMessagePart.Text(payload.toString()))
+            listOf(UIMessagePart.Text(text = payload.toString(), metadata = diffMetadata?.toMetadata()))
         }
     ),
     Tool(
@@ -282,7 +450,7 @@ fun buildLayeredMemoryTools(json: Json, scopeId: String, repo: MemoryRepository)
             Actions:
             - rebuild_index: rebuild the injected index summary (returns line/char counts and the index text).
             - detect_conflicts: find records of the same category+product+overlapping tags that state the same key with different values (report only).
-            - suggest_upgrades: when a ⚠️/待确认 record's key=value is confirmed by another record, suggest upgrading its confidence flag to ✅实测已验证 (report only).
+            - suggest_upgrades: when a ⚠️/待确认 record's key=value is confirmed by another record, suggest upgrading its confidence flag to ✅实测已验证 (report only). Apply a suggestion with memory_write (action=edit, id, confidence_flags only) — no need to rewrite the record content.
             - archive: archive records by id (ids required). dry_run=true only returns the ids that would be archived; dry_run=false actually archives them.
             After archiving, records disappear from the index and active set.
             中文：冲突检测与升级建议只报告不自动修改；归档默认 dry_run 预览。

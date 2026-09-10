@@ -1,8 +1,10 @@
 package me.rerere.rikkahub.data.repository
 
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.yield
 import me.rerere.rikkahub.data.db.dao.MemoryDAO
 import me.rerere.rikkahub.data.db.entity.MemoryEntity
 import org.junit.Assert.assertEquals
@@ -144,7 +146,7 @@ class LayeredMemoryRepositoryTest {
     @Test
     fun `writeLayeredMemory create fills defaults and today date`() {
         val (repo, dao) = repoWith()
-        val created = runBlocking {
+        val (created, _) = runBlocking {
             repo.writeLayeredMemory(
                 assistantId = "a", id = null, category = "PARAMS", title = "baud",
                 content = "baud=115200", confidenceFlags = listOf("✅实测已验证"),
@@ -192,7 +194,7 @@ class LayeredMemoryRepositoryTest {
         )
         val before = dao.rows.single()
         // 只更新 title + tags（清空 tags），其余保持
-        val edited = runBlocking {
+        val (edited, _) = runBlocking {
             repo.writeLayeredMemory(
                 assistantId = "a", id = before.id, category = null, title = "new title",
                 content = "old content", confidenceFlags = null, tags = emptyList(), product = null,
@@ -238,8 +240,7 @@ class LayeredMemoryRepositoryTest {
     }
 
     @Test
-    fun `getLayeredMemoryContext excludes archived from index`() {
-        val (repo, _) = repoWith(
+    fun `getLayeredMemoryContext excludes archived from index`() {        val (repo, _) = repoWith(
             MemoryEntity(
                 id = 0, assistantId = "a", content = "done stuff", category = "PARAMS",
                 title = "done", status = "archived", updated = "2025-01-01",
@@ -255,6 +256,282 @@ class LayeredMemoryRepositoryTest {
         assertEquals(1, ctx.indexCount)
         // ACTIVE 分类记录进入活跃状态段
         assertEquals(1, ctx.activeCount)
+    }
+
+    // ---- 局部修改（edits） ----
+
+    /** 在临界区内让出一次，使并发调用真正交错；没有写锁时会丢失更新。 */
+    private class YieldingMemoryDAO(private val delegate: MemoryDAO) : MemoryDAO by delegate {
+        override suspend fun getMemoryById(id: Int): MemoryEntity? {
+            yield()
+            return delegate.getMemoryById(id)
+        }
+
+        override suspend fun updateMemory(memory: MemoryEntity) {
+            yield()
+            delegate.updateMemory(memory)
+        }
+    }
+
+    @Test
+    fun `patch edit changes only the matched spot and refreshes updated`() {
+        val (repo, dao) = repoWith(
+            MemoryEntity(
+                id = 0, assistantId = "a", content = "转速: 12000\n冷却: 水冷\n", category = "PARAMS",
+                title = "主轴", updated = "2020-01-01", confidenceFlags = """["✅实测已验证"]""",
+                tags = """["p1"]""", product = "P1",
+            )
+        )
+        val id = dao.rows.single().id
+
+        val (edited, _) = runBlocking {
+            repo.writeLayeredMemory(
+                assistantId = "a", id = id, category = null, title = null,
+                confidenceFlags = null, tags = null, product = null,
+                edits = listOf(MemoryEdit("转速: 12000", "转速: 12500")),
+            )
+        }
+
+        assertEquals("转速: 12500\n冷却: 水冷\n", edited.content)
+        assertEquals(java.time.LocalDate.now().toString(), edited.updated)
+        // 未涉及的字段与正文其余部分保持原样
+        assertEquals("PARAMS", edited.category)
+        assertEquals("主轴", edited.title)
+        assertEquals(listOf("✅实测已验证"), edited.confidenceFlags)
+        assertEquals(listOf("p1"), edited.tags)
+        assertEquals("P1", edited.product)
+    }
+
+    @Test
+    fun `two patches in one call both land`() {
+        val (repo, dao) = repoWith(
+            MemoryEntity(id = 0, assistantId = "a", content = "转速: 12000\n冷却: 水冷\n", title = "t")
+        )
+        val id = dao.rows.single().id
+
+        val (edited, _) = runBlocking {
+            repo.writeLayeredMemory(
+                assistantId = "a", id = id, category = null, title = null,
+                confidenceFlags = null, tags = null, product = null,
+                edits = listOf(
+                    MemoryEdit("转速: 12000", "转速: 12500"),
+                    MemoryEdit("冷却: 水冷", "冷却: 风冷"),
+                ),
+            )
+        }
+
+        assertEquals("转速: 12500\n冷却: 风冷\n", edited.content)
+    }
+
+    @Test
+    fun `patch failure leaves the record unchanged`() {        val original = "转速: 12000\n冷却: 水冷\n"
+        val (repo, dao) = repoWith(MemoryEntity(id = 0, assistantId = "a", content = original, title = "t"))
+        val id = dao.rows.single().id
+        val before = dao.rows.single()
+
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                repo.writeLayeredMemory(
+                    assistantId = "a", id = id, category = null, title = null,
+                    confidenceFlags = null, tags = null, product = null,
+                    edits = listOf(
+                        MemoryEdit("转速: 12000", "转速: 12500"),
+                        MemoryEdit("不存在的锚点", "x"),
+                    ),
+                )
+            }
+        }
+
+        // 第一个补丁已命中，但整次调用失败 → 一个字节都不能写进去
+        assertEquals(before, dao.rows.single())
+        assertEquals(original, dao.rows.single().content)
+    }
+
+    @Test
+    fun `patch failure message names the record`() {
+        val (repo, dao) = repoWith(
+            MemoryEntity(id = 0, assistantId = "a", content = "转速: 12000\n", title = "t")
+        )
+        val id = dao.rows.single().id
+
+        val error = assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                repo.writeLayeredMemory(
+                    assistantId = "a", id = id, category = null, title = null,
+                    confidenceFlags = null, tags = null, product = null,
+                    edits = listOf(MemoryEdit("不存在的锚点", "x")),
+                )
+            }
+        }
+
+        // 模型靠错误信息里的 id 决定重读哪条记录
+        assertTrue(error.message!!.contains("#$id"))
+        assertTrue(error.message!!.contains("not found"))
+    }
+
+    @Test
+    fun `later patch call fails when an earlier call removed its anchor`() {
+        val (repo, dao) = repoWith(
+            MemoryEntity(id = 0, assistantId = "a", content = "转速: 12000\n冷却: 水冷\n", title = "t")
+        )
+        val id = dao.rows.single().id
+
+        val (first, _) = runBlocking {
+            repo.writeLayeredMemory(
+                assistantId = "a", id = id, category = null, title = null,
+                confidenceFlags = null, tags = null, product = null,
+                edits = listOf(MemoryEdit("冷却: 水冷", "冷却: 风冷")),
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                repo.writeLayeredMemory(
+                    assistantId = "a", id = id, category = null, title = null,
+                    confidenceFlags = null, tags = null, product = null,
+                    edits = listOf(MemoryEdit("冷却: 水冷", "冷却: 油冷")),
+                )
+            }
+        }
+
+        assertEquals(first.content, dao.rows.single().content)
+        assertEquals("转速: 12000\n冷却: 风冷\n", dao.rows.single().content)
+    }
+
+    @Test
+    fun `field change and patch in one call both apply`() {
+        val (repo, dao) = repoWith(
+            MemoryEntity(id = 0, assistantId = "a", content = "转速: 12000\n", title = "old")
+        )
+        val id = dao.rows.single().id
+
+        val (edited, _) = runBlocking {
+            repo.writeLayeredMemory(
+                assistantId = "a", id = id, category = null, title = "new title",
+                confidenceFlags = listOf("⚠️单板待确认"), tags = null, product = null,
+                edits = listOf(MemoryEdit("转速: 12000", "转速: 12500")),
+            )
+        }
+
+        assertEquals("转速: 12500\n", edited.content)
+        assertEquals("new title", edited.title)
+        assertEquals(listOf("⚠️单板待确认"), edited.confidenceFlags)
+    }
+
+    @Test
+    fun `field-only edit keeps content untouched`() {
+        val (repo, dao) = repoWith(
+            MemoryEntity(id = 0, assistantId = "a", content = "转速: 12000\n", title = "old")
+        )
+        val id = dao.rows.single().id
+
+        val (edited, _) = runBlocking {
+            repo.writeLayeredMemory(
+                assistantId = "a", id = id, category = null, title = null,
+                confidenceFlags = listOf("✅实测已验证"), tags = null, product = null,
+            )
+        }
+
+        assertEquals("转速: 12000\n", edited.content)
+        assertEquals(listOf("✅实测已验证"), edited.confidenceFlags)
+    }
+
+    @Test
+    fun `edit without any change is rejected and updated stays`() {
+        val (repo, dao) = repoWith(
+            MemoryEntity(id = 0, assistantId = "a", content = "转速: 12000\n", title = "t", updated = "2020-01-01")
+        )
+        val id = dao.rows.single().id
+
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                repo.writeLayeredMemory(
+                    assistantId = "a", id = id, category = null, title = null,
+                    confidenceFlags = null, tags = null, product = null,
+                )
+            }
+        }
+
+        // 空写不得刷新新鲜度
+        assertEquals("2020-01-01", dao.rows.single().updated)
+    }
+
+    @Test
+    fun `content and edits together are rejected`() {
+        val (repo, dao) = repoWith(MemoryEntity(id = 0, assistantId = "a", content = "c", title = "t"))
+        val id = dao.rows.single().id
+
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                repo.writeLayeredMemory(
+                    assistantId = "a", id = id, category = null, title = null,
+                    content = "整段新内容", confidenceFlags = null, tags = null, product = null,
+                    edits = listOf(MemoryEdit("c", "x")),
+                )
+            }
+        }
+        assertEquals("c", dao.rows.single().content)
+    }
+
+    @Test
+    fun `create with edits is rejected`() {
+        val (repo, dao) = repoWith()
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                repo.writeLayeredMemory(
+                    assistantId = "a", id = null, category = "PARAMS", title = "t",
+                    content = "c", confidenceFlags = listOf("✅"), tags = null, product = null,
+                    edits = listOf(MemoryEdit("c", "x")),
+                )
+            }
+        }
+        assertTrue(dao.rows.isEmpty())
+    }
+
+    @Test
+    fun `patch on a missing record is rejected`() {
+        val (repo, _) = repoWith()
+        assertThrows(IllegalStateException::class.java) {
+            runBlocking {
+                repo.writeLayeredMemory(
+                    assistantId = "a", id = 999, category = null, title = null,
+                    confidenceFlags = null, tags = null, product = null,
+                    edits = listOf(MemoryEdit("c", "x")),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `concurrent patches on the same record keep both changes`() {
+        val dao = FakeMemoryDAO()
+        dao.rows += MemoryEntity(
+            id = dao.nextId++, assistantId = "a", content = "转速: 12000\n冷却: 水冷\n", title = "t",
+        )
+        val repo = MemoryRepository(YieldingMemoryDAO(dao))
+        val id = dao.rows.single().id
+
+        runBlocking {
+            val first = async {
+                repo.writeLayeredMemory(
+                    assistantId = "a", id = id, category = null, title = null,
+                    confidenceFlags = null, tags = null, product = null,
+                    edits = listOf(MemoryEdit("转速: 12000", "转速: 12500")),
+                )
+            }
+            val second = async {
+                repo.writeLayeredMemory(
+                    assistantId = "a", id = id, category = null, title = null,
+                    confidenceFlags = null, tags = null, product = null,
+                    edits = listOf(MemoryEdit("冷却: 水冷", "冷却: 风冷")),
+                )
+            }
+            first.await()
+            second.await()
+        }
+
+        val content = dao.rows.single().content
+        assertTrue(content.contains("转速: 12500"))
+        assertTrue(content.contains("冷却: 风冷"))
     }
 
 }

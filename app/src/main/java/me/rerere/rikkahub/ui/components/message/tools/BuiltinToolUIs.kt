@@ -13,7 +13,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
@@ -22,6 +24,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -38,18 +41,22 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.jsonPrimitive
+import me.rerere.ai.ui.DiffMetadata
+import me.rerere.ai.ui.metadataAs
 import me.rerere.common.http.jsonObjectOrNull
 import me.rerere.highlight.CodeHighlightText
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.Clipboard
 import me.rerere.hugeicons.stroke.Delete01
 import me.rerere.hugeicons.stroke.Eraser
+import me.rerere.hugeicons.stroke.FileEdit
 import me.rerere.hugeicons.stroke.GlobalSearch
 import me.rerere.hugeicons.stroke.MagicWand01
 import me.rerere.hugeicons.stroke.Message02
@@ -61,11 +68,16 @@ import me.rerere.hugeicons.stroke.SmartPhone01
 import me.rerere.hugeicons.stroke.Time02
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.repository.MemoryRepository
+import me.rerere.rikkahub.ui.components.richtext.DiffAddedColor
+import me.rerere.rikkahub.ui.components.richtext.DiffRemovedColor
+import me.rerere.rikkahub.ui.components.richtext.DiffView
 import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
+import me.rerere.rikkahub.ui.components.richtext.parseDiffStats
 import me.rerere.rikkahub.ui.components.ui.Favicon
 import me.rerere.rikkahub.ui.components.ui.FaviconRow
 import me.rerere.rikkahub.ui.modifier.shimmer
 import me.rerere.rikkahub.utils.JsonInstantPretty
+import me.rerere.rikkahub.utils.generateUnifiedDiff
 import me.rerere.rikkahub.utils.jsonPrimitiveOrNull
 import me.rerere.rikkahub.utils.openUrl
 import org.koin.compose.koinInject
@@ -145,6 +157,134 @@ object MemoryToolUI : ToolUIRenderer {
                 null
             },
         )
+    }
+}
+
+/**
+ * 分层记忆写入: 标题区分新建/修改/重写, 摘要与详情展示实际落地的 diff
+ *
+ * 执行后读输出部件的 [DiffMetadata] (由 memory_write 生成); 未执行时用入参的 edits 片段生成预览。
+ */
+object MemoryWriteToolUI : ToolUIRenderer {
+    private const val SUMMARY_MAX_LINES = 10
+
+    override val toolName: String = "memory_write"
+
+    override fun icon(context: ToolUIContext): ImageVector =
+        if (context.arguments.getStringContent("action") == "create") {
+            HugeIcons.QuillWrite01
+        } else {
+            HugeIcons.FileEdit
+        }
+
+    @Composable
+    override fun title(context: ToolUIContext): String {
+        val id = context.arguments.getStringContent("id")
+        return when (context.arguments.getStringContent("action")) {
+            "create" -> stringResource(R.string.tool_ui_memory_write_create)
+            "replace" -> if (id != null) {
+                stringResource(R.string.tool_ui_memory_write_replace, id)
+            } else {
+                stringResource(R.string.tool_ui_memory_write_replace_default)
+            }
+
+            else -> if (id != null) {
+                stringResource(R.string.tool_ui_memory_write_edit, id)
+            } else {
+                stringResource(R.string.tool_ui_memory_write_edit_default)
+            }
+        }
+    }
+
+    private fun diffOf(context: ToolUIContext): String? {
+        if (context.tool.isExecuted) {
+            return context.tool.output.firstOrNull()?.metadataAs<DiffMetadata>()?.diff
+        }
+        // 未执行时按入参预览: 把本次所有补丁拼成一个 diff, 仅用于展示“即将改成什么”
+        val edits = context.arguments.jsonObjectOrNull?.get("edits") as? JsonArray ?: return null
+        val pairs = edits.mapNotNull { element ->
+            val obj = element.jsonObjectOrNull ?: return@mapNotNull null
+            val oldText = (obj["old_text"] as? JsonPrimitive)?.contentOrNull ?: return@mapNotNull null
+            val newText = (obj["new_text"] as? JsonPrimitive)?.contentOrNull ?: ""
+            oldText to newText
+        }
+        if (pairs.isEmpty()) return null
+        return generateUnifiedDiff(
+            oldText = pairs.joinToString("\n") { it.first },
+            newText = pairs.joinToString("\n") { it.second },
+            path = "memory",
+        )
+    }
+
+    override fun hasSummary(context: ToolUIContext): Boolean = diffOf(context) != null
+
+    @Composable
+    override fun Summary(context: ToolUIContext) {
+        val diff = remember(context) { diffOf(context) } ?: return
+        val stats = remember(diff) { parseDiffStats(diff) }
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = "+${stats.additions}",
+                style = MaterialTheme.typography.labelSmall,
+                color = DiffAddedColor,
+            )
+            Text(
+                text = "-${stats.deletions}",
+                style = MaterialTheme.typography.labelSmall,
+                color = DiffRemovedColor,
+            )
+        }
+        DiffView(
+            diff = diff,
+            modifier = Modifier.fillMaxWidth(),
+            maxLines = SUMMARY_MAX_LINES,
+            showFileHeader = false,
+        )
+    }
+
+    @Composable
+    override fun Preview(context: ToolUIContext, onDismissRequest: () -> Unit) {
+        val diff = remember(context) { diffOf(context) }
+        if (diff == null) {
+            DefaultToolPreview(context = context)
+            return
+        }
+        val stats = remember(diff) { parseDiffStats(diff) }
+        Column(
+            modifier = Modifier
+                .fillMaxHeight(0.8f)
+                .padding(16.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    text = title(context),
+                    style = MaterialTheme.typography.titleMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    text = "+${stats.additions}",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = DiffAddedColor,
+                )
+                Text(
+                    text = "-${stats.deletions}",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = DiffRemovedColor,
+                )
+            }
+            DiffView(diff = diff, modifier = Modifier.fillMaxWidth())
+        }
     }
 }
 
