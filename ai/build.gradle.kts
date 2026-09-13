@@ -23,6 +23,11 @@ android {
 //            version = "3.22.1"
 //        }
 //    }
+    testOptions {
+        // Provider 走错时会调 android.util.Log，JVM 单测里那些桩默认抛异常，
+        // 让它们返回默认值，就能在本地把「网关报错」这类路径测起来。
+        unitTests.isReturnDefaultValues = true
+    }
     tasks.withType<KotlinCompile>().configureEach {
         compilerOptions.optIn.add("kotlin.uuid.ExperimentalUuidApi")
         compilerOptions.optIn.add("kotlin.time.ExperimentalTime")

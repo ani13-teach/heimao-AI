@@ -51,6 +51,7 @@ import me.rerere.ai.util.HttpException
 import me.rerere.ai.util.KeyRoulette
 import me.rerere.ai.util.configureReferHeaders
 import me.rerere.ai.util.encodeBase64
+import me.rerere.ai.util.httpResponseFailure
 import me.rerere.ai.util.json
 import me.rerere.ai.util.mergeCustomBody
 import me.rerere.ai.util.parseErrorDetail
@@ -183,7 +184,9 @@ class ResponseAPI(
                     Log.w(TAG, "onFailure: failed to parse from $bodyRaw")
                     e.printStackTrace()
                 } finally {
-                    close(exception)
+                    // 错误体不是 JSON（例如网关的 HTML 错误页）时也得报错，
+                    // 拿 null 关流会变成空回复，上层看不到任何异常。
+                    close(exception ?: httpResponseFailure(response, bodyRaw))
                 }
             }
 

@@ -52,6 +52,7 @@ import me.rerere.ai.util.HttpException
 import me.rerere.ai.util.KeyRoulette
 import me.rerere.ai.util.configureReferHeaders
 import me.rerere.ai.util.encodeBase64
+import me.rerere.ai.util.httpResponseFailure
 import me.rerere.ai.util.json
 import me.rerere.ai.util.mergeCustomBody
 import me.rerere.ai.util.parseErrorDetail
@@ -202,9 +203,17 @@ class ChatCompletionsAPI(
                 } catch (e: Throwable) {
                     Log.w(TAG, "onFailure: failed to parse from $bodyRaw")
                     e.printStackTrace()
-                    exception = e
+                    // 响应体不是 JSON（网关的 HTML 错误页最常见）时，报状态码 + 原文比甩一个
+                    // JSON 解析错误更有用；响应本身正常（200）才保留解析异常。
+                    exception = if (response != null && !response.isSuccessful) {
+                        httpResponseFailure(response, bodyRaw)
+                    } else {
+                        e
+                    }
                 } finally {
-                    close(exception)
+                    // 错误体拿不到（空响应）时也得报错：拿 null 关流会变成空回复，
+                    // 上层看不到任何异常，界面上既不显示回答也不显示报错。
+                    close(exception ?: httpResponseFailure(response, bodyRaw))
                 }
             }
 

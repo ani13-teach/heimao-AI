@@ -8,6 +8,7 @@ import me.rerere.ai.provider.CustomHeader
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
+import okhttp3.Response
 import okhttp3.ResponseBody
 import okhttp3.internal.http.RealResponseBody
 
@@ -43,6 +44,24 @@ fun ResponseBody.stringSafe(): String? {
         is RealResponseBody -> string()
         else -> null
     }
+}
+
+/**
+ * HTTP 响应本身就是失败、却拿不到可用异常时的兜底错误。
+ *
+ * 网关返回 HTML 错误页（不是 JSON）时解析会失败，此时若拿 null 关闭流，
+ * 这一轮流会「正常结束」成空回复：界面既不显示回答，也不显示报错。
+ */
+fun httpResponseFailure(response: Response?, bodyRaw: String?): HttpException {
+    val status = response?.code
+    // 错误页可能是一整页 HTML，截断再进提示，别把错误卡片撑满
+    val detail = bodyRaw.orEmpty().replace(Regex("\\s+"), " ").trim().take(300)
+    val message = buildString {
+        append("Failed to get response")
+        if (status != null) append(": $status")
+        if (detail.isNotEmpty()) append(" $detail")
+    }
+    return HttpException(message, status)
 }
 
 fun JsonObject.mergeCustomBody(bodies: List<CustomBody>): JsonObject {
