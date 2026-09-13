@@ -1,2 +1,6 @@
 # Baseline Profile 生成文件：标记为文本，统一使用 LF 换行，避免 CRLF 抖动
 app/src/release/generated/baselineProfiles/*.txt text eol=lf
+
+# 高亮器的标准答案样本：测试要把它们跟生成结果逐字比对，
+# 工作区里被换成 CRLF 就会每行多一个 \r，30 个用例全挂，必须固定 LF
+highlight/src/test/resources/** text eol=lf
