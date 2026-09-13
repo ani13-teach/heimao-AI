@@ -408,6 +408,37 @@ class ChatService(
         }
     }
 
+    /**
+     * 生成任务统一在这里创建。
+     *
+     * [keepAliveInBackground] 为 true 时申请前台服务，让界面被隐藏（切后台/锁屏）后生成仍能继续。
+     * 任务用 LAZY 创建：[ConversationSession.setJob] 拒绝时任务不会执行，
+     * 也就不会白白申请一个前台服务。
+     */
+    private fun launchGenerationJob(
+        conversationId: Uuid,
+        keepAliveInBackground: Boolean = true,
+        block: suspend () -> Unit,
+    ): Job {
+        if (!keepAliveInBackground) return appScope.launch(start = CoroutineStart.LAZY) { block() }
+
+        return appScope.launch(start = CoroutineStart.LAZY) {
+            val generationId = Uuid.random()
+            val foregroundStarted = ChatGenerationForegroundService.acquire(
+                context = context,
+                generationId = generationId,
+                conversationId = conversationId,
+            )
+            try {
+                block()
+            } finally {
+                if (foregroundStarted) {
+                    ChatGenerationForegroundService.release(context, generationId)
+                }
+            }
+        }
+    }
+
     // ---- 发送消息 ----
 
     fun sendMessage(conversationId: Uuid, content: List<UIMessagePart>, answer: Boolean = true) {
@@ -417,7 +448,10 @@ class ChatService(
         val previousJob = session.getJob()
         previousJob?.cancel()
 
-        val job = appScope.launch(start = CoroutineStart.LAZY) {
+        val job = launchGenerationJob(
+            conversationId = conversationId,
+            keepAliveInBackground = answer,
+        ) {
             try {
                 // ChatVM starts initialization asynchronously. Do not inspect or persist the
                 // temporary session state until the new-vs-existing decision is complete.
@@ -482,7 +516,10 @@ class ChatService(
         val session = getOrCreateSession(conversationId)
         session.getJob()?.cancel()
 
-        val job = appScope.launch(start = CoroutineStart.LAZY) {
+        val job = launchGenerationJob(
+            conversationId = conversationId,
+            keepAliveInBackground = message.role == MessageRole.USER || regenerateAssistantMsg,
+        ) {
             try {
                 val conversation = session.state.value
 
@@ -526,7 +563,17 @@ class ChatService(
         val session = getOrCreateSession(conversationId)
         session.getJob()?.cancel()
 
-        val job = appScope.launch(start = CoroutineStart.LAZY) {
+        // 还有别的工具等用户审批时，这轮不会真的继续生成，不需要前台服务。
+        val hasOtherPendingTools = session.state.value.messageNodes.any { node ->
+            node.currentMessage.parts.any { part ->
+                part is UIMessagePart.Tool && part.isPending && part.toolCallId != toolCallId
+            }
+        }
+
+        val job = launchGenerationJob(
+            conversationId = conversationId,
+            keepAliveInBackground = !hasOtherPendingTools,
+        ) {
             try {
                 val conversation = session.state.value
                 val newApprovalState = when {
