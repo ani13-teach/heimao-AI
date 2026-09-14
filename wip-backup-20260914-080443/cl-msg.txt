@@ -1,0 +1,12 @@
+feat(log): replace the debug page with a runtime log page
+
+The debug page only dumped raw state and was not useful in daily use.
+
+Record what actually helps diagnose a bad reply:
+- per-request token usage with cache read/write and hit rate
+- tool call failures, including MCP ones that are swallowed into text
+- crashes, appended on the crashing thread
+
+Entries live in app-private storage and are pruned to the last 24 hours
+on every launch. A log level setting (off / errors only / all) replaces
+the unused developer-mode flag.

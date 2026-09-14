@@ -1,0 +1,737 @@
+package me.rerere.rikkahub.data.datastore
+
+import android.content.Context
+import androidx.datastore.core.IOException
+import androidx.datastore.preferences.SharedPreferencesMigration
+import androidx.datastore.preferences.core.MutablePreferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.preferencesDataStore
+import androidx.datastore.preferences.preferencesDataStoreFile
+import io.pebbletemplates.pebble.PebbleEngine
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
+import me.rerere.ai.core.MessageRole
+import me.rerere.ai.core.ReasoningLevel
+import me.rerere.ai.provider.Model
+import me.rerere.ai.provider.ProviderSetting
+import me.rerere.rikkahub.AppScope
+import me.rerere.rikkahub.data.ai.mcp.McpServerConfig
+import me.rerere.rikkahub.data.ai.prompts.DEFAULT_COMPRESS_PROMPT
+import me.rerere.rikkahub.data.ai.prompts.DEFAULT_OCR_PROMPT
+import me.rerere.rikkahub.data.ai.prompts.DEFAULT_SUGGESTION_PROMPT
+import me.rerere.rikkahub.data.ai.prompts.DEFAULT_TITLE_PROMPT
+import me.rerere.rikkahub.data.ai.prompts.DEFAULT_TRANSLATION_PROMPT
+import me.rerere.rikkahub.data.ai.prompts.LEARNING_MODE_PROMPT
+import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV1Migration
+import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV2Migration
+import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV4Migration
+import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV5Migration
+import me.rerere.rikkahub.data.log.ChatLogLevel
+import me.rerere.rikkahub.data.model.Assistant
+import me.rerere.rikkahub.data.model.Avatar
+import me.rerere.rikkahub.data.model.InjectionPosition
+import me.rerere.rikkahub.data.model.PromptInjection
+import me.rerere.rikkahub.data.model.Tag
+import me.rerere.rikkahub.data.sync.s3.S3Config
+import me.rerere.rikkahub.ui.theme.CustomTheme
+import me.rerere.rikkahub.ui.theme.PresetThemes
+import me.rerere.rikkahub.utils.JsonInstant
+import me.rerere.rikkahub.utils.toMutableStateFlow
+import me.rerere.search.SearchCommonOptions
+import me.rerere.search.SearchServiceOptions
+import org.koin.core.component.KoinComponent
+import org.koin.core.component.get
+import java.io.File
+import kotlin.uuid.Uuid
+
+internal const val SETTINGS_DATASTORE_NAME = "settings"
+
+internal fun settingsDataStoreFile(context: Context): File =
+    context.preferencesDataStoreFile(SETTINGS_DATASTORE_NAME)
+
+private val Context.settingsStore by preferencesDataStore(
+    name = SETTINGS_DATASTORE_NAME,
+    produceMigrations = { context ->
+        listOf(
+            PreferenceStoreV1Migration(),
+            PreferenceStoreV2Migration(),
+            PreferenceStoreV4Migration(),
+            PreferenceStoreV5Migration(),
+        )
+    }
+)
+
+private fun MutablePreferences.writeSettings(settings: Settings) {
+    this[SettingsStore.DYNAMIC_COLOR] = settings.dynamicColor
+    this[SettingsStore.THEME_ID] = settings.themeId
+    this[SettingsStore.CUSTOM_THEMES] = JsonInstant.encodeToString(settings.customThemes)
+    this[SettingsStore.DISPLAY_SETTING] = JsonInstant.encodeToString(settings.displaySetting)
+    this[SettingsStore.CHAT_LOG_LEVEL] = settings.chatLogLevel.name
+    this[SettingsStore.PROMPT_CACHE_ENABLED] = settings.promptCacheEnabled
+    this[SettingsStore.AUTO_RETRY_ENABLED] = settings.autoRetryEnabled
+    this[SettingsStore.AUTO_RETRY_INTERVAL_SECONDS] = settings.autoRetryIntervalSeconds
+    this[SettingsStore.AUTO_RETRY_MAX_DURATION_MINUTES] = settings.autoRetryMaxDurationMinutes
+
+    this[SettingsStore.FAVORITE_MODELS] = JsonInstant.encodeToString(settings.favoriteModels)
+    this[SettingsStore.SELECT_MODEL] = settings.chatModelId.toString()
+    this[SettingsStore.FAST_MODEL] = settings.fastModelId.toString()
+    settings.titleModelId?.let {
+        this[SettingsStore.TITLE_MODEL] = it.toString()
+    } ?: remove(SettingsStore.TITLE_MODEL)
+    this[SettingsStore.TRANSLATE_MODEL] = settings.translateModeId.toString()
+    this[SettingsStore.ENABLE_SUGGESTION] = settings.enableSuggestion
+    settings.suggestionModelId?.let {
+        this[SettingsStore.SUGGESTION_MODEL] = it.toString()
+    } ?: remove(SettingsStore.SUGGESTION_MODEL)
+    this[SettingsStore.IMAGE_GENERATION_MODEL] = settings.imageGenerationModelId.toString()
+    this[SettingsStore.TITLE_PROMPT] = settings.titlePrompt
+    this[SettingsStore.TRANSLATION_PROMPT] = settings.translatePrompt
+    this[SettingsStore.TRANSLATE_THINKING_BUDGET] = settings.translateThinkingBudget
+    this[SettingsStore.SUGGESTION_PROMPT] = settings.suggestionPrompt
+    this[SettingsStore.OCR_MODEL] = settings.ocrModelId.toString()
+    this[SettingsStore.OCR_PROMPT] = settings.ocrPrompt
+    this[SettingsStore.COMPRESS_MODEL] = settings.compressModelId.toString()
+    this[SettingsStore.COMPRESS_PROMPT] = settings.compressPrompt
+
+    this[SettingsStore.PROVIDERS] = JsonInstant.encodeToString(settings.providers)
+
+    this[SettingsStore.ASSISTANTS] = JsonInstant.encodeToString(settings.assistants)
+    this[SettingsStore.SELECT_ASSISTANT] = settings.assistantId.toString()
+    this[SettingsStore.ASSISTANT_TAGS] = JsonInstant.encodeToString(settings.assistantTags)
+
+    this[SettingsStore.SEARCH_SERVICES] = JsonInstant.encodeToString(settings.searchServices)
+    this[SettingsStore.SEARCH_COMMON] = JsonInstant.encodeToString(settings.searchCommonOptions)
+    this[SettingsStore.SEARCH_SELECTED] = settings.searchServiceSelected.coerceIn(0, settings.searchServices.size - 1)
+
+    this[SettingsStore.MCP_SERVERS] = JsonInstant.encodeToString(settings.mcpServers)
+    this[SettingsStore.WEBDAV_CONFIG] = JsonInstant.encodeToString(settings.webDavConfig)
+    this[SettingsStore.S3_CONFIG] = JsonInstant.encodeToString(settings.s3Config)
+    this[SettingsStore.MODE_INJECTIONS] = JsonInstant.encodeToString(settings.modeInjections)
+    this[SettingsStore.BACKUP_REMINDER_CONFIG] = JsonInstant.encodeToString(settings.backupReminderConfig)
+    this[SettingsStore.LAUNCH_COUNT] = settings.launchCount
+}
+
+/**
+ * Restores settings without constructing [SettingsStore] or touching Koin. The same DataStore
+ * delegate and Preferences serialization path used by [SettingsStore] are deliberately reused.
+ */
+internal suspend fun restoreSettingsDataStore(context: Context, settings: Settings) {
+    context.settingsStore.edit { preferences ->
+        preferences.writeSettings(settings)
+    }
+}
+
+class SettingsStore(
+    context: Context,
+    scope: AppScope,
+) : KoinComponent {
+    companion object {
+        // 版本号
+        val VERSION = intPreferencesKey("data_version")
+
+        // UI设置
+        val DYNAMIC_COLOR = booleanPreferencesKey("dynamic_color")
+        val THEME_ID = stringPreferencesKey("theme_id")
+        val CUSTOM_THEMES = stringPreferencesKey("custom_themes")
+        val DISPLAY_SETTING = stringPreferencesKey("display_setting")
+        val CHAT_LOG_LEVEL = stringPreferencesKey("chat_log_level")
+        val PROMPT_CACHE_ENABLED = booleanPreferencesKey("prompt_cache_enabled")
+
+        // 自动重试
+        val AUTO_RETRY_ENABLED = booleanPreferencesKey("auto_retry_enabled")
+        val AUTO_RETRY_INTERVAL_SECONDS = intPreferencesKey("auto_retry_interval_seconds")
+        val AUTO_RETRY_MAX_DURATION_MINUTES = intPreferencesKey("auto_retry_max_duration_minutes")
+
+        // 模型选择
+        val FAVORITE_MODELS = stringPreferencesKey("favorite_models")
+        val SELECT_MODEL = stringPreferencesKey("chat_model")
+        val FAST_MODEL = stringPreferencesKey("fast_model")
+        val TITLE_MODEL = stringPreferencesKey("title_model")
+        val TRANSLATE_MODEL = stringPreferencesKey("translate_model")
+        val ENABLE_SUGGESTION = booleanPreferencesKey("enable_suggestion")
+        val SUGGESTION_MODEL = stringPreferencesKey("suggestion_model")
+        val IMAGE_GENERATION_MODEL = stringPreferencesKey("image_generation_model")
+        val TITLE_PROMPT = stringPreferencesKey("title_prompt")
+        val TRANSLATION_PROMPT = stringPreferencesKey("translation_prompt")
+        val TRANSLATE_THINKING_BUDGET = intPreferencesKey("translate_thinking_budget")
+        val SUGGESTION_PROMPT = stringPreferencesKey("suggestion_prompt")
+        val OCR_MODEL = stringPreferencesKey("ocr_model")
+        val OCR_PROMPT = stringPreferencesKey("ocr_prompt")
+        val COMPRESS_MODEL = stringPreferencesKey("compress_model")
+        val COMPRESS_PROMPT = stringPreferencesKey("compress_prompt")
+
+        // 提供商
+        val PROVIDERS = stringPreferencesKey("providers")
+
+        // 助手
+        val SELECT_ASSISTANT = stringPreferencesKey("select_assistant")
+        val ASSISTANTS = stringPreferencesKey("assistants")
+        val ASSISTANT_TAGS = stringPreferencesKey("assistant_tags")
+
+        // 搜索
+        val SEARCH_SERVICES = stringPreferencesKey("search_services")
+        val SEARCH_COMMON = stringPreferencesKey("search_common")
+        val SEARCH_SELECTED = intPreferencesKey("search_selected")
+
+        // MCP
+        val MCP_SERVERS = stringPreferencesKey("mcp_servers")
+
+        // WebDAV
+        val WEBDAV_CONFIG = stringPreferencesKey("webdav_config")
+
+        // S3
+        val S3_CONFIG = stringPreferencesKey("s3_config")
+
+        // 提示词注入
+        val MODE_INJECTIONS = stringPreferencesKey("mode_injections")
+
+        // 备份提醒
+        val BACKUP_REMINDER_CONFIG = stringPreferencesKey("backup_reminder_config")
+
+        // 统计
+        val LAUNCH_COUNT = intPreferencesKey("launch_count")
+    }
+
+    private val dataStore = context.settingsStore
+    private val writeMutex = Mutex()
+
+    private val settingsFlowFailFast = dataStore.data
+        .map { preferences ->
+            Settings(
+                favoriteModels = preferences[FAVORITE_MODELS]?.let {
+                    JsonInstant.decodeFromString(it)
+                } ?: emptyList(),
+                chatModelId = preferences[SELECT_MODEL]?.let { Uuid.parse(it) }
+                    ?: DEFAULT_AUTO_MODEL_ID,
+                fastModelId = preferences[FAST_MODEL]?.let { Uuid.parse(it) }
+                    ?: DEFAULT_AUTO_MODEL_ID,
+                titleModelId = preferences[TITLE_MODEL]?.let { Uuid.parse(it) },
+                translateModeId = preferences[TRANSLATE_MODEL]?.let { Uuid.parse(it) }
+                    ?: DEFAULT_AUTO_MODEL_ID,
+                enableSuggestion = preferences[ENABLE_SUGGESTION] != false,
+                suggestionModelId = preferences[SUGGESTION_MODEL]?.let { Uuid.parse(it) },
+                imageGenerationModelId = preferences[IMAGE_GENERATION_MODEL]?.let { Uuid.parse(it) } ?: Uuid.random(),
+                titlePrompt = preferences[TITLE_PROMPT] ?: DEFAULT_TITLE_PROMPT,
+                translatePrompt = preferences[TRANSLATION_PROMPT] ?: DEFAULT_TRANSLATION_PROMPT,
+                translateThinkingBudget = preferences[TRANSLATE_THINKING_BUDGET] ?: 0,
+                suggestionPrompt = preferences[SUGGESTION_PROMPT] ?: DEFAULT_SUGGESTION_PROMPT,
+                ocrModelId = preferences[OCR_MODEL]?.let { Uuid.parse(it) } ?: Uuid.random(),
+                ocrPrompt = preferences[OCR_PROMPT] ?: DEFAULT_OCR_PROMPT,
+                compressModelId = preferences[COMPRESS_MODEL]?.let { Uuid.parse(it) } ?: DEFAULT_AUTO_MODEL_ID,
+                compressPrompt = preferences[COMPRESS_PROMPT] ?: DEFAULT_COMPRESS_PROMPT,
+                assistantId = preferences[SELECT_ASSISTANT]?.let { Uuid.parse(it) }
+                    ?: DEFAULT_ASSISTANT_ID,
+                assistantTags = preferences[ASSISTANT_TAGS]?.let {
+                    JsonInstant.decodeFromString(it)
+                } ?: emptyList(),
+                providers = JsonInstant.decodeFromString(preferences[PROVIDERS] ?: "[]"),
+                assistants = JsonInstant.decodeFromString(preferences[ASSISTANTS] ?: "[]"),
+                dynamicColor = preferences[DYNAMIC_COLOR] != false,
+                themeId = preferences[THEME_ID] ?: PresetThemes[0].id,
+                customThemes = preferences[CUSTOM_THEMES]?.let {
+                    JsonInstant.decodeFromString(it)
+                } ?: emptyList(),
+                displaySetting = JsonInstant.decodeFromString(preferences[DISPLAY_SETTING] ?: "{}"),
+                chatLogLevel = preferences[CHAT_LOG_LEVEL]
+                    ?.let { runCatching { ChatLogLevel.valueOf(it) }.getOrNull() }
+                    ?: ChatLogLevel.ALL,
+                promptCacheEnabled = preferences[PROMPT_CACHE_ENABLED] != false,
+                searchServices = preferences[SEARCH_SERVICES]?.let {
+                    JsonInstant.decodeFromString(it)
+                } ?: listOf(SearchServiceOptions.DEFAULT),
+                searchCommonOptions = preferences[SEARCH_COMMON]?.let {
+                    JsonInstant.decodeFromString(it)
+                } ?: SearchCommonOptions(),
+                searchServiceSelected = preferences[SEARCH_SELECTED] ?: 0,
+                mcpServers = preferences[MCP_SERVERS]?.let {
+                    JsonInstant.decodeFromString(it)
+                } ?: emptyList(),
+                webDavConfig = preferences[WEBDAV_CONFIG]?.let {
+                    JsonInstant.decodeFromString(it)
+                } ?: WebDavConfig(),
+                s3Config = preferences[S3_CONFIG]?.let {
+                    JsonInstant.decodeFromString(it)
+                } ?: S3Config(),
+                modeInjections = preferences[MODE_INJECTIONS]?.let {
+                    JsonInstant.decodeFromString(it)
+                } ?: emptyList(),
+                backupReminderConfig = preferences[BACKUP_REMINDER_CONFIG]?.let {
+                    JsonInstant.decodeFromString(it)
+                } ?: BackupReminderConfig(),
+                launchCount = preferences[LAUNCH_COUNT] ?: 0,
+                autoRetryEnabled = preferences[AUTO_RETRY_ENABLED] != false,
+                autoRetryIntervalSeconds = preferences[AUTO_RETRY_INTERVAL_SECONDS]
+                    ?: Settings.DEFAULT_AUTO_RETRY_INTERVAL_SECONDS,
+                autoRetryMaxDurationMinutes = preferences[AUTO_RETRY_MAX_DURATION_MINUTES]
+                    ?: Settings.DEFAULT_AUTO_RETRY_MAX_DURATION_MINUTES,
+            )
+        }
+        .map {
+            var providers = it.providers.ifEmpty { DEFAULT_PROVIDERS }.toMutableList()
+            DEFAULT_PROVIDERS.forEach { defaultProvider ->
+                if (providers.none { it.id == defaultProvider.id }) {
+                    providers.add(defaultProvider.copyProvider())
+                }
+            }
+            providers = providers.map { provider ->
+                val defaultProvider = DEFAULT_PROVIDERS.find { it.id == provider.id }
+                if (defaultProvider != null) {
+                    provider.copyProvider(
+                        name = if (
+                            defaultProvider.id == DEFAULT_BRANDED_PROVIDER_ID && provider.name == "RikkaHub"
+                        ) defaultProvider.name else provider.name,
+                        builtIn = defaultProvider.builtIn,
+                        description = defaultProvider.description,
+                        shortDescription = defaultProvider.shortDescription,
+                    )
+                } else provider
+            }.toMutableList()
+            val assistants = it.assistants.ifEmpty { DEFAULT_ASSISTANTS }.toMutableList()
+            DEFAULT_ASSISTANTS.forEach { defaultAssistant ->
+                if (assistants.none { it.id == defaultAssistant.id }) {
+                    assistants.add(defaultAssistant.copy())
+                }
+            }
+            it.copy(
+                providers = providers,
+                assistants = assistants,
+            ).resolveLegacyModelTransports()
+        }
+        .map { settings ->
+            // 去重并清理无效引用
+            val validMcpServerIds = settings.mcpServers.map { it.id }.toSet()
+            val validModeInjectionIds = settings.modeInjections.map { it.id }.toSet()
+            settings.copy(
+                providers = settings.providers.distinctBy { it.id }.map { provider ->
+                    when (provider) {
+                        is ProviderSetting.OpenAI -> provider.copy(
+                            models = provider.models.distinctBy { model -> model.id }
+                        )
+
+                        is ProviderSetting.Google -> provider.copy(
+                            models = provider.models.distinctBy { model -> model.id }
+                        )
+
+                        is ProviderSetting.Claude -> provider.copy(
+                            models = provider.models.distinctBy { model -> model.id }
+                        )
+                    }
+                },
+                assistants = settings.assistants.distinctBy { it.id }.map { assistant ->
+                    assistant.copy(
+                        // 过滤掉不存在的 MCP 服务器 ID
+                        mcpServers = assistant.mcpServers.filter { serverId ->
+                            serverId in validMcpServerIds
+                        }.toSet(),
+                        // 过滤掉不存在的模式注入 ID
+                        modeInjectionIds = assistant.modeInjectionIds.filter { id ->
+                            id in validModeInjectionIds
+                        }.toSet(),
+                    )
+                },
+                favoriteModels = settings.favoriteModels.filter { uuid ->
+                    settings.providers.flatMap { it.models }.any { it.id == uuid }
+                },
+                modeInjections = settings.modeInjections.distinctBy { it.id },
+            )
+        }
+
+    val settingsFlowRaw = settingsFlowFailFast.catch { exception ->
+        if (exception is IOException) {
+            emit(Settings())
+        } else {
+            throw exception
+        }
+    }
+
+    val settingsFlow = settingsFlowRaw
+        .distinctUntilChanged()
+        .toMutableStateFlow(scope, Settings.dummy())
+
+    /** Reads decoded persisted settings without replacing I/O or serialization failures with defaults. */
+    suspend fun readPersistedSettingsFailFast(): Settings = settingsFlowFailFast.first()
+
+    /** Serializes runtime writers and applies [transform] to the latest persisted value. */
+    suspend fun transformLatest(transform: (Settings) -> Settings): Settings = writeMutex.withLock {
+        val current = readPersistedSettingsFailFast()
+        val updated = transform(current)
+        if (updated == current) return@withLock current
+        require(!updated.init) { "Cannot persist dummy settings" }
+        dataStore.edit { preferences ->
+            preferences.writeSettings(updated)
+        }
+        get<PebbleEngine>().templateCache.invalidateAll()
+        updated
+    }
+
+    class AuthoritativeRestoreTransaction internal constructor(
+        private val store: SettingsStore,
+    ) {
+        suspend fun replace(settings: Settings) {
+            store.replaceAuthoritativelyForRestoreLocked(settings)
+        }
+    }
+
+    /**
+     * Holds the settings writer lock from rollback-baseline capture through restore commit or
+     * compensation. This prevents an unrelated settings edit from being lost to an old snapshot.
+     */
+    suspend fun <T> withAuthoritativeRestoreTransaction(
+        block: suspend AuthoritativeRestoreTransaction.(Settings) -> T,
+    ): T = writeMutex.withLock {
+        AuthoritativeRestoreTransaction(this).block(readPersistedSettingsFailFast())
+    }
+
+    /** Quiesced restore-only replacement; normal runtime code must use [transformLatest]. */
+    suspend fun replaceAuthoritativelyForRestore(settings: Settings) = writeMutex.withLock {
+        replaceAuthoritativelyForRestoreLocked(settings)
+    }
+
+    private suspend fun replaceAuthoritativelyForRestoreLocked(settings: Settings) {
+        require(!settings.init) { "Cannot persist dummy settings" }
+        dataStore.edit { preferences ->
+            preferences.writeSettings(settings)
+        }
+        get<PebbleEngine>().templateCache.invalidateAll()
+    }
+
+    suspend fun update(fn: (Settings) -> Settings): Settings = transformLatest(fn)
+
+    suspend fun updateAssistant(assistantId: Uuid) {
+        transformLatest { settings -> settings.copy(assistantId = assistantId) }
+    }
+
+    suspend fun updateAssistantModel(assistantId: Uuid, modelId: Uuid) {
+        update { settings ->
+            settings.copy(
+                assistants = settings.assistants.map { assistant ->
+                    if (assistant.id == assistantId) {
+                        assistant.copy(chatModelId = modelId)
+                    } else {
+                        assistant
+                    }
+                }
+            )
+        }
+    }
+
+    suspend fun updateAssistantReasoningLevel(assistantId: Uuid, reasoningLevel: ReasoningLevel) {
+        update { settings ->
+            settings.copy(
+                assistants = settings.assistants.map { assistant ->
+                    if (assistant.id == assistantId) {
+                        assistant.copy(reasoningLevel = reasoningLevel)
+                    } else {
+                        assistant
+                    }
+                }
+            )
+        }
+    }
+
+    suspend fun updateAssistantWebSearch(assistantId: Uuid, enabled: Boolean) {
+        update { settings ->
+            settings.copy(
+                assistants = settings.assistants.map { assistant ->
+                    if (assistant.id == assistantId) {
+                        assistant.copy(enableWebSearch = enabled)
+                    } else {
+                        assistant
+                    }
+                }
+            )
+        }
+    }
+
+    suspend fun updateAssistantMcpServers(assistantId: Uuid, mcpServers: Set<Uuid>) {
+        update { settings ->
+            settings.copy(
+                assistants = settings.assistants.map { assistant ->
+                    if (assistant.id == assistantId) {
+                        assistant.copy(mcpServers = mcpServers)
+                    } else {
+                        assistant
+                    }
+                }
+            )
+        }
+    }
+
+    suspend fun updateAssistantInjections(
+        assistantId: Uuid,
+        modeInjectionIds: Set<Uuid>,
+    ) {
+        update { settings ->
+            settings.copy(
+                assistants = settings.assistants.map { assistant ->
+                    if (assistant.id == assistantId) {
+                        assistant.copy(
+                            modeInjectionIds = modeInjectionIds,
+                        )
+                    } else {
+                        assistant
+                    }
+                }
+            )
+        }
+    }
+}
+
+internal fun Settings.resolveLegacyModelTransports(): Settings {
+    if (providers.none { provider -> provider.models.any { it.streamOutput == null } }) {
+        return this
+    }
+
+    val legacyTransportByModelId = assistants
+        .groupBy { assistant -> assistant.chatModelId ?: chatModelId }
+        .mapValues { (_, modelAssistants) ->
+            // A model can now have only one transport. If old assistants disagreed,
+            // non-streaming is the conservative choice for relay compatibility.
+            modelAssistants.all { assistant -> assistant.streamOutput }
+        }
+
+    return copy(
+        providers = providers.map { provider ->
+            provider.copyProvider(
+                models = provider.models.map { model ->
+                    model.copy(
+                        streamOutput = model.streamOutput
+                            ?: legacyTransportByModelId[model.id]
+                            ?: true,
+                    )
+                }
+            )
+        }
+    )
+}
+
+@Serializable
+data class Settings(
+    @Transient
+    val init: Boolean = false,
+    val dynamicColor: Boolean = true,
+    val themeId: String = PresetThemes[0].id,
+    val customThemes: List<CustomTheme> = emptyList(),
+    val displaySetting: DisplaySetting = DisplaySetting(),
+    /** 运行日志等级：关 / 只记错误 / 全记。 */
+    val chatLogLevel: ChatLogLevel = ChatLogLevel.ALL,
+    val promptCacheEnabled: Boolean = true,
+    /** 生成失败后是否自动重试。 */
+    val autoRetryEnabled: Boolean = true,
+    /** 两次尝试之间的等待秒数。 */
+    val autoRetryIntervalSeconds: Int = DEFAULT_AUTO_RETRY_INTERVAL_SECONDS,
+    /** 从首次失败算起，允许重试的总分钟数。 */
+    val autoRetryMaxDurationMinutes: Int = DEFAULT_AUTO_RETRY_MAX_DURATION_MINUTES,
+    val favoriteModels: List<Uuid> = emptyList(),
+    val chatModelId: Uuid = Uuid.random(),
+    val fastModelId: Uuid = Uuid.random(),
+    val titleModelId: Uuid? = null,
+    val imageGenerationModelId: Uuid = Uuid.random(),
+    val titlePrompt: String = DEFAULT_TITLE_PROMPT,
+    val translateModeId: Uuid = Uuid.random(),
+    val translatePrompt: String = DEFAULT_TRANSLATION_PROMPT,
+    val translateThinkingBudget: Int = 0,
+    val enableSuggestion: Boolean = true,
+    val suggestionModelId: Uuid? = null,
+    val suggestionPrompt: String = DEFAULT_SUGGESTION_PROMPT,
+    val ocrModelId: Uuid = Uuid.random(),
+    val ocrPrompt: String = DEFAULT_OCR_PROMPT,
+    val compressModelId: Uuid = Uuid.random(),
+    val compressPrompt: String = DEFAULT_COMPRESS_PROMPT,
+    val assistantId: Uuid = DEFAULT_ASSISTANT_ID,
+    val providers: List<ProviderSetting> = DEFAULT_PROVIDERS,
+    val assistants: List<Assistant> = DEFAULT_ASSISTANTS,
+    val assistantTags: List<Tag> = emptyList(),
+    val searchServices: List<SearchServiceOptions> = listOf(SearchServiceOptions.DEFAULT),
+    val searchCommonOptions: SearchCommonOptions = SearchCommonOptions(),
+    val searchServiceSelected: Int = 0,
+    val mcpServers: List<McpServerConfig> = emptyList(),
+    val webDavConfig: WebDavConfig = WebDavConfig(),
+    val s3Config: S3Config = S3Config(),
+    val modeInjections: List<PromptInjection.ModeInjection> = DEFAULT_MODE_INJECTIONS,
+    val backupReminderConfig: BackupReminderConfig = BackupReminderConfig(),
+    val launchCount: Int = 0,
+) {
+    companion object {
+        const val DEFAULT_AUTO_RETRY_INTERVAL_SECONDS = 3
+        const val DEFAULT_AUTO_RETRY_MAX_DURATION_MINUTES = 2
+
+        // 构造一个用于初始化的settings, 但它不能用于保存，防止使用初始值存储
+        fun dummy() = Settings(init = true)
+    }
+}
+
+@Serializable
+enum class ChatFontFamily {
+    @SerialName("default")
+    DEFAULT,
+    @SerialName("serif")
+    SERIF,
+    @SerialName("monospace")
+    MONOSPACE,
+
+    @SerialName("custom")
+    CUSTOM,
+}
+
+@Serializable
+data class DisplaySetting(
+    val userAvatar: Avatar = Avatar.Dummy,
+    val userNickname: String = "",
+    val useAppIconStyleLoadingIndicator: Boolean = true,
+    val showUserAvatar: Boolean = true,
+    val showAssistantBubble: Boolean = false,
+    val bubbleOpacity: Float = 1.0f,
+    val showModelIcon: Boolean = true,
+    val showModelName: Boolean = true,
+    val showDateTimeInMessage: Boolean = false,
+    val showTokenUsage: Boolean = true,
+    val showThinkingContent: Boolean = true,
+    val autoCloseThinking: Boolean = true,
+    val showMessageJumper: Boolean = true,
+    val messageJumperOnLeft: Boolean = false,
+    val fontSizeRatio: Float = 1.0f,
+    val enableMessageGenerationHapticEffect: Boolean = false,
+    val skipCropImage: Boolean = true,
+    val enableNotificationOnMessageGeneration: Boolean = false,
+    val enableLiveUpdateNotification: Boolean = false,
+    val codeBlockAutoWrap: Boolean = false,
+    val codeBlockAutoCollapse: Boolean = false,
+    val showLineNumbers: Boolean = false,
+    val pasteLongTextAsFile: Boolean = false,
+    val pasteLongTextThreshold: Int = 1000,
+    val sendOnEnter: Boolean = false,
+    val enableAutoScroll: Boolean = true,
+    val enableLatexRendering: Boolean = true,
+    val enableBlurEffect: Boolean = false,
+    val chatFontFamily: ChatFontFamily = ChatFontFamily.DEFAULT,
+    val chatCustomFontPath: String = "",
+    val chatCustomFontName: String = "",
+    val enableVolumeKeyScroll: Boolean = false,
+    val volumeKeyScrollRatio: Float = 1.0f,
+)
+
+@Serializable
+data class WebDavConfig(
+    val url: String = "",
+    val username: String = "",
+    val password: String = "",
+    val path: String = "rikkahub_backups",
+    val items: List<BackupItem> = listOf(
+        BackupItem.DATABASE,
+        BackupItem.FILES
+    ),
+) {
+    @Serializable
+    enum class BackupItem {
+        DATABASE,
+        FILES,
+    }
+}
+
+@Serializable
+data class BackupReminderConfig(
+    val enabled: Boolean = false,
+    val intervalDays: Int = 7,
+    val lastBackupTime: Long = 0L,
+)
+
+fun Settings.isNotConfigured() = providers.all { it.models.isEmpty() }
+
+fun Settings.findModelById(uuid: Uuid?, fallback: Uuid? = null): Model? {
+    if (uuid == null && fallback == null) return null
+    return uuid?.let { this.providers.findModelById(it) }
+        ?: fallback?.let { this.providers.findModelById(it) }
+}
+
+fun List<ProviderSetting>.findModelById(uuid: Uuid): Model? {
+    this.forEach { setting ->
+        setting.models.forEach { model ->
+            if (model.id == uuid) {
+                return model
+            }
+        }
+    }
+    return null
+}
+
+fun Settings.getCurrentChatModel(): Model? {
+    return findModelById(this.getCurrentAssistant().chatModelId ?: this.chatModelId)
+}
+
+fun Settings.getCurrentAssistant(): Assistant {
+    return this.assistants.find { it.id == assistantId } ?: this.assistants.first()
+}
+
+fun Settings.getAssistantById(id: Uuid): Assistant? {
+    return this.assistants.find { it.id == id }
+}
+
+fun Model.findProvider(providers: List<ProviderSetting>, checkOverwrite: Boolean = true): ProviderSetting? {
+    val provider = findModelProviderFromList(providers) ?: return null
+    val providerOverwrite = this.providerOverwrite
+    if (checkOverwrite && providerOverwrite != null) {
+        return providerOverwrite.copyProvider(models = emptyList())
+    }
+    return provider
+}
+
+private fun Model.findModelProviderFromList(providers: List<ProviderSetting>): ProviderSetting? {
+    providers.forEach { setting ->
+        setting.models.forEach { model ->
+            if (model.id == this.id) {
+                return setting
+            }
+        }
+    }
+    return null
+}
+
+internal val DEFAULT_ASSISTANT_ID = Uuid.parse("0950e2dc-9bd5-4801-afa3-aa887aa36b4e")
+internal val DEFAULT_ASSISTANTS = listOf(
+    Assistant(
+        id = DEFAULT_ASSISTANT_ID,
+        name = "",
+        systemPrompt = ""
+    ),
+    Assistant(
+        id = Uuid.parse("3d47790c-c415-4b90-9388-751128adb0a0"),
+        name = "",
+        systemPrompt = """
+            You are a helpful assistant, called {{char}}, based on model {{model_name}}.
+
+            ## Info
+            - Date: {{cur_date}}
+            - Locale: {{locale}}
+            - Timezone: {{timezone}}
+            - Device Info: {{device_info}}
+            - System Version: {{system_version}}
+            - User Nickname: {{user}}
+
+            ## Hint
+            - If the user does not specify a language, reply in the user's primary language.
+            - Remember to use Markdown syntax for formatting, and use latex for mathematical expressions.
+        """.trimIndent()
+    ),
+)
+
+internal val DEFAULT_ASSISTANTS_IDS = DEFAULT_ASSISTANTS.map { it.id }
+
+val DEFAULT_MODE_INJECTIONS = listOf(
+    PromptInjection.ModeInjection(
+        id = Uuid.parse("b87eaf16-f5cd-4ac1-9e4f-b11ae3a61d74"),
+        content = LEARNING_MODE_PROMPT,
+        position = InjectionPosition.AFTER_SYSTEM_PROMPT,
+        name = "Learning Mode"
+    )
+)

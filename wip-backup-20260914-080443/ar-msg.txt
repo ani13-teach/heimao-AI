@@ -1,0 +1,5 @@
+feat(retry): let the user cap how many times a request is retried
+
+Auto retry already respected a fixed 10-attempt ceiling that could not be
+changed from the UI. Expose it next to the interval and time-budget
+controls as a slider from 2 to 20 attempts, defaulting to 10.

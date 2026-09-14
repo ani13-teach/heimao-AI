@@ -1,0 +1,2814 @@
+diff --git a/ai/src/main/java/me/rerere/ai/provider/ProviderSetting.kt b/ai/src/main/java/me/rerere/ai/provider/ProviderSetting.kt
+index c36df35f..5d7914aa 100644
+--- a/ai/src/main/java/me/rerere/ai/provider/ProviderSetting.kt
++++ b/ai/src/main/java/me/rerere/ai/provider/ProviderSetting.kt
+@@ -65,6 +65,8 @@ sealed class ProviderSetting {
+         var chatCompletionsPath: String = "/chat/completions",
+         var useResponseApi: Boolean = false,
+         var includeHistoryReasoning: Boolean = true,
++        /** 是否把 `prompt_cache_key` 发给这个上游，默认只发给已确认支持的上游。 */
++        var promptCacheRouting: PromptCacheRouting = PromptCacheRouting.AUTO,
+     ) : ProviderSetting() {
+         override fun addModel(model: Model): ProviderSetting {
+             return copy(models = models + model)
+diff --git a/ai/src/main/java/me/rerere/ai/provider/RetryPolicy.kt b/ai/src/main/java/me/rerere/ai/provider/RetryPolicy.kt
+index 35c10bf1..40eeb86c 100644
+--- a/ai/src/main/java/me/rerere/ai/provider/RetryPolicy.kt
++++ b/ai/src/main/java/me/rerere/ai/provider/RetryPolicy.kt
+@@ -3,6 +3,7 @@ package me.rerere.ai.provider
+ import java.io.IOException
+ import kotlinx.coroutines.CancellationException
+ import me.rerere.ai.util.HttpException
++import me.rerere.ai.util.PromptCacheKeyRejectedException
+ 
+ /**
+  * 用户可配置的自动重试参数。
+@@ -53,10 +54,14 @@ private val RETRYABLE_STATUS_CODES = setOf(408, 409, 425, 429)
+  * 传输层失败（连接中断、超时、流提前结束）与限流、服务端错误可以重试；
+  * 配置类错误（无效密钥、请求格式错误）立即上报，不消耗重试预算。
+  * 取消永远不重试。
++ *
++ * 唯一一个例外是上游不认 `prompt_cache_key`：去掉这个字段再试一次真能成功，
++ * 去字段后的重试会在下一次构造请求时生效（见 [PromptCacheKeyRejection]）。
+  */
+ fun isRetryableFailure(error: Throwable): Boolean = when (error) {
+     is CancellationException -> false
+     is IOException -> true
++    is PromptCacheKeyRejectedException -> true
+     is HttpException -> error.status.isRetryableStatus()
+     else -> false
+ }
+diff --git a/ai/src/main/java/me/rerere/ai/provider/providers/openai/ChatCompletionsAPI.kt b/ai/src/main/java/me/rerere/ai/provider/providers/openai/ChatCompletionsAPI.kt
+index 38215ad0..fc876f4b 100644
+--- a/ai/src/main/java/me/rerere/ai/provider/providers/openai/ChatCompletionsAPI.kt
++++ b/ai/src/main/java/me/rerere/ai/provider/providers/openai/ChatCompletionsAPI.kt
+@@ -37,6 +37,8 @@ import me.rerere.ai.provider.ModelAbility
+ import me.rerere.ai.provider.ProviderSetting
+ import me.rerere.ai.provider.TextGenerationResult
+ import me.rerere.ai.provider.TextGenerationParams
++import me.rerere.ai.provider.promptCacheKeyFailure
++import me.rerere.ai.provider.resolvePromptCacheKey
+ import me.rerere.ai.provider.stream.SseEvent
+ import me.rerere.ai.provider.providers.PartGroup
+ import me.rerere.ai.provider.providers.groupPartsByToolBoundary
+@@ -103,7 +105,10 @@ class ChatCompletionsAPI(
+ 
+         val response = client.newCall(request).await()
+         if (!response.isSuccessful) {
+-            throw HttpException("Failed to get response: ${response.code} ${response.body?.string()}", response.code)
++            val status = response.code
++            val rawBody = response.body?.string()
++            throw promptCacheKeyFailure(providerSetting, requestBody, status, rawBody)
++                ?: HttpException("Failed to get response: $status $rawBody", status)
+         }
+ 
+         val bodyStr = response.body?.string() ?: ""
+@@ -193,6 +198,11 @@ class ChatCompletionsAPI(
+                 println("[onFailure] 发生错误: ${t?.javaClass?.name} ${t?.message} / $response")
+ 
+                 val bodyRaw = response?.body?.stringSafe()
++                promptCacheKeyFailure(providerSetting, requestBody, response?.code, bodyRaw)?.let { error ->
++                    // 上游不认这个字段：先记下来，再让外层去掉字段重试一次
++                    close(error)
++                    return
++                }
+                 try {
+                     if (!bodyRaw.isNullOrBlank()) {
+                         val bodyElement = Json.parseToJsonElement(bodyRaw)
+@@ -252,9 +262,11 @@ class ChatCompletionsAPI(
+                     supportInputModalities = params.model.inputModalities,
+                 )
+             )
+-            if (params.promptCacheEnabled && !params.promptCacheKey.isNullOrBlank()) {
+-                put("prompt_cache_key", params.promptCacheKey)
+-            }
++            resolvePromptCacheKey(
++                setting = providerSetting,
++                globalEnabled = params.promptCacheEnabled,
++                key = params.promptCacheKey,
++            )?.let { cacheKey -> put("prompt_cache_key", cacheKey) }
+ 
+             if (isModelAllowTemperature(params.model)) {
+                 if (params.temperature != null) put("temperature", params.temperature)
+diff --git a/ai/src/main/java/me/rerere/ai/provider/providers/openai/ResponseAPI.kt b/ai/src/main/java/me/rerere/ai/provider/providers/openai/ResponseAPI.kt
+index 8da7a979..71a45ea0 100644
+--- a/ai/src/main/java/me/rerere/ai/provider/providers/openai/ResponseAPI.kt
++++ b/ai/src/main/java/me/rerere/ai/provider/providers/openai/ResponseAPI.kt
+@@ -33,6 +33,8 @@ import me.rerere.ai.provider.ModelAbility
+ import me.rerere.ai.provider.ProviderSetting
+ import me.rerere.ai.provider.TextGenerationResult
+ import me.rerere.ai.provider.TextGenerationParams
++import me.rerere.ai.provider.promptCacheKeyFailure
++import me.rerere.ai.provider.resolvePromptCacheKey
+ import me.rerere.ai.provider.stream.SseEvent
+ import me.rerere.ai.provider.providers.PartGroup
+ import me.rerere.ai.provider.providers.groupPartsByToolBoundary
+@@ -104,7 +106,10 @@ class ResponseAPI(
+ 
+         val response = client.newCall(request).await()
+         if (!response.isSuccessful) {
+-            throw HttpException("Failed to get response: ${response.code} ${response.body.string()}", response.code)
++            val status = response.code
++            val rawBody = response.body.string()
++            throw promptCacheKeyFailure(providerSetting, requestBody, status, rawBody)
++                ?: HttpException("Failed to get response: $status $rawBody", status)
+         }
+ 
+         val bodyStr = response.body?.string() ?: ""
+@@ -173,6 +178,11 @@ class ResponseAPI(
+                 println("[onFailure] 发生错误: ${t?.javaClass?.name} ${t?.message} / $response")
+ 
+                 val bodyRaw = response?.body?.stringSafe()
++                promptCacheKeyFailure(providerSetting, requestBody, response?.code, bodyRaw)?.let { error ->
++                    // 上游不认这个字段：先记下来，再让外层去掉字段重试一次
++                    close(error)
++                    return
++                }
+                 try {
+                     if (!bodyRaw.isNullOrBlank()) {
+                         val bodyElement = Json.parseToJsonElement(bodyRaw)
+@@ -235,9 +245,11 @@ class ResponseAPI(
+             if (systemParts.isNotEmpty()) {
+                 put("instructions", systemParts.joinToString("\n") { it.text })
+             }
+-            if (params.promptCacheEnabled && !params.promptCacheKey.isNullOrBlank()) {
+-                put("prompt_cache_key", params.promptCacheKey)
+-            }
++            resolvePromptCacheKey(
++                setting = providerSetting,
++                globalEnabled = params.promptCacheEnabled,
++                key = params.promptCacheKey,
++            )?.let { cacheKey -> put("prompt_cache_key", cacheKey) }
+ 
+             // messages
+             put("input", buildMessages(prompt.toProviderMessages(includeSystem = false)))
+diff --git a/ai/src/main/java/me/rerere/ai/ui/Message.kt b/ai/src/main/java/me/rerere/ai/ui/Message.kt
+index 9714d6e7..02b3f5a9 100644
+--- a/ai/src/main/java/me/rerere/ai/ui/Message.kt
++++ b/ai/src/main/java/me/rerere/ai/ui/Message.kt
+@@ -4,6 +4,7 @@ import kotlinx.datetime.LocalDateTime
+ import kotlinx.datetime.TimeZone
+ import kotlinx.datetime.toLocalDateTime
+ import kotlinx.serialization.Serializable
++import kotlinx.serialization.Transient
+ import me.rerere.ai.core.MessageRole
+ import me.rerere.ai.core.TokenUsage
+ import me.rerere.ai.util.json
+@@ -23,7 +24,10 @@ data class UIMessage(
+     val finishedAt: LocalDateTime? = null,
+     val modelId: Uuid? = null,
+     val usage: TokenUsage? = null,
+-    val translation: String? = null
++    val translation: String? = null,
++    // 请求期间临时拼出来的内部消息（系统提示、注入、时间提醒等）；该标记仅在内存中使用，不落库
++    @Transient
++    val isSynthetic: Boolean = false,
+ ) {
+     fun summaryAsText(maxLength: Int = Int.MAX_VALUE): String {
+         val text = "[${role.name}]: " + parts.joinToString(separator = "\n") { part ->
+diff --git a/ai/src/main/java/me/rerere/ai/util/ErrorParser.kt b/ai/src/main/java/me/rerere/ai/util/ErrorParser.kt
+index 1d773edc..cd53d32a 100644
+--- a/ai/src/main/java/me/rerere/ai/util/ErrorParser.kt
++++ b/ai/src/main/java/me/rerere/ai/util/ErrorParser.kt
+@@ -7,7 +7,7 @@ import kotlinx.serialization.json.JsonObject
+ import kotlinx.serialization.json.JsonPrimitive
+ import kotlinx.serialization.json.jsonPrimitive
+ 
+-class HttpException(
++open class HttpException(
+     message: String,
+     /**
+      * HTTP 状态码，未知时为 null。
+@@ -17,6 +17,17 @@ class HttpException(
+     val status: Int? = null,
+ ) : RuntimeException(message)
+ 
++/**
++ * 上游因为不认识的 `prompt_cache_key` 字段拒绝了请求。
++ *
++ * 单独一个类型是为了让重试逻辑知道：去掉这个字段再试一次是真的可能成功的，
++ * 与“密钥错误”这类重试也没用的配置错误不是一回事。
++ */
++class PromptCacheKeyRejectedException(
++    message: String,
++    status: Int? = null,
++) : HttpException(message, status)
++
+ fun JsonElement.parseErrorDetail(status: Int? = null): HttpException {
+     return when (this) {
+         is JsonObject -> {
+diff --git a/ai/src/test/java/me/rerere/ai/provider/RetryPolicyTest.kt b/ai/src/test/java/me/rerere/ai/provider/RetryPolicyTest.kt
+index 81779960..54f35e7a 100644
+--- a/ai/src/test/java/me/rerere/ai/provider/RetryPolicyTest.kt
++++ b/ai/src/test/java/me/rerere/ai/provider/RetryPolicyTest.kt
+@@ -4,6 +4,7 @@ import java.io.IOException
+ import java.net.SocketTimeoutException
+ import kotlinx.coroutines.CancellationException
+ import me.rerere.ai.util.HttpException
++import me.rerere.ai.util.PromptCacheKeyRejectedException
+ import org.junit.Assert.assertEquals
+ import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertNull
+@@ -95,6 +96,12 @@ class RetryPolicyTest {
+         assertFalse(isRetryableFailure(HttpException("bad request", status = 400)))
+     }
+ 
++    @Test
++    fun `retries a prompt cache key rejection so the field can be dropped`() {
++        // 去掉这个字段再试一次真能成功，所以不算“重试也没用”的配置错误
++        assertTrue(isRetryableFailure(PromptCacheKeyRejectedException("unknown field", status = 400)))
++    }
++
+     @Test
+     fun `treats rate limits and server errors as retryable`() {
+         assertTrue(isRetryableFailure(HttpException("rate limited", status = 429)))
+diff --git a/ai/src/test/java/me/rerere/ai/provider/providers/openai/PromptCacheRequestTest.kt b/ai/src/test/java/me/rerere/ai/provider/providers/openai/PromptCacheRequestTest.kt
+index 0fc64ac6..a27002e0 100644
+--- a/ai/src/test/java/me/rerere/ai/provider/providers/openai/PromptCacheRequestTest.kt
++++ b/ai/src/test/java/me/rerere/ai/provider/providers/openai/PromptCacheRequestTest.kt
+@@ -10,6 +10,7 @@ import me.rerere.ai.provider.ClaudeMemoryCacheBlock
+ import me.rerere.ai.provider.LogicalPrompt
+ import me.rerere.ai.provider.Model
+ import me.rerere.ai.provider.ProviderSetting
++import me.rerere.ai.provider.PromptCacheRouting
+ import me.rerere.ai.provider.TextGenerationParams
+ import me.rerere.ai.ui.UIMessage
+ import me.rerere.ai.util.KeyRoulette
+@@ -34,6 +35,7 @@ class PromptCacheRequestTest {
+     private fun buildChatRequest(
+         params: TextGenerationParams,
+         messages: List<UIMessage>,
++        setting: ProviderSetting.OpenAI = ProviderSetting.OpenAI(baseUrl = "https://api.openai.com/v1"),
+     ): JsonObject {
+         val method = ChatCompletionsAPI::class.java.getDeclaredMethod(
+             "buildChatCompletionRequest",
+@@ -47,7 +49,7 @@ class PromptCacheRequestTest {
+             chat,
+             messages,
+             params,
+-            ProviderSetting.OpenAI(baseUrl = "https://api.openai.com/v1"),
++            setting,
+             false,
+         ) as JsonObject
+     }
+@@ -92,6 +94,54 @@ class PromptCacheRequestTest {
+         assertFalse(responseBody.containsKey("cache_control"))
+     }
+ 
++    @Test
++    fun `auto routing keeps the key away from unconfirmed upstreams`() {
++        val params = TextGenerationParams(
++            model = Model(modelId = "gpt-test"),
++            promptCacheEnabled = true,
++            promptCacheKey = "chat_" + "d".repeat(64),
++        )
++        val relay = ProviderSetting.OpenAI(baseUrl = "https://relay.example.com/v1")
++        val messages = listOf(UIMessage.user("hello"))
++
++        assertNull(buildChatRequest(params, messages, relay)["prompt_cache_key"])
++        assertNull(
++            responses.buildRequestBody(relay, messages, params, stream = false)["prompt_cache_key"],
++        )
++    }
++
++    @Test
++    fun `provider override beats auto detection on both adapters`() {
++        val params = TextGenerationParams(
++            model = Model(modelId = "gpt-test"),
++            promptCacheEnabled = true,
++            promptCacheKey = "chat_" + "e".repeat(64),
++        )
++        val messages = listOf(UIMessage.user("hello"))
++        val relay = ProviderSetting.OpenAI(
++            baseUrl = "https://relay.example.com/v1",
++            promptCacheRouting = PromptCacheRouting.ENABLED,
++        )
++        val official = ProviderSetting.OpenAI(
++            baseUrl = "https://api.openai.com/v1",
++            promptCacheRouting = PromptCacheRouting.DISABLED,
++        )
++
++        assertEquals(
++            params.promptCacheKey,
++            buildChatRequest(params, messages, relay)["prompt_cache_key"]?.jsonPrimitive?.content,
++        )
++        assertEquals(
++            params.promptCacheKey,
++            responses.buildRequestBody(relay, messages, params, stream = false)["prompt_cache_key"]
++                ?.jsonPrimitive?.content,
++        )
++        assertNull(buildChatRequest(params, messages, official)["prompt_cache_key"])
++        assertNull(
++            responses.buildRequestBody(official, messages, params, stream = false)["prompt_cache_key"],
++        )
++    }
++
+     @Test
+     fun `Responses and Chat adapters use explicit logical order without explicit cache boundaries`() {
+         val prompt = LogicalPrompt(
+diff --git a/app/src/main/java/me/rerere/rikkahub/RikkaHubApp.kt b/app/src/main/java/me/rerere/rikkahub/RikkaHubApp.kt
+index 3f03caec..0e86659b 100644
+--- a/app/src/main/java/me/rerere/rikkahub/RikkaHubApp.kt
++++ b/app/src/main/java/me/rerere/rikkahub/RikkaHubApp.kt
+@@ -12,6 +12,7 @@ import kotlinx.coroutines.CoroutineName
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+ import me.rerere.rikkahub.data.files.FileFolders
++import me.rerere.rikkahub.data.log.ChatLogStore
+ import java.io.File
+ import kotlinx.coroutines.SupervisorJob
+ import kotlinx.coroutines.cancel
+@@ -104,6 +105,9 @@ class RikkaHubApp : Application() {
+         // cleanup stale tool output files
+         cleanupToolOutputs()
+ 
++        // 清掉过期的运行日志（只留 24 小时）
++        pruneExpiredChatLogs()
++
+         // cleanup workspace temp dirs (proot + rootfs /tmp)
+         cleanupWorkspaceTempDirs()
+ 
+@@ -183,6 +187,16 @@ class RikkaHubApp : Application() {
+         }
+     }
+ 
++    private fun pruneExpiredChatLogs() {
++        get<AppScope>().launch(Dispatchers.IO) {
++            runCatching {
++                get<ChatLogStore>().pruneExpired()
++            }.onFailure {
++                Log.e(TAG, "pruneExpiredChatLogs failed", it)
++            }
++        }
++    }
++
+     private fun syncManagedFiles() {
+         get<AppScope>().launch(Dispatchers.IO) {
+             runCatching {
+diff --git a/app/src/main/java/me/rerere/rikkahub/RouteActivity.kt b/app/src/main/java/me/rerere/rikkahub/RouteActivity.kt
+index 189039d9..4e65b9e2 100644
+--- a/app/src/main/java/me/rerere/rikkahub/RouteActivity.kt
++++ b/app/src/main/java/me/rerere/rikkahub/RouteActivity.kt
+@@ -82,7 +82,7 @@ import me.rerere.rikkahub.ui.pages.assistant.detail.AssistantPromptPage
+ import me.rerere.rikkahub.ui.pages.assistant.detail.AssistantRequestPage
+ import me.rerere.rikkahub.ui.pages.backup.BackupPage
+ import me.rerere.rikkahub.ui.pages.chat.ChatPage
+-import me.rerere.rikkahub.ui.pages.debug.DebugPage
++import me.rerere.rikkahub.ui.pages.chatlog.ChatLogPage
+ import me.rerere.rikkahub.ui.pages.extensions.ExtensionsPage
+ import me.rerere.rikkahub.ui.pages.extensions.PromptPage
+ import me.rerere.rikkahub.ui.pages.extensions.skills.SkillDetailPage
+@@ -228,7 +228,7 @@ class RouteActivity : ComponentActivity() {
+         val toastState = rememberToasterState()
+         val settings by settingsStore.settingsFlow.collectAsStateWithLifecycle()
+         val eventBus = koinInject<AppEventBus>()
+-        LaunchedEffect(eventBus) {
++        LaunchedEffect(eventBus) {
+             eventBus.events.collect { event ->
+                 when (event) {
+                     is AppEvent.OpenUsageAccessSettings -> this@RouteActivity.openUsageAccessSettings()
+@@ -437,8 +437,8 @@ class RouteActivity : ComponentActivity() {
+                                 SettingFilesPage()
+                             }
+ 
+-                            entry<Screen.Debug> {
+-                                DebugPage()
++                            entry<Screen.ChatLogs> {
++                                ChatLogPage()
+                             }
+ 
+                             entry<Screen.Extensions> {
+@@ -634,7 +634,7 @@ sealed interface Screen : NavKey {
+     data object SettingFiles : Screen
+ 
+     @Serializable
+-    data object Debug : Screen
++    data object ChatLogs : Screen
+ 
+     @Serializable
+     data object Extensions : Screen
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/AutoRetrySettings.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/AutoRetrySettings.kt
+index 0087db37..a5f05c98 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/AutoRetrySettings.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/AutoRetrySettings.kt
+@@ -11,6 +11,10 @@ const val AUTO_RETRY_MAX_INTERVAL_SECONDS = 60
+ const val AUTO_RETRY_MIN_DURATION_MINUTES = 1
+ const val AUTO_RETRY_MAX_DURATION_MINUTES = 30
+ 
++/** 最多尝试次数的可选范围（次，含首次尝试）。 */
++const val AUTO_RETRY_MIN_ATTEMPTS = 2
++const val AUTO_RETRY_MAX_ATTEMPTS = 20
++
+ /**
+  * 把用户设置映射成请求层使用的重试策略。
+  *
+@@ -26,5 +30,7 @@ fun Settings.toRetryPolicy(): RetryPolicy? {
+         maxDurationMillis = autoRetryMaxDurationMinutes
+             .coerceIn(AUTO_RETRY_MIN_DURATION_MINUTES, AUTO_RETRY_MAX_DURATION_MINUTES)
+             .toLong() * 60_000L,
++        maxAttempts = autoRetryMaxAttempts
++            .coerceIn(AUTO_RETRY_MIN_ATTEMPTS, AUTO_RETRY_MAX_ATTEMPTS),
+     )
+ }
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/GenerationHandler.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/GenerationHandler.kt
+index 06671179..f5de45d4 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/GenerationHandler.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/GenerationHandler.kt
+@@ -45,6 +45,7 @@ import me.rerere.rikkahub.data.ai.tools.buildMemoryTools
+ import me.rerere.rikkahub.data.datastore.Settings
+ import me.rerere.rikkahub.data.datastore.findModelById
+ import me.rerere.rikkahub.data.datastore.findProvider
++import me.rerere.rikkahub.data.log.ChatLogStore
+ import me.rerere.rikkahub.data.model.Assistant
+ import me.rerere.rikkahub.data.model.AssistantMemory
+ import me.rerere.rikkahub.data.repository.LayeredMemoryContext
+@@ -61,8 +62,13 @@ private const val TAG = "GenerationHandler"
+ private const val MAX_TOOL_OUTPUT_CHARS = 32 * 1024
+ private const val TOOL_OUTPUT_PREVIEW_CHARS = 4 * 1024
+ private const val MAX_MEMORY_SNAPSHOT_ENTRIES = 32
+-internal const val MEMORY_PATCH_COMPACTION_COUNT = 16
+-internal const val MEMORY_PATCH_COMPACTION_BYTES = 16 * 1024
++/**
++ * Committed patches are re-sent after history, so their tokens are rewritten into the cache on
++ * every turn. Compaction instead rewrites the stable prefix once (system + history).
++ * Break-even is roughly `stable prefix tokens / patch tokens` turns, so accumulate at most one
++ * turn's worth of a medium-size prefix before folding the patches back into the Base.
++ */
++internal const val MEMORY_PATCH_COMPACTION_BYTES = 4 * 1024
+ 
+ 
+ @Serializable
+@@ -90,10 +96,12 @@ internal data class MemoryPromptEntry(
+ 
+ internal data class MemorySnapshotState(
+     val projection: List<MemoryPromptEntry>,
++    /** Stable Memory Base blocks that live before history and stay unchanged across edits. */
+     val cacheBlocks: List<ClaudeMemoryCacheBlock>,
++    /** Committed patches that are re-sent after history so the cached prefix survives edits. */
++    val committedPatches: List<String> = emptyList(),
+     val revision: Long = 0,
+     val lastIssuedRevision: Long = revision,
+-    val patchCount: Int = 0,
+     val patchBytes: Int = 0,
+ ) {
+     val snapshot: List<AssistantMemory>
+@@ -109,10 +117,12 @@ internal data class MemorySnapshotCommit(
+ internal data class MemorySnapshotResolution(
+     /** The current Room projection used by provider-independent flattened prompts. */
+     val snapshot: List<AssistantMemory>,
+-    /** Stable append-only Base/Patch blocks used only by Claude; null keeps legacy fallback. */
++    /** Stable append-only Base blocks used only by Claude; null keeps legacy fallback. */
+     val claudeCacheBlocks: List<ClaudeMemoryCacheBlock>? = null,
+     /** Request-local patch against [claudeCacheBlocks], committed only after provider success. */
+     val delta: List<UIMessage> = emptyList(),
++    /** Committed patches that must stay after history, plus the pending [delta] text. */
++    val claudePatches: List<UIMessage> = emptyList(),
+     val commit: MemorySnapshotCommit? = null,
+ )
+ 
+@@ -153,6 +163,7 @@ internal fun prepareMemorySnapshot(
+             )
+         }
+ 
++        val committedPatches = state.committedPatches.map { UIMessage.user(it) }
+         val oldById = state.projection.associateBy { it.id }
+         val currentById = currentProjection.associateBy { it.id }
+         val changed = currentProjection.filter { oldById[it.id]?.content != it.content }
+@@ -161,6 +172,7 @@ internal fun prepareMemorySnapshot(
+             return MemorySnapshotResolution(
+                 snapshot = current,
+                 claudeCacheBlocks = state.cacheBlocks,
++                claudePatches = committedPatches,
+             )
+         }
+ 
+@@ -171,26 +183,25 @@ internal fun prepareMemorySnapshot(
+         val candidateRevision = state.lastIssuedRevision + 1
+         val issuedState = state.copy(lastIssuedRevision = candidateRevision)
+         memorySnapshots[key] = issuedState
+-        val nextPatchCount = state.patchCount + 1
+         val nextPatchBytes = state.patchBytes + patchText.toByteArray(Charsets.UTF_8).size
+         val shouldCompact = state.cacheBlocks.isEmpty() ||
+-            nextPatchCount >= MEMORY_PATCH_COMPACTION_COUNT ||
+             nextPatchBytes >= MEMORY_PATCH_COMPACTION_BYTES
+         val nextState = issuedState.copy(
+             projection = currentProjection,
+             cacheBlocks = if (shouldCompact) {
+                 memoryBaseBlocks(currentProjection)
+             } else {
+-                state.cacheBlocks + ClaudeMemoryCacheBlock(patchText)
++                state.cacheBlocks
+             },
++            committedPatches = if (shouldCompact) emptyList() else state.committedPatches + patchText,
+             revision = candidateRevision,
+-            patchCount = if (shouldCompact) 0 else nextPatchCount,
+             patchBytes = if (shouldCompact) 0 else nextPatchBytes,
+         )
+         return MemorySnapshotResolution(
+             snapshot = current,
+             claudeCacheBlocks = state.cacheBlocks,
+             delta = listOf(UIMessage.user(patchText)),
++            claudePatches = committedPatches + UIMessage.user(patchText),
+             commit = MemorySnapshotCommit(
+                 key = key,
+                 revision = candidateRevision,
+@@ -247,6 +258,7 @@ class GenerationHandler(
+     private val memoryRepo: MemoryRepository,
+     private val workspaceRepository: WorkspaceRepository,
+     private val workspaceAccessGate: AssistantWorkspaceAccessGate,
++    private val chatLogStore: ChatLogStore,
+ ) {
+     private val memorySnapshots = object : LinkedHashMap<String, MemorySnapshotState>(16, 0.75f, true) {
+         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, MemorySnapshotState>): Boolean =
+@@ -411,6 +423,7 @@ class GenerationHandler(
+                     memorySnapshot = memoryResolution.snapshot,
+                     claudeMemoryCacheBlocks = memoryResolution.claudeCacheBlocks,
+                     memoryDelta = memoryResolution.delta,
++                    claudeMemoryPatches = memoryResolution.claudePatches,
+                     layeredMemoryContext = layeredMemoryContext,
+                     processingStatus = processingStatus,
+                     conversationSystemPrompt = conversationSystemPrompt,
+@@ -419,6 +432,12 @@ class GenerationHandler(
+                     workspaceId = workspaceId,
+                     workspaceCwd = workspaceCwd,
+                 )
++                // 一轮模型请求结束，记下这一轮的 token 明细和缓存命中情况。
++                chatLogStore.recordTokenUsage(
++                    model = model,
++                    provider = provider,
++                    usage = messages.lastOrNull()?.usage,
++                )
+                 memoryResolution.commit?.let { commit ->
+                     refreshAndCommitMemorySnapshot(
+                         memorySnapshots = memorySnapshots,
+@@ -570,6 +589,7 @@ class GenerationHandler(
+                             // 取消必须向上传播，否则停止生成会被误报为工具执行错误
+                             if (it is CancellationException) throw it
+                             it.printStackTrace()
++                            chatLogStore.recordToolFailure(toolName = tool.toolName, error = it)
+                             executedTools += tool.copy(
+                                 output = listOf(
+                                     UIMessagePart.Text(
+@@ -645,6 +665,7 @@ class GenerationHandler(
+         memorySnapshot: List<AssistantMemory>,
+         claudeMemoryCacheBlocks: List<ClaudeMemoryCacheBlock>?,
+         memoryDelta: List<UIMessage>,
++        claudeMemoryPatches: List<UIMessage> = emptyList(),
+         processingStatus: MutableStateFlow<String?> = MutableStateFlow(null),
+         conversationSystemPrompt: String? = null,
+         conversationModeInjectionIds: Set<Uuid> = emptySet(),
+@@ -686,7 +707,7 @@ class GenerationHandler(
+         }
+ 
+         val transformed = buildList {
+-            add(UIMessage.system(prompt = stableSystemPrompt))
++            add(UIMessage.system(prompt = stableSystemPrompt).copy(isSynthetic = true))
+             addAll(limitedMessages)
+         }.transforms(
+             transformers = transformers,
+@@ -712,13 +733,22 @@ class GenerationHandler(
+                 conversationMessages
+             },
+             transientContext = additionalContextMessages,
+-            memorySnapshot = if (hasMemoryContent) listOf(UIMessage.system(prompt = memoryPrompt)) else emptyList(),
++            memorySnapshot = if (hasMemoryContent) {
++                listOf(UIMessage.system(prompt = memoryPrompt).copy(isSynthetic = true))
++            } else {
++                emptyList()
++            },
+             claudeMemoryCacheBlocks = if (assistant.enableMemory && layeredMemoryContext == null) {
+                 claudeMemoryCacheBlocks
+             } else {
+                 null
+             },
+-            claudeMemoryDelta = if (assistant.enableMemory && layeredMemoryContext == null) memoryDelta else emptyList(),
++            claudeMemoryDelta = if (assistant.enableMemory && layeredMemoryContext == null) {
++                // Committed patches already include the pending delta; adding both would duplicate it.
++                claudeMemoryPatches.ifEmpty { memoryDelta }
++            } else {
++                emptyList()
++            },
+             latestUser = conversationMessages.getOrNull(latestUserIndex),
+             currentToolLoop = if (latestUserIndex >= 0) {
+                 conversationMessages.drop(latestUserIndex + 1)
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpManager.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpManager.kt
+index b3d54c43..eeb53f03 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpManager.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpManager.kt
+@@ -26,6 +26,7 @@ import me.rerere.rikkahub.data.datastore.getCurrentAssistant
+ import me.rerere.rikkahub.data.event.AppEventBus
+ import me.rerere.rikkahub.data.files.FilesManager
+ import me.rerere.rikkahub.data.files.saveUploadFromBytes
++import me.rerere.rikkahub.data.log.ChatLogStore
+ import me.rerere.rikkahub.utils.JsonInstant
+ import okhttp3.OkHttpClient
+ import java.util.concurrent.TimeUnit
+@@ -42,6 +43,7 @@ class McpManager(
+     private val settingsStore: SettingsStore,
+     private val appScope: AppScope,
+     private val filesManager: FilesManager,
++    private val chatLogStore: ChatLogStore,
+     appEventBus: AppEventBus,
+ ) {
+     private val okHttpClient = OkHttpClient.Builder()
+@@ -116,6 +118,8 @@ class McpManager(
+         } catch (e: CancellationException) {
+             throw e
+         } catch (e: McpClientUnavailableException) {
++            // 这里把异常吞成了文本返回，工具执行层看不到，所以单独记一笔。
++            chatLogStore.recordToolFailure(toolName = toolName, error = e)
+             return listOf(UIMessagePart.Text("Failed to execute MCP tool: ${e.message ?: e.javaClass.name}"))
+         }
+         return result.content.map { content ->
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/PromptInjectionTransformer.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/PromptInjectionTransformer.kt
+index fbd2930d..c7698719 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/PromptInjectionTransformer.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/PromptInjectionTransformer.kt
+@@ -117,7 +117,8 @@ internal fun applyInjections(
+             }
+ 
+             result[systemIndex] = systemMessage.copy(
+-                parts = listOf(UIMessagePart.Text(newText))
++                parts = listOf(UIMessagePart.Text(newText)),
++                isSynthetic = true,
+             )
+         }
+     } else {
+@@ -138,7 +139,7 @@ internal fun applyInjections(
+         }
+ 
+         if (combinedContent.isNotEmpty()) {
+-            result.add(0, UIMessage.system(combinedContent))
++            result.add(0, UIMessage.system(combinedContent).copy(isSynthetic = true))
+         }
+     }
+ 
+@@ -199,7 +200,7 @@ private fun createMergedInjectionMessages(injections: List<PromptInjection>): Li
+             when (role) {
+                 MessageRole.ASSISTANT -> UIMessage.assistant(mergedContent)
+                 else -> UIMessage.user(mergedContent)
+-            }
++            }.copy(isSynthetic = true)
+         }
+ }
+ 
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/TemplateTransformer.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/TemplateTransformer.kt
+index 504a8b86..c3dea91d 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/TemplateTransformer.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/TemplateTransformer.kt
+@@ -25,6 +25,9 @@ class TemplateTransformer(
+         val template = engine.getTemplate(ctx.assistant.id.toString())
+         val timeZone = TimeZone.currentSystemDefault()
+         return messages.map { message ->
++            // 我们自己拼出来的消息不参与模版渲染
++            if (message.isSynthetic) return@map message
++
+             // 使用消息本身的发送时间而不是当前时间, 保证多次请求时渲染结果稳定, 不破坏 prompt 缓存
+             val createdAt = message.createdAt.toInstant(timeZone).toJavaInstant()
+             message.copy(
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/TimeReminderTransformer.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/TimeReminderTransformer.kt
+index e0e78c2f..acdefb0f 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/TimeReminderTransformer.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/TimeReminderTransformer.kt
+@@ -67,7 +67,7 @@ private fun buildTimeReminderMessage(gapSeconds: Long?, instant: Instant): UIMes
+     } else {
+         "<time_reminder>Current time: $dayOfWeek, $timeStr</time_reminder>"
+     }
+-    return UIMessage.user(content)
++    return UIMessage.user(content).copy(isSynthetic = true)
+ }
+ 
+ private fun formatGap(seconds: Long): String {
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/WorkspaceReminderTransformer.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/WorkspaceReminderTransformer.kt
+index 2abe713e..4ff71ac5 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/WorkspaceReminderTransformer.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/WorkspaceReminderTransformer.kt
+@@ -1,17 +1,22 @@
+ package me.rerere.rikkahub.data.ai.transformers
+ 
++import android.util.Log
++import kotlinx.coroutines.CancellationException
+ import me.rerere.ai.core.MessageRole
+ import me.rerere.ai.ui.UIMessage
+ import me.rerere.ai.ui.UIMessagePart
+ import me.rerere.rikkahub.data.db.entity.WorkspaceEntity
+ import me.rerere.rikkahub.data.repository.WorkspaceRepository
+ import me.rerere.workspace.WorkspaceShellStatus
++import java.io.ByteArrayOutputStream
++import java.nio.file.Paths
+ 
+ /**
+  * Workspace 系统提示注入转换器
+  *
+  * 当会话记录了一个 shell 已就绪的 workspace 时, 在系统提示词中追加一段引导,
+  * 让模型了解 workspace 环境与 workspace_* 工具的使用方式。
++ * 同时读取 ~/.agents、/workspace 和会话当前目录中的 AGENTS.md 作为工作区指令。
+  */
+ class WorkspaceReminderTransformer(
+     private val workspaceRepository: WorkspaceRepository,
+@@ -25,18 +30,67 @@ class WorkspaceReminderTransformer(
+         // 与 ChatService.createWorkspaceToolsIfReady 保持一致: 仅在 shell 就绪时注入
+         if (workspace.shellStatus != WorkspaceShellStatus.READY.name) return messages
+ 
+-        val prompt = buildWorkspacePrompt(workspace, ctx.workspaceCwd)
++        val prompt = buildWorkspacePrompt(workspace, ctx.workspaceCwd) +
++            buildAgentsPrompt(workspaceId, ctx.workspaceCwd)
+ 
+         // 追加到第一条 system 消息; 若不存在则插入一条
+         val systemIndex = messages.indexOfFirst { it.role == MessageRole.SYSTEM }
+         return if (systemIndex >= 0) {
+             messages.toMutableList().apply {
+-                this[systemIndex] = this[systemIndex].appendText("\n\n$prompt")
++                this[systemIndex] = this[systemIndex]
++                    .appendText("\n\n$prompt")
++                    .copy(isSynthetic = true)
+             }
+         } else {
+-            listOf(UIMessage.system(prompt)) + messages
++            listOf(UIMessage.system(prompt).copy(isSynthetic = true)) + messages
+         }
+     }
++
++    private suspend fun buildAgentsPrompt(workspaceId: String, cwd: String?): String {
++        // ProotShellRunner 把 HOME 定为 /root；相对 cwd 按 /workspace 解析。
++        val workingDirectory = Paths.get("/workspace")
++            .resolve(cwd?.takeIf { it.isNotBlank() } ?: ".")
++            .normalize()
++        val paths = linkedSetOf(
++            "/root/.agents/AGENTS.md",
++            "/workspace/AGENTS.md",
++            workingDirectory.resolve("AGENTS.md").toString(),
++        )
++        val instructions = paths.mapNotNull { path ->
++            try {
++                val size = workspaceRepository.rootfsFileSize(workspaceId, path)
++                require(size <= MAX_AGENTS_BYTES) { "AGENTS.md exceeds $MAX_AGENTS_BYTES bytes" }
++                val content = ByteArrayOutputStream().use { output ->
++                    workspaceRepository.exportRootfsFile(workspaceId, path, output)
++                    output.toString(Charsets.UTF_8.name())
++                }
++                content.takeIf { it.isNotBlank() }?.let { path to it }
++            } catch (e: CancellationException) {
++                throw e
++            } catch (e: Exception) {
++                // 文件不存在、太大或读不了都直接跳过，不影响本轮对话
++                Log.d("WorkspaceReminder", "Skipping workspace instructions: $path", e)
++                null
++            }
++        }
++        if (instructions.isEmpty()) return ""
++        return buildString {
++            appendLine()
++            appendLine()
++            appendLine("<workspace_instructions>")
++            appendLine("Follow the AGENTS.md instructions below.")
++            instructions.forEach { (path, content) ->
++                appendLine()
++                appendLine("AGENTS.md source: $path")
++                appendLine(content)
++            }
++            append("</workspace_instructions>")
++        }
++    }
++
++    private companion object {
++        const val MAX_AGENTS_BYTES = 64L * 1024
++    }
+ }
+ 
+ private fun buildWorkspacePrompt(workspace: WorkspaceEntity, cwd: String? = null): String = buildString {
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt b/app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt
+index 02821121..8808f1cf 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt
+@@ -36,6 +36,7 @@ import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV1Migration
+ import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV2Migration
+ import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV4Migration
+ import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV5Migration
++import me.rerere.rikkahub.data.log.ChatLogLevel
+ import me.rerere.rikkahub.data.model.Assistant
+ import me.rerere.rikkahub.data.model.Avatar
+ import me.rerere.rikkahub.data.model.InjectionPosition
+@@ -74,12 +75,13 @@ private fun MutablePreferences.writeSettings(settings: Settings) {
+     this[SettingsStore.DYNAMIC_COLOR] = settings.dynamicColor
+     this[SettingsStore.THEME_ID] = settings.themeId
+     this[SettingsStore.CUSTOM_THEMES] = JsonInstant.encodeToString(settings.customThemes)
+-    this[SettingsStore.DEVELOPER_MODE] = settings.developerMode
+     this[SettingsStore.DISPLAY_SETTING] = JsonInstant.encodeToString(settings.displaySetting)
++    this[SettingsStore.CHAT_LOG_LEVEL] = settings.chatLogLevel.name
+     this[SettingsStore.PROMPT_CACHE_ENABLED] = settings.promptCacheEnabled
+     this[SettingsStore.AUTO_RETRY_ENABLED] = settings.autoRetryEnabled
+     this[SettingsStore.AUTO_RETRY_INTERVAL_SECONDS] = settings.autoRetryIntervalSeconds
+     this[SettingsStore.AUTO_RETRY_MAX_DURATION_MINUTES] = settings.autoRetryMaxDurationMinutes
++    this[SettingsStore.AUTO_RETRY_MAX_ATTEMPTS] = settings.autoRetryMaxAttempts
+ 
+     this[SettingsStore.FAVORITE_MODELS] = JsonInstant.encodeToString(settings.favoriteModels)
+     this[SettingsStore.SELECT_MODEL] = settings.chatModelId.toString()
+@@ -143,13 +145,14 @@ class SettingsStore(
+         val THEME_ID = stringPreferencesKey("theme_id")
+         val CUSTOM_THEMES = stringPreferencesKey("custom_themes")
+         val DISPLAY_SETTING = stringPreferencesKey("display_setting")
+-        val DEVELOPER_MODE = booleanPreferencesKey("developer_mode")
++        val CHAT_LOG_LEVEL = stringPreferencesKey("chat_log_level")
+         val PROMPT_CACHE_ENABLED = booleanPreferencesKey("prompt_cache_enabled")
+ 
+         // 自动重试
+         val AUTO_RETRY_ENABLED = booleanPreferencesKey("auto_retry_enabled")
+         val AUTO_RETRY_INTERVAL_SECONDS = intPreferencesKey("auto_retry_interval_seconds")
+         val AUTO_RETRY_MAX_DURATION_MINUTES = intPreferencesKey("auto_retry_max_duration_minutes")
++        val AUTO_RETRY_MAX_ATTEMPTS = intPreferencesKey("auto_retry_max_attempts")
+ 
+         // 模型选择
+         val FAVORITE_MODELS = stringPreferencesKey("favorite_models")
+@@ -240,8 +243,10 @@ class SettingsStore(
+                 customThemes = preferences[CUSTOM_THEMES]?.let {
+                     JsonInstant.decodeFromString(it)
+                 } ?: emptyList(),
+-                developerMode = preferences[DEVELOPER_MODE] == true,
+                 displaySetting = JsonInstant.decodeFromString(preferences[DISPLAY_SETTING] ?: "{}"),
++                chatLogLevel = preferences[CHAT_LOG_LEVEL]
++                    ?.let { runCatching { ChatLogLevel.valueOf(it) }.getOrNull() }
++                    ?: ChatLogLevel.ALL,
+                 promptCacheEnabled = preferences[PROMPT_CACHE_ENABLED] != false,
+                 searchServices = preferences[SEARCH_SERVICES]?.let {
+                     JsonInstant.decodeFromString(it)
+@@ -271,6 +276,8 @@ class SettingsStore(
+                     ?: Settings.DEFAULT_AUTO_RETRY_INTERVAL_SECONDS,
+                 autoRetryMaxDurationMinutes = preferences[AUTO_RETRY_MAX_DURATION_MINUTES]
+                     ?: Settings.DEFAULT_AUTO_RETRY_MAX_DURATION_MINUTES,
++                autoRetryMaxAttempts = preferences[AUTO_RETRY_MAX_ATTEMPTS]
++                    ?: Settings.DEFAULT_AUTO_RETRY_MAX_ATTEMPTS,
+             )
+         }
+         .map {
+@@ -519,8 +526,9 @@ data class Settings(
+     val dynamicColor: Boolean = true,
+     val themeId: String = PresetThemes[0].id,
+     val customThemes: List<CustomTheme> = emptyList(),
+-    val developerMode: Boolean = false,
+     val displaySetting: DisplaySetting = DisplaySetting(),
++    /** 运行日志等级：关 / 只记错误 / 全记。 */
++    val chatLogLevel: ChatLogLevel = ChatLogLevel.ALL,
+     val promptCacheEnabled: Boolean = true,
+     /** 生成失败后是否自动重试。 */
+     val autoRetryEnabled: Boolean = true,
+@@ -528,6 +536,8 @@ data class Settings(
+     val autoRetryIntervalSeconds: Int = DEFAULT_AUTO_RETRY_INTERVAL_SECONDS,
+     /** 从首次失败算起，允许重试的总分钟数。 */
+     val autoRetryMaxDurationMinutes: Int = DEFAULT_AUTO_RETRY_MAX_DURATION_MINUTES,
++    /** 一段生成最多尝试的次数，含首次尝试。 */
++    val autoRetryMaxAttempts: Int = DEFAULT_AUTO_RETRY_MAX_ATTEMPTS,
+     val favoriteModels: List<Uuid> = emptyList(),
+     val chatModelId: Uuid = Uuid.random(),
+     val fastModelId: Uuid = Uuid.random(),
+@@ -561,6 +571,7 @@ data class Settings(
+     companion object {
+         const val DEFAULT_AUTO_RETRY_INTERVAL_SECONDS = 3
+         const val DEFAULT_AUTO_RETRY_MAX_DURATION_MINUTES = 2
++        const val DEFAULT_AUTO_RETRY_MAX_ATTEMPTS = 10
+ 
+         // 构造一个用于初始化的settings, 但它不能用于保存，防止使用初始值存储
+         fun dummy() = Settings(init = true)
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/db/dao/MessageNodeDAO.kt b/app/src/main/java/me/rerere/rikkahub/data/db/dao/MessageNodeDAO.kt
+index de76c5fe..25ef9e5f 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/db/dao/MessageNodeDAO.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/db/dao/MessageNodeDAO.kt
+@@ -12,6 +12,10 @@ import me.rerere.rikkahub.data.db.entity.MessageNodeEntity
+ 
+ @Dao
+ interface MessageNodeDAO {
++    // 用与 messages 相同的 JSON 编码来查，保守地把所有分支里出现过的 URL 都算作引用
++    @Query("SELECT EXISTS(SELECT 1 FROM message_node WHERE instr(messages, :encodedFileUrl) > 0)")
++    suspend fun hasFileReference(encodedFileUrl: String): Boolean
++
+     @Query("SELECT * FROM message_node WHERE conversation_id = :conversationId ORDER BY node_index ASC")
+     suspend fun getNodesOfConversation(conversationId: String): List<MessageNodeEntity>
+ 
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/files/FilesManager.kt b/app/src/main/java/me/rerere/rikkahub/data/files/FilesManager.kt
+index 0d1e5372..e830583a 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/files/FilesManager.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/files/FilesManager.kt
+@@ -493,6 +493,9 @@ object FileFolders {
+     const val TOOL_OUTPUTS = "tool_outputs"
+     /** App-private workspace snapshots; deliberately not included in any shell bind mount. */
+     const val SNAPSHOTS = "snapshots"
++
++    /** App-private 运行日志，只保留 24 小时。 */
++    const val LOGS = "logs"
+ }
+ 
+ suspend fun FilesManager.saveUploadFromUri(
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/model/Conversation.kt b/app/src/main/java/me/rerere/rikkahub/data/model/Conversation.kt
+index 06d8a9cc..a0af0447 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/model/Conversation.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/model/Conversation.kt
+@@ -44,8 +44,8 @@ data class Conversation(
+     val files: List<Uri>
+         get() = messageNodes
+             .flatMap { node -> node.messages.flatMap { it.parts } }
+-            .collectAllParts()
+-            .mapNotNull { it.fileUri() }
++            .localFileUrls()
++            .map { it.toUri() }
+ 
+     /**
+      *  当前选中的 message
+@@ -143,19 +143,21 @@ fun UIMessage.toMessageNode(): MessageNode {
+     )
+ }
+ 
+-/**
+- * 递归展开所有 parts，包括工具调用结果中的嵌套 parts。
+- */
+-private fun List<UIMessagePart>.collectAllParts(): List<UIMessagePart> =
+-    this + filterIsInstance<UIMessagePart.Tool>().flatMap { it.output.collectAllParts() }
+-
+-/**
+- * 提取 part 中引用的本地文件 URI，新增文件类型时只需在此处添加。
+- */
+-private fun UIMessagePart.fileUri(): Uri? = when (this) {
+-    is UIMessagePart.Image -> url.takeIf { it.startsWith("file://") }?.toUri()
+-    is UIMessagePart.Document -> url.takeIf { it.startsWith("file://") }?.toUri()
+-    is UIMessagePart.Video -> url.takeIf { it.startsWith("file://") }?.toUri()
+-    is UIMessagePart.Audio -> url.takeIf { it.startsWith("file://") }?.toUri()
+-    else -> null
++/** 本地附件引用，包含工具结果中的嵌套附件。 */
++internal fun List<UIMessagePart>.localFileUrls(): Set<String> = buildSet {
++    this@localFileUrls.forEach { part ->
++        val url = when (part) {
++            is UIMessagePart.Image -> part.url
++            is UIMessagePart.Document -> part.url
++            is UIMessagePart.Video -> part.url
++            is UIMessagePart.Audio -> part.url
++            is UIMessagePart.Tool -> {
++                addAll(part.output.localFileUrls())
++                null
++            }
++
++            else -> null
++        }
++        if (url?.startsWith("file://") == true) add(url)
++    }
+ }
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/repository/ConversationRepository.kt b/app/src/main/java/me/rerere/rikkahub/data/repository/ConversationRepository.kt
+index 50d52875..72ac07dc 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/repository/ConversationRepository.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/repository/ConversationRepository.kt
+@@ -52,6 +52,9 @@ class ConversationRepository(
+         private const val SUMMARY_MAX_SERIALIZED_SOURCE_CHARACTERS = 16_000_000L
+     }
+ 
++    suspend fun hasFileReference(fileUrl: String): Boolean =
++        messageNodeDAO.hasFileReference(JsonInstant.encodeToString(fileUrl))
++
+     suspend fun getRecentConversations(assistantId: Uuid, limit: Int = 10): List<Conversation> =
+         conversationDAO.getRecentConversationsOfAssistant(
+             assistantId = assistantId.toString(),
+diff --git a/app/src/main/java/me/rerere/rikkahub/di/DataSourceModule.kt b/app/src/main/java/me/rerere/rikkahub/di/DataSourceModule.kt
+index aae2263c..d5a641a1 100644
+--- a/app/src/main/java/me/rerere/rikkahub/di/DataSourceModule.kt
++++ b/app/src/main/java/me/rerere/rikkahub/di/DataSourceModule.kt
+@@ -20,6 +20,7 @@ import me.rerere.rikkahub.data.ai.GenerationHandler
+ import me.rerere.rikkahub.data.ai.transformers.TemplateTransformer
+ import me.rerere.rikkahub.data.api.RikkaHubAPI
+ import me.rerere.rikkahub.data.datastore.SettingsStore
++import me.rerere.rikkahub.data.log.ChatLogStore
+ import me.rerere.rikkahub.data.db.AppDatabase
+ import me.rerere.rikkahub.data.db.fts.MessageFtsManager
+ import me.rerere.rikkahub.data.db.fts.SimpleDictManager
+@@ -179,7 +180,15 @@ val dataSourceModule = module {
+         MessageFtsManager(get())
+     }
+ 
+-    single { McpManager(settingsStore = get(), appScope = get(), filesManager = get(), appEventBus = get()) }
++    single {
++        ChatLogStore(
++            context = get(),
++            settingsStore = get(),
++            appScope = get(),
++        )
++    }
++
++    single { McpManager(settingsStore = get(), appScope = get(), filesManager = get(), chatLogStore = get(), appEventBus = get()) }
+ 
+     single {
+         GenerationHandler(
+@@ -189,6 +198,7 @@ val dataSourceModule = module {
+             memoryRepo = get(),
+             workspaceRepository = get(),
+             workspaceAccessGate = get(),
++            chatLogStore = get(),
+         )
+     }
+ 
+diff --git a/app/src/main/java/me/rerere/rikkahub/di/ViewModelModule.kt b/app/src/main/java/me/rerere/rikkahub/di/ViewModelModule.kt
+index fa6a6a29..370c3d08 100644
+--- a/app/src/main/java/me/rerere/rikkahub/di/ViewModelModule.kt
++++ b/app/src/main/java/me/rerere/rikkahub/di/ViewModelModule.kt
+@@ -5,7 +5,7 @@ import me.rerere.rikkahub.ui.pages.assistant.detail.AssistantDetailVM
+ import me.rerere.rikkahub.ui.pages.backup.BackupVM
+ import me.rerere.rikkahub.ui.pages.chat.ChatDrawerVM
+ import me.rerere.rikkahub.ui.pages.chat.ChatVM
+-import me.rerere.rikkahub.ui.pages.debug.DebugVM
++import me.rerere.rikkahub.ui.pages.chatlog.ChatLogVM
+ import me.rerere.rikkahub.ui.pages.favorite.FavoriteVM
+ import me.rerere.rikkahub.ui.pages.search.SearchVM
+ import me.rerere.rikkahub.ui.pages.history.HistoryVM
+@@ -39,8 +39,8 @@ val viewModelModule = module {
+         )
+     }
+     viewModelOf(::ChatDrawerVM)
++    viewModelOf(::ChatLogVM)
+     viewModelOf(::SettingVM)
+-    viewModelOf(::DebugVM)
+     viewModelOf(::HistoryVM)
+     viewModelOf(::AssistantVM)
+     viewModel<AssistantDetailVM> {
+diff --git a/app/src/main/java/me/rerere/rikkahub/service/ChatService.kt b/app/src/main/java/me/rerere/rikkahub/service/ChatService.kt
+index 5141ad2c..c80d01f5 100644
+--- a/app/src/main/java/me/rerere/rikkahub/service/ChatService.kt
++++ b/app/src/main/java/me/rerere/rikkahub/service/ChatService.kt
+@@ -39,7 +39,10 @@ import me.rerere.ai.provider.BuiltInTools
+ import me.rerere.ai.provider.Model
+ import me.rerere.ai.provider.ModelAbility
+ import me.rerere.ai.provider.PromptCacheKey
++import me.rerere.ai.provider.PromptCacheKeyRejection
++import me.rerere.ai.provider.PromptCacheRouting
+ import me.rerere.ai.provider.ProviderManager
++import me.rerere.ai.provider.ProviderSetting
+ import me.rerere.ai.provider.TextGenerationParams
+ import me.rerere.ai.provider.generateTextWithModelTransport
+ import me.rerere.ai.ui.ToolApprovalState
+@@ -84,6 +87,7 @@ import me.rerere.rikkahub.data.files.FilesManager
+ import me.rerere.rikkahub.data.model.Conversation
+ import me.rerere.rikkahub.data.model.Assistant
+ import me.rerere.rikkahub.data.model.AssistantAffectScope
++import me.rerere.rikkahub.data.model.localFileUrls
+ import me.rerere.rikkahub.data.model.replaceRegexes
+ import me.rerere.rikkahub.data.model.toMessageNode
+ import me.rerere.rikkahub.data.repository.ConversationRepository
+@@ -243,6 +247,32 @@ class ChatService(
+ ) {
+     init {
+         workspaceSessionInvalidator.register(::invalidateAssistantSessions)
++        // 上游明确说不认识 prompt_cache_key 时，把这家供应商落成"关闭"，重启后不用再失败一次
++        PromptCacheKeyRejection.onRejected = { providerId ->
++            appScope.launch { disablePromptCacheRouting(providerId) }
++        }
++    }
++
++    /**
++     * 把已经拒绝过这个字段的供应商改成"关闭"。
++     *
++     * 只改 OpenAI 类型的供应商，而且用户之后手动改回自动或开启就以用户的选择为准。
++     */
++    private suspend fun disablePromptCacheRouting(providerId: String) {
++        settingsStore.update { settings ->
++            settings.copy(
++                providers = settings.providers.map { provider ->
++                    if (provider is ProviderSetting.OpenAI &&
++                        provider.id.toString() == providerId &&
++                        provider.promptCacheRouting != PromptCacheRouting.DISABLED
++                    ) {
++                        provider.copy(promptCacheRouting = PromptCacheRouting.DISABLED)
++                    } else {
++                        provider
++                    }
++                },
++            )
++        }
+     }
+     // workspace 系统提示注入 (依赖 workspaceRepository, 故在类内构造)
+     private val workspaceReminderTransformer = WorkspaceReminderTransformer(workspaceRepository)
+@@ -297,7 +327,15 @@ class ChatService(
+                     assistantId = settings.getCurrentAssistant().id
+                 ),
+                 scope = appScope,
+-                onIdle = { removeSession(it) }
++                onIdle = { removeSession(it) },
++                onGenerationFinished = { id, cause ->
++                    // 真失败才停队列，等用户点「继续发送」；
++                    // 内部取消（例如 pauseGeneration 挪工作区）不算失败，队列继续跑。
++                    if (cause != null && cause !is CancellationException) {
++                        sessions[id]?.messageQueue?.pause()
++                    }
++                    appScope.launch { dispatchNextQueuedMessage(id) }
++                },
+             ).also {
+                 _sessionsVersion.value++
+                 Log.i(TAG, "createSession: $id (total: ${sessions.size + 1})")
+@@ -441,22 +479,110 @@ class ChatService(
+ 
+     // ---- 发送消息 ----
+ 
++    fun getMessageQueueFlow(conversationId: Uuid): StateFlow<MessageQueueState> =
++        getOrCreateSession(conversationId).messageQueue.state
++
++    fun removeQueuedMessage(conversationId: Uuid, messageId: Uuid) {
++        sessions[conversationId]?.messageQueue?.remove(messageId)?.let(::cleanupQueuedAttachments)
++        dispatchNextQueuedMessage(conversationId)
++    }
++
++    fun beginEditQueuedMessage(conversationId: Uuid, messageId: Uuid): QueuedMessage? =
++        sessions[conversationId]?.messageQueue?.beginEdit(messageId)
++
++    fun finishEditQueuedMessage(
++        conversationId: Uuid,
++        messageId: Uuid,
++        parts: List<UIMessagePart>? = null,
++    ) {
++        sessions[conversationId]?.messageQueue?.finishEdit(messageId, parts)
++            ?.let(::cleanupQueuedAttachments)
++        dispatchNextQueuedMessage(conversationId)
++    }
++
++    fun resumeMessageQueue(conversationId: Uuid) {
++        sessions[conversationId]?.messageQueue?.resume()
++        dispatchNextQueuedMessage(conversationId)
++    }
++
++    /**
++     * 撤销或编辑排队消息后，清掉不再被任何地方引用的附件。
++     * 查不到引用时宁可保留文件，也不能误删。
++     */
++    private fun cleanupQueuedAttachments(previous: QueuedMessage) {
++        val candidates = previous.parts.localFileUrls()
++        if (candidates.isEmpty()) return
++        appScope.launch {
++            try {
++                // 没打开的会话和没选中的分支也可能引用同一个附件
++                val persistedReferences =
++                    candidates.filter { conversationRepo.hasFileReference(it) }.toSet()
++                // 数据库查询是挂起的，期间队列可能已经推进，删之前重读一遍内存引用
++                val currentSessions = sessions.values.toList()
++                val unusedFiles = unreferencedQueuedAttachmentUrls(
++                    previous = previous,
++                    conversations = currentSessions.map { it.state.value },
++                    pendingMessages = currentSessions.flatMap {
++                        it.messageQueue.state.value.messages + listOfNotNull(it.submittingMessage)
++                    },
++                ) - persistedReferences
++                if (unusedFiles.isNotEmpty()) {
++                    filesManager.deleteChatFiles(unusedFiles.map { it.toUri() })
++                }
++            } catch (e: Exception) {
++                if (e is CancellationException) throw e
++                Log.w(TAG, "Failed to clean queued attachments", e)
++            }
++        }
++    }
++
+     fun sendMessage(conversationId: Uuid, content: List<UIMessagePart>, answer: Boolean = true) {
+         if (content.isEmptyInputMessage()) return
+ 
+         val session = getOrCreateSession(conversationId)
+-        val previousJob = session.getJob()
+-        previousJob?.cancel()
++        synchronized(session) {
++            // 队列空着时手动发送，说明用户想继续，先解除之前的暂停
++            if (session.messageQueue.state.value.messages.isEmpty()) session.messageQueue.resume()
++            session.messageQueue.enqueue(content, answer)
++            dispatchNextQueuedMessage(conversationId)
++        }
++    }
++
++    /**
++     * 当前这轮结束后从队列里取一条发送。
++     * 生成中、还有工具等审批、或会话处于临时禁生成窗口时都不动作。
++     */
++    private fun dispatchNextQueuedMessage(conversationId: Uuid) {
++        val session = sessions[conversationId] ?: return
++        synchronized(session) {
++            if (session.getJob() != null || session.isGenerationPaused) return
++            // 还有工具等用户审批，说明这一轮没真正结束
++            if (session.state.value.currentMessages.any { message ->
++                    message.parts.any { it is UIMessagePart.Tool && it.isPending }
++                }
++            ) {
++                return
++            }
++            val next = session.messageQueue.takeNext() ?: return
++            session.submittingMessage = next
++            sendQueuedMessage(session, next)
++        }
++    }
++
++    private fun sendQueuedMessage(session: ConversationSession, queued: QueuedMessage) {
++        val conversationId = session.id
++        val content = queued.parts
++        val answer = queued.answer
+ 
+         val job = launchGenerationJob(
+             conversationId = conversationId,
+             keepAliveInBackground = answer,
+         ) {
++            var persisted = false
+             try {
+                 // ChatVM starts initialization asynchronously. Do not inspect or persist the
+                 // temporary session state until the new-vs-existing decision is complete.
+                 session.awaitInitialized()
+-                runCatching { previousJob?.join() }
+                 finishInterruptedPendingTools(conversationId)
+ 
+                 val currentConversation = session.state.value
+@@ -473,6 +599,9 @@ class ChatService(
+                     ).toMessageNode(),
+                 )
+                 saveConversation(conversationId, newConversation)
++                persisted = true
++                // 消息已进历史，附件引用从队列转交给了会话
++                session.submittingMessage = null
+ 
+                 // 开始补全
+                 if (answer) {
+@@ -481,11 +610,26 @@ class ChatService(
+ 
+                 _generationDoneFlow.emit(conversationId)
+             } catch (e: Exception) {
++                // 消息已从队列取走却还没进历史（助手被删、读设置失败、中途被停等），
++                // 放回去等下一轮，不能就这么没了。
++                if (!persisted) session.messageQueue.enqueue(queued.parts, queued.answer)
++                if (e is CancellationException) throw e
+                 e.printStackTrace()
++                session.messageQueue.pause()
+                 addError(e, conversationId, title = context.getString(R.string.error_title_send_message))
+             }
+         }
+-        if (session.setJob(job)) job.start()
++        job.invokeOnCompletion {
++            synchronized(session) {
++                if (session.submittingMessage?.id == queued.id) session.submittingMessage = null
++            }
++        }
++        if (!session.setJob(job)) {
++            // 会话正好进了禁生成窗口：把消息放回队列等下次调度，不能丢掉
++            session.messageQueue.enqueue(queued.parts, queued.answer)
++            return
++        }
++        job.start()
+     }
+ 
+     private fun preprocessUserInputParts(parts: List<UIMessagePart>, assistant: Assistant): List<UIMessagePart> {
+@@ -1011,6 +1155,9 @@ class ChatService(
+ 
+             it.printStackTrace()
+             addError(it, conversationId, title = context.getString(R.string.error_title_generation))
++            // 失败先按住队列：不清空也不自动往下发，等用户点「继续发送」，
++            // 免得对着同一个错误一条接一条地重试。
++            sessions[conversationId]?.messageQueue?.pause()
+             Logging.log(TAG, "handleMessageComplete: $it")
+             Logging.log(TAG, it.stackTraceToString())
+         }.onSuccess {
+@@ -1429,6 +1576,7 @@ class ChatService(
+                     }
+                 } finally {
+                     session?.resumeGeneration()
++                    session?.let { dispatchNextQueuedMessage(it.id) }
+                 }
+             }
+         }
+@@ -1443,7 +1591,10 @@ class ChatService(
+                 session.state.update { it.copy(workspaceCwd = null) }
+             }
+         } finally {
+-            affected.forEach(ConversationSession::resumeGeneration)
++            affected.forEach { session ->
++                session.resumeGeneration()
++                dispatchNextQueuedMessage(session.id)
++            }
+         }
+     }
+ 
+@@ -1483,7 +1634,12 @@ class ChatService(
+     }
+ 
+     private fun checkFilesDelete(newConversation: Conversation, oldConversation: Conversation) {
+-        val newFiles = newConversation.files
++        val session = sessions[newConversation.id]
++        // 排队中的消息也算引用，否则用户撤销/编辑排队消息时附件会被误删
++        val queuedFiles = (session?.messageQueue?.state?.value?.messages.orEmpty() +
++                listOfNotNull(session?.submittingMessage))
++            .flatMap { it.parts }.localFileUrls().map { it.toUri() }
++        val newFiles = newConversation.files + queuedFiles
+         val oldFiles = oldConversation.files
+         val deletedFiles = oldFiles.filter { file ->
+             newFiles.none { it == file }
+@@ -1522,6 +1678,9 @@ class ChatService(
+             conversationRepo.updateConversation(updatedConversation)
+         }
+         updateConversation(conversationId, persistedConversation)
++
++        // 删除消息或切换分支可能解除工具审批的阻塞，保存成功后重新看一遗队列。
++        dispatchNextQueuedMessage(conversationId)
+     }
+ 
+     // ---- 翻译消息 ----
+@@ -1786,8 +1945,12 @@ class ChatService(
+ 
+     // 停止当前会话生成任务（不清理会话缓存）
+     suspend fun stopGeneration(conversationId: Uuid) {
+-        val job = sessions[conversationId]?.getJob() ?: return
+-        job.cancel()
++        val session = sessions[conversationId] ?: return
++        val job = synchronized(session) {
++            // 用户主动停止：队列也停下来，避免刚停就又自动发下一条
++            session.messageQueue.pause()
++            session.getJob()?.also { it.cancel() }
++        } ?: return
+         runCatching { job.join() }
+         finishInterruptedPendingTools(conversationId)
+     }
+diff --git a/app/src/main/java/me/rerere/rikkahub/service/ConversationSession.kt b/app/src/main/java/me/rerere/rikkahub/service/ConversationSession.kt
+index 5dca1e9d..ac3efebf 100644
+--- a/app/src/main/java/me/rerere/rikkahub/service/ConversationSession.kt
++++ b/app/src/main/java/me/rerere/rikkahub/service/ConversationSession.kt
+@@ -21,10 +21,19 @@ class ConversationSession(
+     initial: Conversation,
+     private val scope: CoroutineScope,
+     private val onIdle: (Uuid) -> Unit,
++    private val onGenerationFinished: (Uuid, Throwable?) -> Unit = { _, _ -> },
+ ) {
+     // 会话状态
+     val state = MutableStateFlow(initial)
+ 
++    // 生成中排队等发送的消息
++    val messageQueue = MessageQueue()
++
++    // 从队列取出到写进会话历史之间，附件仍要当成有效引用，否则会被误删
++    @Volatile
++    var submittingMessage: QueuedMessage? = null
++        internal set
++
+     // ChatVM 创建 session 后才异步加载持久化会话；发送必须等待这一步完成，
+     // 否则临时初始值中的 workspaceId=null 可能覆盖新会话的助手默认值。
+     private val initialization = CompletableDeferred<Unit>()
+@@ -51,7 +60,9 @@ class ConversationSession(
+     private val _generationJob = MutableStateFlow<Job?>(null)
+     val generationJob: StateFlow<Job?> = _generationJob.asStateFlow()
+     val isGenerating: Boolean get() = _generationJob.value?.isActive == true
+-    val isInUse: Boolean get() = refCount.get() > 0 || isGenerating
++    val isInUse: Boolean
++        get() = refCount.get() > 0 || _generationJob.value != null ||
++                messageQueue.state.value.messages.isNotEmpty()
+ 
+     // 空闲检查任务
+     private var idleCheckJob: Job? = null
+@@ -99,15 +110,22 @@ class ConversationSession(
+             _generationJob.value.also { _generationJob.value = job }
+         }
+         previous?.cancel()
+-        job?.invokeOnCompletion {
+-            _generationJob.compareAndSet(job, null)
+-            if (refCount.get() <= 0) {
+-                scheduleIdleCheck()
++        job?.invokeOnCompletion { cause ->
++            // 被替掉的旧任务不能清掉或推进接替它的新任务
++            val isCurrent = _generationJob.compareAndSet(job, null)
++            if (isCurrent) {
++                onGenerationFinished(id, cause)
++                if (refCount.get() <= 0) {
++                    scheduleIdleCheck()
++                }
+             }
+         }
+         return true
+     }
+ 
++    /** 会话正处于临时禁生成窗口（搬家、归档等）时为 true。 */
++    val isGenerationPaused: Boolean get() = !acceptsGenerationJobs
++
+     fun pauseGeneration(): Job? = synchronized(generationJobLock) {
+         acceptsGenerationJobs = false
+         _generationJob.value?.also(Job::cancel)
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/ai/ChatInput.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/ai/ChatInput.kt
+index 248b651d..1555b06e 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/components/ai/ChatInput.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/ai/ChatInput.kt
+@@ -91,9 +91,13 @@ import me.rerere.rikkahub.ui.components.ai.completion.ChatCompletionItem
+ import me.rerere.rikkahub.ui.components.ai.completion.ChatCompletionList
+ import me.rerere.rikkahub.ui.components.ai.completion.ChatCompletionProvider
+ import me.rerere.rikkahub.ui.components.ui.KeepScreenOn
++import me.rerere.rikkahub.service.MessageQueueState
++import me.rerere.rikkahub.service.QueuedMessage
++import me.rerere.ai.ui.UIMessagePart
+ import me.rerere.rikkahub.ui.context.LocalSettings
+ import me.rerere.rikkahub.ui.context.LocalToaster
+ import me.rerere.rikkahub.ui.hooks.ChatInputState
++import kotlin.uuid.Uuid
+ import org.koin.compose.koinInject
+ import kotlin.time.Duration.Companion.seconds
+ 
+@@ -114,6 +118,11 @@ fun ChatInput(
+     onCancelClick: () -> Unit,
+     onSendClick: () -> Unit,
+     onLongSendClick: () -> Unit,
++    messageQueue: MessageQueueState = MessageQueueState(),
++    onRemoveQueuedMessage: (Uuid) -> Unit = {},
++    onBeginEditQueuedMessage: (Uuid) -> QueuedMessage? = { null },
++    onFinishEditQueuedMessage: (Uuid, List<UIMessagePart>?) -> Unit = { _, _ -> },
++    onResumeMessageQueue: () -> Unit = {},
+ ) {
+     val toaster = LocalToaster.current
+     val assistant = settings.getCurrentAssistant()
+@@ -139,13 +148,14 @@ fun ChatInput(
+     fun sendMessage() {
+         focusManager.clearFocus(force = true)
+         keyboardController?.hide()
+-        if (loading) onCancelClick() else onSendClick()
++        // 生成中如果输入框里有内容就排队发送，只有空输入才当作「停止」
++        if (loading && state.isEmpty()) onCancelClick() else onSendClick()
+     }
+ 
+     fun sendMessageWithoutAnswer() {
+         focusManager.clearFocus(force = true)
+         keyboardController?.hide()
+-        if (loading) onCancelClick() else onLongSendClick()
++        if (loading && state.isEmpty()) onCancelClick() else onLongSendClick()
+     }
+ 
+     Surface(
+@@ -159,6 +169,13 @@ fun ChatInput(
+                 .padding(bottom = if (imeVisible) 0.dp else 8.dp),
+             verticalArrangement = Arrangement.spacedBy(8.dp)
+         ) {
++            MessageQueuePanel(
++                state = messageQueue,
++                onRemove = onRemoveQueuedMessage,
++                onBeginEdit = onBeginEditQueuedMessage,
++                onFinishEdit = onFinishEditQueuedMessage,
++                onResume = onResumeMessageQueue,
++            )
+             Surface(
+                 modifier = Modifier
+                     .fillMaxWidth()
+@@ -261,6 +278,7 @@ fun ChatInput(
+                             )
+                         }
+ 
++                        val showStop = loading && state.isEmpty()
+                         Box(
+                             contentAlignment = Alignment.Center,
+                             modifier = Modifier
+@@ -268,7 +286,7 @@ fun ChatInput(
+                                 .testTag("chat_send_button")
+                                 .clip(CircleShape)
+                                 .combinedClickable(
+-                                    enabled = loading || !state.isEmpty(),
++                                    enabled = showStop || !state.isEmpty(),
+                                     onClick = {
+                                         sendMessage()
+                                     }, onLongClick = {
+@@ -277,12 +295,12 @@ fun ChatInput(
+                                 )
+                         ) {
+                             val containerColor = when {
+-                                loading -> MaterialTheme.colorScheme.errorContainer
++                                showStop -> MaterialTheme.colorScheme.errorContainer
+                                 state.isEmpty() -> MaterialTheme.colorScheme.surfaceContainerHigh
+                                 else -> MaterialTheme.colorScheme.primary
+                             }
+                             val contentColor = when {
+-                                loading -> MaterialTheme.colorScheme.onErrorContainer
++                                showStop -> MaterialTheme.colorScheme.onErrorContainer
+                                 state.isEmpty() -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                                 else -> MaterialTheme.colorScheme.onPrimary
+                             }
+@@ -293,20 +311,15 @@ fun ChatInput(
+                                 content = {})
+                             if (loading) {
+                                 KeepScreenOn()
+-                                Icon(
+-                                    imageVector = HugeIcons.Cancel01,
+-                                    contentDescription = stringResource(R.string.stop),
+-                                    tint = contentColor,
+-                                    modifier = Modifier.size(18.dp)
+-                                )
+-                            } else {
+-                                Icon(
+-                                    imageVector = HugeIcons.ArrowUp02,
+-                                    contentDescription = stringResource(R.string.send),
+-                                    tint = contentColor,
+-                                    modifier = Modifier.size(18.dp)
+-                                )
+                             }
++                            Icon(
++                                imageVector = if (showStop) HugeIcons.Cancel01 else HugeIcons.ArrowUp02,
++                                contentDescription = stringResource(
++                                    if (showStop) R.string.stop else R.string.send
++                                ),
++                                tint = contentColor,
++                                modifier = Modifier.size(18.dp)
++                            )
+                         }
+                     }
+                 }
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatPage.kt
+index 78b07666..b51155ac 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatPage.kt
+@@ -346,12 +346,18 @@ private fun ChatPageContent(
+                             onClear = vm::clearSummaryContext,
+                         )
+                     }
++                    val messageQueue by vm.messageQueue.collectAsStateWithLifecycle()
+                     ChatInput(
+                     state = inputState,
+                     loading = loadingJob != null,
+                     settings = setting,
+                     hazeState = hazeState,
+                     completionProviders = completionProviders,
++                    messageQueue = messageQueue,
++                    onRemoveQueuedMessage = vm::removeQueuedMessage,
++                    onBeginEditQueuedMessage = vm::beginEditQueuedMessage,
++                    onFinishEditQueuedMessage = vm::finishEditQueuedMessage,
++                    onResumeMessageQueue = vm::resumeMessageQueue,
+                     onCancelClick = {
+                         vm.stopGeneration()
+                     },
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatVM.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatVM.kt
+index f1a1dc49..e3ca874a 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatVM.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatVM.kt
+@@ -143,6 +143,17 @@ class ChatVM(
+ 
+     fun clearAllErrors() = chatService.clearAllErrors()
+ 
++    val messageQueue = chatService.getMessageQueueFlow(_conversationId)
++
++    fun removeQueuedMessage(id: Uuid) = chatService.removeQueuedMessage(_conversationId, id)
++
++    fun beginEditQueuedMessage(id: Uuid) = chatService.beginEditQueuedMessage(_conversationId, id)
++
++    fun finishEditQueuedMessage(id: Uuid, parts: List<UIMessagePart>?) =
++        chatService.finishEditQueuedMessage(_conversationId, id, parts)
++
++    fun resumeMessageQueue() = chatService.resumeMessageQueue(_conversationId)
++
+     // 生成完成
+     val generationDoneFlow: SharedFlow<Uuid> = chatService.generationDoneFlow
+ 
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/debug/DebugPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/debug/DebugPage.kt
+deleted file mode 100644
+index 50f00447..00000000
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/debug/DebugPage.kt
++++ /dev/null
+@@ -1,383 +0,0 @@
+-package me.rerere.rikkahub.ui.pages.debug
+-
+-import androidx.compose.foundation.background
+-import androidx.compose.foundation.border
+-import androidx.compose.foundation.layout.Arrangement
+-import androidx.compose.foundation.layout.Box
+-import androidx.compose.foundation.layout.Column
+-import androidx.compose.foundation.layout.PaddingValues
+-import androidx.compose.foundation.layout.Row
+-import androidx.compose.foundation.layout.fillMaxSize
+-import androidx.compose.foundation.layout.fillMaxWidth
+-import androidx.compose.foundation.layout.height
+-import androidx.compose.foundation.layout.imePadding
+-import androidx.compose.foundation.layout.padding
+-import androidx.compose.foundation.lazy.LazyColumn
+-import androidx.compose.foundation.lazy.items
+-import androidx.compose.foundation.pager.HorizontalPager
+-import androidx.compose.foundation.pager.rememberPagerState
+-import androidx.compose.foundation.rememberScrollState
+-import androidx.compose.foundation.shape.RoundedCornerShape
+-import androidx.compose.foundation.verticalScroll
+-import androidx.compose.material3.Button
+-import androidx.compose.material3.HorizontalDivider
+-import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.OutlinedTextField
+-import androidx.compose.material3.Scaffold
+-import androidx.compose.material3.SecondaryTabRow
+-import androidx.compose.material3.Tab
+-import androidx.compose.material3.Text
+-import androidx.compose.material3.TopAppBar
+-import androidx.compose.runtime.Composable
+-import androidx.compose.runtime.getValue
+-import androidx.compose.runtime.mutableIntStateOf
+-import androidx.compose.runtime.mutableStateOf
+-import androidx.compose.runtime.remember
+-import androidx.compose.runtime.rememberCoroutineScope
+-import androidx.compose.runtime.setValue
+-import androidx.compose.ui.Alignment
+-import androidx.compose.ui.Modifier
+-import androidx.compose.ui.draw.clip
+-import androidx.compose.ui.graphics.Color
+-import androidx.compose.ui.graphics.toArgb
+-import androidx.compose.ui.platform.LocalContext
+-import androidx.compose.ui.unit.dp
+-import androidx.lifecycle.compose.collectAsStateWithLifecycle
+-import com.dokar.sonner.ToastType
+-import kotlinx.coroutines.launch
+-import me.rerere.common.android.Logging
+-import me.rerere.rikkahub.data.model.Avatar
+-import me.rerere.rikkahub.ui.components.ui.UIAvatar
+-import me.rerere.rikkahub.ui.components.nav.BackButton
+-import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
+-import me.rerere.rikkahub.ui.components.richtext.MathBlock
+-import me.rerere.rikkahub.ui.components.richtext.Mermaid
+-import me.rerere.rikkahub.ui.context.LocalSettings
+-import me.rerere.rikkahub.ui.context.LocalToaster
+-import me.rerere.rikkahub.ui.theme.JetbrainsMono
+-import org.koin.androidx.compose.koinViewModel
+-import kotlin.random.Random
+-import kotlin.random.nextInt
+-import kotlin.uuid.Uuid
+-
+-@Composable
+-fun DebugPage(vm: DebugVM = koinViewModel()) {
+-    val scope = rememberCoroutineScope()
+-    val context = LocalContext.current
+-    Scaffold(
+-        topBar = {
+-            TopAppBar(
+-                title = {
+-                    Text("Debug Mode")
+-                },
+-                navigationIcon = {
+-                    BackButton()
+-                }
+-            )
+-        }
+-    ) { contentPadding ->
+-        val state = rememberPagerState { 3 }
+-        Column(
+-            modifier = Modifier
+-                .fillMaxSize()
+-                .padding(contentPadding)
+-        ) {
+-            SecondaryTabRow(
+-                selectedTabIndex = state.currentPage,
+-            ) {
+-                Tab(
+-                    selected = state.currentPage == 0,
+-                    onClick = {
+-                        scope.launch {
+-                            state.animateScrollToPage(0)
+-                        }
+-                    },
+-                    text = {
+-                        Text("Main")
+-                    }
+-                )
+-                Tab(
+-                    selected = state.currentPage == 1,
+-                    onClick = {
+-                        scope.launch {
+-                            state.animateScrollToPage(1)
+-                        }
+-                    },
+-                    text = {
+-                        Text("Colors")
+-                    }
+-                )
+-                Tab(
+-                    selected = state.currentPage == 2,
+-                    onClick = {
+-                        scope.launch {
+-                            state.animateScrollToPage(2)
+-                        }
+-                    },
+-                    text = {
+-                        Text("Logging")
+-                    }
+-                )
+-            }
+-            HorizontalPager(
+-                state = state,
+-                modifier = Modifier
+-                    .fillMaxWidth()
+-                    .weight(1f)
+-            ) { page ->
+-                when (page) {
+-                    0 -> MainPage(vm)
+-                    1 -> ColorsPage()
+-                    2 -> Box {}
+-                }
+-            }
+-        }
+-    }
+-}
+-
+-@Composable
+-private fun MainPage(vm: DebugVM) {
+-    val settings = LocalSettings.current
+-    val conversationCount by vm.conversationCount.collectAsStateWithLifecycle()
+-    Column(
+-        modifier = Modifier
+-            .padding(8.dp)
+-            .verticalScroll(rememberScrollState())
+-            .imePadding(),
+-        verticalArrangement = Arrangement.spacedBy(4.dp)
+-    ) {
+-        var avatar: Avatar by remember { mutableStateOf(Avatar.Emoji("😎")) }
+-        UIAvatar(
+-            value = avatar,
+-            onUpdate = {
+-                println("Avatar updated: $it")
+-                avatar = it
+-            },
+-            name = "A"
+-        )
+-        Mermaid(
+-            code = """
+-                mindmap
+-                  root((mindmap))
+-                    Origins
+-                      Long history
+-                      ::icon(fa fa-book)
+-                      Popularisation
+-                        British popular psychology author Tony Buzan
+-                    Research
+-                      On effectiveness<br/>and features
+-                      On Automatic creation
+-                        Uses
+-                            Creative techniques
+-                            Strategic planning
+-                            Argument mapping
+-                    Tools
+-                      Pen and paper
+-                      Mermaid
+-                """.trimIndent(),
+-            modifier = Modifier.fillMaxWidth(),
+-        )
+-
+-        var counter by remember {
+-            mutableIntStateOf(0)
+-        }
+-        val toaster = LocalToaster.current
+-        Button(
+-            onClick = {
+-                toaster.show("测试 ${counter++}")
+-                toaster.show("测试 ${counter++}", type = ToastType.Info)
+-                toaster.show("测试 ${counter++}", type = ToastType.Error)
+-            }
+-        ) {
+-            Text("toast")
+-        }
+-        Button(
+-            onClick = {
+-                vm.updateSettings(
+-                    settings.copy(
+-                        chatModelId = Uuid.random()
+-                    )
+-                )
+-            }
+-        ) {
+-            Text("重置Chat模型")
+-        }
+-
+-        Button(
+-            onClick = {
+-                error("测试崩溃 ${Random.nextInt(0..1000)}")
+-            }
+-        ) {
+-            Text("崩溃")
+-        }
+-
+-        Row(
+-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+-            verticalAlignment = Alignment.CenterVertically,
+-        ) {
+-            Text(
+-                text = "Conversation 数量: ${conversationCount?.toString() ?: "..."}",
+-                modifier = Modifier.weight(1f),
+-            )
+-            Button(onClick = { vm.refreshConversationCount() }) {
+-                Text("刷新")
+-            }
+-        }
+-
+-        Button(
+-            onClick = {
+-                vm.createOversizedConversation(30)
+-                toaster.show("正在创建 30MB 超大对话...")
+-            }
+-        ) {
+-            Text("创建超大对话 (30MB)")
+-        }
+-
+-        Button(
+-            onClick = {
+-                vm.createConversationWithMessages(1024)
+-                toaster.show("正在创建 1024 条消息对话...")
+-            }
+-        ) {
+-            Text("创建 1024 个消息的聊天")
+-        }
+-
+-        HorizontalDivider()
+-
+-        Text("Launch Stats", style = MaterialTheme.typography.labelMedium)
+-
+-        var launchCountInput by remember(settings.launchCount) {
+-            mutableStateOf(settings.launchCount.toString())
+-        }
+-        Row(
+-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+-            verticalAlignment = Alignment.CenterVertically,
+-        ) {
+-            OutlinedTextField(
+-                value = launchCountInput,
+-                onValueChange = { launchCountInput = it },
+-                label = { Text("launchCount (current: ${settings.launchCount})") },
+-                modifier = Modifier.weight(1f),
+-                singleLine = true,
+-            )
+-            Button(onClick = {
+-                launchCountInput.toIntOrNull()?.let {
+-                    vm.updateSettings(settings.copy(launchCount = it))
+-                }
+-            }) {
+-                Text("Set")
+-            }
+-        }
+-
+-        var markdown by remember { mutableStateOf("") }
+-        MarkdownBlock(markdown, modifier = Modifier.fillMaxWidth())
+-        MathBlock(markdown)
+-        OutlinedTextField(
+-            value = markdown,
+-            onValueChange = { markdown = it },
+-            modifier = Modifier.fillMaxWidth()
+-        )
+-    }
+-}
+-
+-@Composable
+-private fun ColorsPage() {
+-    val colorScheme = MaterialTheme.colorScheme
+-    val colorTokens = remember(colorScheme) {
+-        listOf(
+-            "primary" to colorScheme.primary,
+-            "onPrimary" to colorScheme.onPrimary,
+-            "primaryContainer" to colorScheme.primaryContainer,
+-            "onPrimaryContainer" to colorScheme.onPrimaryContainer,
+-            "inversePrimary" to colorScheme.inversePrimary,
+-            "secondary" to colorScheme.secondary,
+-            "onSecondary" to colorScheme.onSecondary,
+-            "secondaryContainer" to colorScheme.secondaryContainer,
+-            "onSecondaryContainer" to colorScheme.onSecondaryContainer,
+-            "tertiary" to colorScheme.tertiary,
+-            "onTertiary" to colorScheme.onTertiary,
+-            "tertiaryContainer" to colorScheme.tertiaryContainer,
+-            "onTertiaryContainer" to colorScheme.onTertiaryContainer,
+-            "background" to colorScheme.background,
+-            "onBackground" to colorScheme.onBackground,
+-            "surface" to colorScheme.surface,
+-            "onSurface" to colorScheme.onSurface,
+-            "surfaceVariant" to colorScheme.surfaceVariant,
+-            "onSurfaceVariant" to colorScheme.onSurfaceVariant,
+-            "surfaceTint" to colorScheme.surfaceTint,
+-            "inverseSurface" to colorScheme.inverseSurface,
+-            "inverseOnSurface" to colorScheme.inverseOnSurface,
+-            "surfaceBright" to colorScheme.surfaceBright,
+-            "surfaceDim" to colorScheme.surfaceDim,
+-            "surfaceContainer" to colorScheme.surfaceContainer,
+-            "surfaceContainerHigh" to colorScheme.surfaceContainerHigh,
+-            "surfaceContainerHighest" to colorScheme.surfaceContainerHighest,
+-            "surfaceContainerLow" to colorScheme.surfaceContainerLow,
+-            "surfaceContainerLowest" to colorScheme.surfaceContainerLowest,
+-            "error" to colorScheme.error,
+-            "onError" to colorScheme.onError,
+-            "errorContainer" to colorScheme.errorContainer,
+-            "onErrorContainer" to colorScheme.onErrorContainer,
+-            "outline" to colorScheme.outline,
+-            "outlineVariant" to colorScheme.outlineVariant,
+-            "scrim" to colorScheme.scrim,
+-            "primaryFixed" to colorScheme.primaryFixed,
+-            "primaryFixedDim" to colorScheme.primaryFixedDim,
+-            "onPrimaryFixed" to colorScheme.onPrimaryFixed,
+-            "onPrimaryFixedVariant" to colorScheme.onPrimaryFixedVariant,
+-            "secondaryFixed" to colorScheme.secondaryFixed,
+-            "secondaryFixedDim" to colorScheme.secondaryFixedDim,
+-            "onSecondaryFixed" to colorScheme.onSecondaryFixed,
+-            "onSecondaryFixedVariant" to colorScheme.onSecondaryFixedVariant,
+-            "tertiaryFixed" to colorScheme.tertiaryFixed,
+-            "tertiaryFixedDim" to colorScheme.tertiaryFixedDim,
+-            "onTertiaryFixed" to colorScheme.onTertiaryFixed,
+-            "onTertiaryFixedVariant" to colorScheme.onTertiaryFixedVariant,
+-        )
+-    }
+-    LazyColumn(
+-        contentPadding = PaddingValues(8.dp),
+-        verticalArrangement = Arrangement.spacedBy(4.dp),
+-    ) {
+-        items(colorTokens, key = { it.first }) { (name, color) ->
+-            ColorTokenItem(name, color)
+-        }
+-    }
+-}
+-
+-@Composable
+-private fun ColorTokenItem(name: String, color: Color) {
+-    val shape = RoundedCornerShape(8.dp)
+-    Row(
+-        modifier = Modifier
+-            .fillMaxWidth()
+-            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, shape)
+-            .clip(shape)
+-            .padding(8.dp),
+-        horizontalArrangement = Arrangement.spacedBy(12.dp),
+-        verticalAlignment = Alignment.CenterVertically,
+-    ) {
+-        Box(
+-            modifier = Modifier
+-                .height(40.dp)
+-                .weight(1f)
+-                .clip(RoundedCornerShape(4.dp))
+-                .background(color)
+-                .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(4.dp))
+-        )
+-        Column(modifier = Modifier.weight(2f)) {
+-            Text(name, style = MaterialTheme.typography.bodyMedium)
+-            Text(
+-                color.toHexString(),
+-                style = MaterialTheme.typography.bodySmall,
+-                fontFamily = JetbrainsMono,
+-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+-            )
+-        }
+-    }
+-}
+-
+-private fun Color.toHexString(): String {
+-    val argb = toArgb()
+-    return "#%08X".format(argb)
+-}
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/debug/DebugVM.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/debug/DebugVM.kt
+deleted file mode 100644
+index 93e1219b..00000000
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/debug/DebugVM.kt
++++ /dev/null
+@@ -1,147 +0,0 @@
+-package me.rerere.rikkahub.ui.pages.debug
+-
+-import androidx.lifecycle.ViewModel
+-import androidx.lifecycle.viewModelScope
+-import kotlinx.coroutines.flow.MutableStateFlow
+-import kotlinx.coroutines.flow.SharingStarted
+-import kotlinx.coroutines.flow.StateFlow
+-import kotlinx.coroutines.flow.asStateFlow
+-import kotlinx.coroutines.flow.stateIn
+-import kotlinx.coroutines.launch
+-import me.rerere.ai.core.MessageRole
+-import me.rerere.ai.ui.UIMessage
+-import me.rerere.ai.ui.UIMessagePart
+-import me.rerere.rikkahub.data.datastore.DEFAULT_ASSISTANT_ID
+-import me.rerere.rikkahub.data.datastore.Settings
+-import me.rerere.rikkahub.data.datastore.SettingsStore
+-import me.rerere.rikkahub.data.model.Conversation
+-import me.rerere.rikkahub.data.model.MessageNode
+-import me.rerere.rikkahub.data.repository.ConversationRepository
+-import kotlinx.datetime.TimeZone
+-import kotlinx.datetime.toLocalDateTime
+-import kotlin.time.Clock
+-import kotlin.random.Random
+-import kotlin.uuid.Uuid
+-
+-class DebugVM(
+-    private val settingsStore: SettingsStore,
+-    private val conversationRepository: ConversationRepository,
+-) : ViewModel() {
+-    val settings: StateFlow<Settings> = settingsStore.settingsFlow
+-        .stateIn(viewModelScope, SharingStarted.Lazily, Settings.dummy())
+-
+-    private val _conversationCount = MutableStateFlow<Int?>(null)
+-    val conversationCount: StateFlow<Int?> = _conversationCount.asStateFlow()
+-
+-    init {
+-        refreshConversationCount()
+-    }
+-
+-    fun refreshConversationCount() {
+-        viewModelScope.launch {
+-            _conversationCount.value = conversationRepository.countConversations()
+-        }
+-    }
+-
+-    fun updateSettings(settings: Settings) {
+-        viewModelScope.launch {
+-            settingsStore.transformLatest { current ->
+-                current.copy(
+-                    chatModelId = settings.chatModelId,
+-                    launchCount = settings.launchCount,
+-                )
+-            }
+-        }
+-    }
+-
+-    /**
+-     * 创建一个超大的对话用于测试 CursorWindow 限制
+-     * @param sizeMB 目标大小（MB）
+-     */
+-    fun createOversizedConversation(sizeMB: Int = 3) {
+-        viewModelScope.launch {
+-            val targetSize = sizeMB * 1024 * 1024
+-            val messageNodes = mutableListOf<MessageNode>()
+-            var currentSize = 0
+-
+-            // 生成大量消息直到达到目标大小
+-            var index = 0
+-            while (currentSize < targetSize) {
+-                // 生成一个包含大量文本的消息（约 100KB 每条）
+-                val largeText = buildString {
+-                    repeat(100) {
+-                        append("这是一段很长的测试文本，用于测试 CursorWindow 的大小限制。")
+-                        append("Row too big to fit into CursorWindow 错误通常发生在单行数据超过 2MB 时。")
+-                        append("Lorem ipsum dolor sit amet, consectetur adipiscing elit. ")
+-                        append("Index: $index, Block: $it. ")
+-                    }
+-                }
+-
+-                val userMessage = UIMessage(
+-                    id = Uuid.random(),
+-                    role = MessageRole.USER,
+-                    parts = listOf(UIMessagePart.Text(largeText)),
+-                    createdAt = Clock.System.now().toLocalDateTime(TimeZone.currentSystemDefault()),
+-                )
+-                val assistantMessage = UIMessage(
+-                    id = Uuid.random(),
+-                    role = MessageRole.ASSISTANT,
+-                    parts = listOf(UIMessagePart.Text("回复: $largeText")),
+-                    createdAt = Clock.System.now().toLocalDateTime(TimeZone.currentSystemDefault()),
+-                )
+-
+-                messageNodes.add(MessageNode.of(userMessage))
+-                messageNodes.add(MessageNode.of(assistantMessage))
+-
+-                currentSize += largeText.length * 2 * 2 // 大约估算
+-                index++
+-            }
+-
+-            val conversation = Conversation(
+-                id = Uuid.random(),
+-                assistantId = DEFAULT_ASSISTANT_ID,
+-                title = "超大对话测试 (${sizeMB}MB)",
+-                messageNodes = messageNodes,
+-            )
+-
+-            conversationRepository.insertConversation(conversation)
+-        }
+-    }
+-
+-    fun createConversationWithMessages(messageCount: Int = 1024) {
+-        viewModelScope.launch {
+-            val messageNodes = ArrayList<MessageNode>(messageCount)
+-            val timeZone = TimeZone.currentSystemDefault()
+-            repeat(messageCount) { index ->
+-                val role = if (index % 2 == 0) MessageRole.USER else MessageRole.ASSISTANT
+-                val message = UIMessage(
+-                    id = Uuid.random(),
+-                    role = role,
+-                    parts = listOf(UIMessagePart.Text(randomMessageText(index, role))),
+-                    createdAt = Clock.System.now().toLocalDateTime(timeZone),
+-                )
+-                messageNodes.add(MessageNode.of(message))
+-            }
+-
+-            val conversation = Conversation(
+-                id = Uuid.random(),
+-                assistantId = DEFAULT_ASSISTANT_ID,
+-                title = "${messageCount}条消息测试",
+-                messageNodes = messageNodes,
+-            )
+-
+-            conversationRepository.insertConversation(conversation)
+-        }
+-    }
+-
+-    private fun randomMessageText(index: Int, role: MessageRole): String {
+-        val fragments = listOf(
+-            "快速", "随机", "消息", "样例", "用于", "测试", "列表", "渲染", "滚动", "性能",
+-            "聊天", "对话", "内容", "结构", "验证", "分页", "顺序", "稳定", "系统",
+-        )
+-        val wordCount = Random.nextInt(6, 14)
+-        val prefix = if (role == MessageRole.USER) "用户" else "助手"
+-        val body = List(wordCount) { fragments.random() }.joinToString(" ")
+-        return "$prefix#${index + 1}: $body"
+-    }
+-}
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPage.kt
+index 702ec718..3fb762c4 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPage.kt
+@@ -36,6 +36,7 @@ import me.rerere.hugeicons.HugeIcons
+ import me.rerere.hugeicons.stroke.AiMagic
+ import me.rerere.hugeicons.stroke.Alert01
+ import me.rerere.hugeicons.stroke.Brain02
++import me.rerere.hugeicons.stroke.ChartColumn
+ import me.rerere.hugeicons.stroke.Database02
+ import me.rerere.hugeicons.stroke.GlobalSearch
+ import me.rerere.hugeicons.stroke.ImageUpload
+@@ -217,6 +218,12 @@ fun SettingPage(vm: SettingVM = koinViewModel()) {
+                         },
+                         headlineContent = { Text(stringResource(R.string.setting_page_chat_storage)) },
+                     )
++                    item(
++                        onClick = { navController.navigate(Screen.ChatLogs) },
++                        leadingContent = { Icon(HugeIcons.ChartColumn, null) },
++                        supportingContent = { Text(stringResource(R.string.setting_page_chat_log_desc)) },
++                        headlineContent = { Text(stringResource(R.string.setting_page_chat_log)) },
++                    )
+                 }
+             }
+         }
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPreferencesGeneralPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPreferencesGeneralPage.kt
+index 082321ee..edec947d 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPreferencesGeneralPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPreferencesGeneralPage.kt
+@@ -25,8 +25,10 @@ import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.unit.dp
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import me.rerere.rikkahub.R
++import me.rerere.rikkahub.data.ai.AUTO_RETRY_MAX_ATTEMPTS
+ import me.rerere.rikkahub.data.ai.AUTO_RETRY_MAX_DURATION_MINUTES
+ import me.rerere.rikkahub.data.ai.AUTO_RETRY_MAX_INTERVAL_SECONDS
++import me.rerere.rikkahub.data.ai.AUTO_RETRY_MIN_ATTEMPTS
+ import me.rerere.rikkahub.data.ai.AUTO_RETRY_MIN_DURATION_MINUTES
+ import me.rerere.rikkahub.data.ai.AUTO_RETRY_MIN_INTERVAL_SECONDS
+ import me.rerere.rikkahub.data.datastore.DisplaySetting
+@@ -261,6 +263,9 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
+             }
+ 
+             item {
++                var maxAttempts by remember(settings.autoRetryMaxAttempts) {
++                    mutableStateOf(settings.autoRetryMaxAttempts)
++                }
+                 var intervalSeconds by remember(settings.autoRetryIntervalSeconds) {
+                     mutableStateOf(settings.autoRetryIntervalSeconds)
+                 }
+@@ -288,6 +293,38 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
+                         },
+                     )
+                     if (settings.autoRetryEnabled) {
++                        item(
++                            headlineContent = {
++                                Text(stringResource(R.string.setting_display_page_auto_retry_max_attempts_title))
++                            },
++                            supportingContent = {
++                                Row(
++                                    modifier = Modifier.fillMaxWidth(),
++                                    verticalAlignment = Alignment.CenterVertically,
++                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
++                                ) {
++                                    Slider(
++                                        value = maxAttempts.toFloat(),
++                                        // 拖动时先动本地状态，松手才写入设置，避免每个滑过位置都落盘
++                                        onValueChange = { maxAttempts = it.toInt() },
++                                        onValueChangeFinished = {
++                                            vm.updateSettings(
++                                                settings.copy(autoRetryMaxAttempts = maxAttempts)
++                                            )
++                                        },
++                                        valueRange = AUTO_RETRY_MIN_ATTEMPTS.toFloat()..AUTO_RETRY_MAX_ATTEMPTS.toFloat(),
++                                        steps = AUTO_RETRY_MAX_ATTEMPTS - AUTO_RETRY_MIN_ATTEMPTS - 1,
++                                        modifier = Modifier.weight(1f)
++                                    )
++                                    Text(
++                                        text = stringResource(
++                                            R.string.setting_display_page_auto_retry_max_attempts_value,
++                                            maxAttempts,
++                                        )
++                                    )
++                                }
++                            },
++                        )
+                         item(
+                             headlineContent = {
+                                 Text(stringResource(R.string.setting_display_page_auto_retry_interval_title))
+@@ -354,6 +391,29 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
+                     }
+                 }
+             }
++            item {
++                CardGroup(
++                    modifier = Modifier.padding(horizontal = 8.dp),
++                    title = { Text(stringResource(R.string.setting_display_page_prompt_cache)) },
++                ) {
++                    item(
++                        headlineContent = {
++                            Text(stringResource(R.string.setting_display_page_prompt_cache_enabled_title))
++                        },
++                        supportingContent = {
++                            Text(stringResource(R.string.setting_display_page_prompt_cache_enabled_desc))
++                        },
++                        trailingContent = {
++                            Switch(
++                                checked = settings.promptCacheEnabled,
++                                onCheckedChange = {
++                                    vm.updateSettings(settings.copy(promptCacheEnabled = it))
++                                },
++                            )
++                        },
++                    )
++                }
++            }
+         }
+     }
+ }
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingVM.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingVM.kt
+index 5e57978b..3e76504e 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingVM.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingVM.kt
+@@ -25,12 +25,12 @@ class SettingVM(
+                     dynamicColor = settings.dynamicColor,
+                     themeId = settings.themeId,
+                     customThemes = settings.customThemes,
+-                    developerMode = settings.developerMode,
+                     displaySetting = settings.displaySetting,
+                     promptCacheEnabled = settings.promptCacheEnabled,
+                     autoRetryEnabled = settings.autoRetryEnabled,
+                     autoRetryIntervalSeconds = settings.autoRetryIntervalSeconds,
+                     autoRetryMaxDurationMinutes = settings.autoRetryMaxDurationMinutes,
++                    autoRetryMaxAttempts = settings.autoRetryMaxAttempts,
+                     favoriteModels = settings.favoriteModels,
+                     chatModelId = settings.chatModelId,
+                     fastModelId = settings.fastModelId,
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ProviderConfigure.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ProviderConfigure.kt
+index 1dbcfdf6..8845e188 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ProviderConfigure.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ProviderConfigure.kt
+@@ -30,6 +30,8 @@ import androidx.compose.ui.text.input.VisualTransformation
+ import androidx.compose.ui.unit.dp
+ import com.dokar.sonner.ToastType
+ import me.rerere.ai.provider.ClaudePromptCacheTtl
++import me.rerere.ai.provider.PromptCacheKeyRejection
++import me.rerere.ai.provider.PromptCacheRouting
+ import me.rerere.ai.provider.ProviderSetting
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.data.datastore.DEFAULT_PROVIDERS
+@@ -288,6 +290,40 @@ private fun ProviderConfigureOpenAI(
+             onCheckedChange = { onEdit(provider.copy(includeHistoryReasoning = it)) }
+         )
+     }
++
++    Text(stringResource(R.string.setting_provider_page_prompt_cache_routing))
++    SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
++        PromptCacheRouting.entries.forEachIndexed { index, routing ->
++            SegmentedButton(
++                shape = SegmentedButtonDefaults.itemShape(
++                    index = index,
++                    count = PromptCacheRouting.entries.size
++                ),
++                label = {
++                    Text(
++                        stringResource(
++                            when (routing) {
++                                PromptCacheRouting.AUTO -> R.string.setting_provider_page_prompt_cache_routing_auto
++                                PromptCacheRouting.ENABLED -> R.string.setting_provider_page_prompt_cache_routing_enabled
++                                PromptCacheRouting.DISABLED -> R.string.setting_provider_page_prompt_cache_routing_disabled
++                            }
++                        )
++                    )
++                },
++                selected = provider.promptCacheRouting == routing,
++                onClick = {
++                    // 用户重新选择就是一次明确的重试，清掉“这家上游拒绝过”的记录
++                    PromptCacheKeyRejection.clear(provider.id.toString())
++                    onEdit(provider.copy(promptCacheRouting = routing))
++                }
++            )
++        }
++    }
++    Text(
++        text = stringResource(R.string.setting_provider_page_prompt_cache_routing_desc),
++        style = MaterialTheme.typography.bodySmall,
++        color = MaterialTheme.colorScheme.onSurfaceVariant,
++    )
+ }
+ 
+ @Composable
+diff --git a/app/src/main/java/me/rerere/rikkahub/utils/CrashHandler.kt b/app/src/main/java/me/rerere/rikkahub/utils/CrashHandler.kt
+index 61c45cbe..ee23db61 100644
+--- a/app/src/main/java/me/rerere/rikkahub/utils/CrashHandler.kt
++++ b/app/src/main/java/me/rerere/rikkahub/utils/CrashHandler.kt
+@@ -3,6 +3,7 @@ package me.rerere.rikkahub.utils
+ import android.content.Context
+ import android.util.Log
+ import androidx.core.content.edit
++import me.rerere.rikkahub.data.log.ChatLogFile
+ 
+ private const val TAG = "CrashHandler"
+ private const val PREFS_NAME = "crash_handler"
+@@ -17,6 +18,8 @@ object CrashHandler {
+         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+             Log.e(TAG, "Uncaught exception on thread ${thread.name}", throwable)
+             markCrashed(appContext, thread, throwable)
++            // 同一份运行日志里也留一条。崩溃线程上同步写，写失败不影响原有处理。
++            ChatLogFile.appendCrash(appContext, thread.name, throwable)
+             defaultHandler?.uncaughtException(thread, throwable)
+         }
+     }
+diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
+index 6cbb101a..6c8e3241 100644
+--- a/app/src/main/res/values-ja/strings.xml
++++ b/app/src/main/res/values-ja/strings.xml
+@@ -753,6 +753,14 @@
+   <string name="setting_provider_page_claude_prompt_cache_ttl">プロンプトキャッシュ TTL</string>
+   <string name="setting_provider_page_claude_prompt_cache_ttl_1h">1時間</string>
+   <string name="setting_provider_page_claude_prompt_cache_ttl_5m">5分</string>
++  <string name="setting_provider_page_prompt_cache_routing">プロンプトキャッシュキー</string>
++  <string name="setting_provider_page_prompt_cache_routing_auto">自動</string>
++  <string name="setting_provider_page_prompt_cache_routing_enabled">オン</string>
++  <string name="setting_provider_page_prompt_cache_routing_disabled">オフ</string>
++  <string name="setting_provider_page_prompt_cache_routing_desc">自動は対応を確認済みの接続先にだけキャッシュキーを送ります。接続先が対応していればオン、未知の項目で 400 になる場合はオフにしてください。キーには安定した会話 ID だけを使います。</string>
++  <string name="setting_display_page_prompt_cache">プロンプトキャッシュ</string>
++  <string name="setting_display_page_prompt_cache_enabled_title">キャッシュ情報を送信</string>
++  <string name="setting_display_page_prompt_cache_enabled_desc">オフにするとアプリはキャッシュ項目を送らなくなります。接続先が保存したキャッシュは削除されません。</string>
+   <string name="setting_provider_page_claude_prompt_caching">プロンプトキャッシュ（cache_control）</string>
+   <string name="setting_provider_page_configuration">設定</string>
+   <string name="setting_provider_page_configure_provider_override">プロバイダーオーバーライドを構成</string>
+diff --git a/app/src/main/res/values-ko-rKR/strings.xml b/app/src/main/res/values-ko-rKR/strings.xml
+index 956f00ec..41db8ec1 100644
+--- a/app/src/main/res/values-ko-rKR/strings.xml
++++ b/app/src/main/res/values-ko-rKR/strings.xml
+@@ -753,6 +753,14 @@
+   <string name="setting_provider_page_claude_prompt_cache_ttl">프롬프트 캐시 TTL</string>
+   <string name="setting_provider_page_claude_prompt_cache_ttl_1h">1시간</string>
+   <string name="setting_provider_page_claude_prompt_cache_ttl_5m">5분</string>
++  <string name="setting_provider_page_prompt_cache_routing">프롬프트 캐시 키</string>
++  <string name="setting_provider_page_prompt_cache_routing_auto">자동</string>
++  <string name="setting_provider_page_prompt_cache_routing_enabled">켜기</string>
++  <string name="setting_provider_page_prompt_cache_routing_disabled">끄기</string>
++  <string name="setting_provider_page_prompt_cache_routing_desc">자동은 지원이 확인된 서버에만 캐시 키를 보냅니다. 서버가 지원하면 켜기, 알 수 없는 필드로 400이 나면 끄기를 선택하세요. 키에는 안정적인 대화 ID만 사용합니다.</string>
++  <string name="setting_display_page_prompt_cache">프롬프트 캐시</string>
++  <string name="setting_display_page_prompt_cache_enabled_title">캐시 정보 보내기</string>
++  <string name="setting_display_page_prompt_cache_enabled_desc">끄면 앱이 캐시 관련 필드를 보내지 않습니다. 서버에 저장된 캐시는 삭제되지 않습니다.</string>
+   <string name="setting_provider_page_claude_prompt_caching">프롬프트 캐싱 (cache_control)</string>
+   <string name="setting_provider_page_configuration">구성</string>
+   <string name="setting_provider_page_configure_provider_override">제공업체 재정의 구성</string>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 894a61c7..5043f5ec 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -753,6 +753,14 @@
+   <string name="setting_provider_page_claude_prompt_cache_ttl">TTL кэша промпта</string>
+   <string name="setting_provider_page_claude_prompt_cache_ttl_1h">1 час</string>
+   <string name="setting_provider_page_claude_prompt_cache_ttl_5m">5 минут</string>
++  <string name="setting_provider_page_prompt_cache_routing">Ключ кэша промпта</string>
++  <string name="setting_provider_page_prompt_cache_routing_auto">Авто</string>
++  <string name="setting_provider_page_prompt_cache_routing_enabled">Вкл</string>
++  <string name="setting_provider_page_prompt_cache_routing_disabled">Выкл</string>
++  <string name="setting_provider_page_prompt_cache_routing_desc">В режиме «Авто» ключ кэша отправляется только проверенным серверам. Включите, если сервер его поддерживает, или выключите, если строгий сервер отвечает 400 на неизвестные поля. В ключе используется только стабильный ID диалога.</string>
++  <string name="setting_display_page_prompt_cache">Кэш промпта</string>
++  <string name="setting_display_page_prompt_cache_enabled_title">Отправлять подсказки кэша</string>
++  <string name="setting_display_page_prompt_cache_enabled_desc">Если выключено, приложение не отправляет поля кэша. Кэш, сохранённый провайдером, не удаляется.</string>
+   <string name="setting_provider_page_claude_prompt_caching">Кэширование промптов (cache_control)</string>
+   <string name="setting_provider_page_configuration">Конфигурация</string>
+   <string name="setting_provider_page_configure_provider_override">Настроить переопределение поставщика</string>
+diff --git a/app/src/main/res/values-zh-rTW/strings.xml b/app/src/main/res/values-zh-rTW/strings.xml
+index b538f461..6e5b6f27 100644
+--- a/app/src/main/res/values-zh-rTW/strings.xml
++++ b/app/src/main/res/values-zh-rTW/strings.xml
+@@ -753,6 +753,14 @@
+   <string name="setting_provider_page_claude_prompt_cache_ttl">提示快取時長</string>
+   <string name="setting_provider_page_claude_prompt_cache_ttl_1h">1 小時</string>
+   <string name="setting_provider_page_claude_prompt_cache_ttl_5m">5 分鐘</string>
++  <string name="setting_provider_page_prompt_cache_routing">提示詞快取鍵</string>
++  <string name="setting_provider_page_prompt_cache_routing_auto">自動</string>
++  <string name="setting_provider_page_prompt_cache_routing_enabled">開啟</string>
++  <string name="setting_provider_page_prompt_cache_routing_disabled">關閉</string>
++  <string name="setting_provider_page_prompt_cache_routing_desc">自動只對已確認支援的介面送出快取鍵。介面支援就選開啟；介面會因為不認識的欄位回 400 就選關閉。鍵只用穩定的對話 ID。</string>
++  <string name="setting_display_page_prompt_cache">提示詞快取</string>
++  <string name="setting_display_page_prompt_cache_enabled_title">主動送出快取提示</string>
++  <string name="setting_display_page_prompt_cache_enabled_desc">關閉後應用程式不再主動帶快取欄位；這不會刪掉服務商已經存的快取。</string>
+   <string name="setting_provider_page_claude_prompt_caching">提示快取 (cache_control)</string>
+   <string name="setting_provider_page_configuration">配置</string>
+   <string name="setting_provider_page_configure_provider_override">配置提供商覆寫</string>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index 080d77bc..1654e053 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -217,6 +217,31 @@
+   <string name="chat_input_placeholder">输入消息与AI聊天</string>
+   <string name="chat_input_unsupported_file_type">不支持的文件类型：%s</string>
+   <string name="chat_input_file_read_failed">文件读取失败：%s</string>
++  <string name="chat_log_cache_hit_rate">缓存命中率</string>
++  <string name="chat_log_cache_read">缓存读</string>
++  <string name="chat_log_cache_write">缓存写</string>
++  <string name="chat_log_clear">清空</string>
++  <string name="chat_log_completion_tokens">输出</string>
++  <string name="chat_log_crash_thread">线程</string>
++  <string name="chat_log_empty">还没有记录。</string>
++  <string name="chat_log_error_type">错误类型</string>
++  <string name="chat_log_level_all">全记</string>
++  <string name="chat_log_level_errors">只记错误</string>
++  <string name="chat_log_level_off">关</string>
++  <string name="chat_log_level_title">记录什么</string>
++  <string name="chat_log_model">模型</string>
++  <string name="chat_log_page_title">运行日志</string>
++  <string name="chat_log_prompt_tokens">输入</string>
++  <string name="chat_log_provider">供应商</string>
++  <string name="chat_log_reason">原因</string>
++  <string name="chat_log_refresh">刷新</string>
++  <string name="chat_log_retention_hint">只保留 24 小时，每次启动 App 清一次。</string>
++  <string name="chat_log_tool_name">工具</string>
++  <string name="chat_log_total_tokens">合计</string>
++  <string name="chat_log_type_crash">崩溃</string>
++  <string name="chat_log_type_tool_failure">工具调用失败</string>
++  <string name="chat_log_type_usage">请求 token</string>
++  <string name="chat_log_upstream_code">上游报错码</string>
+   <string name="chat_message_add_favorite">添加收藏</string>
+   <string name="chat_message_remove_favorite">取消收藏</string>
+   <string name="chat_message_tool_approve">批准</string>
+@@ -575,6 +600,8 @@
+   <string name="setting_display_page_auto_retry_interval_desc">两次尝试同一个请求之间等待多久</string>
+   <string name="setting_display_page_auto_retry_interval_title">重试间隔</string>
+   <string name="setting_display_page_auto_retry_interval_value">%1$d 秒</string>
++  <string name="setting_display_page_auto_retry_max_attempts_title">最大自动重试次数</string>
++  <string name="setting_display_page_auto_retry_max_attempts_value">%1$d 次</string>
+   <string name="setting_display_page_auto_retry_max_duration_desc">一次生成允许用于重试的总时长，用完就停止重试</string>
+   <string name="setting_display_page_auto_retry_max_duration_title">最大重试时间</string>
+   <string name="setting_display_page_auto_retry_max_duration_value">%1$d 分钟</string>
+@@ -722,6 +749,8 @@
+   <string name="setting_page_built_in_tools_url_context_desc">启用 URL 内容处理</string>
+   <string name="setting_page_chat_storage">聊天记录存储</string>
+   <string name="setting_page_chat_storage_desc">%1$d 个文件，%2$.2f MB</string>
++  <string name="setting_page_chat_log">运行日志</string>
++  <string name="setting_page_chat_log_desc">缓存命中率、工具调用失败、崩溃</string>
+   <string name="setting_page_code_display_settings">代码显示</string>
+   <string name="setting_page_color_mode">颜色模式</string>
+   <string name="setting_page_color_mode_dark">深色</string>
+@@ -795,6 +824,14 @@
+   <string name="setting_provider_page_claude_prompt_cache_ttl">提示缓存时长</string>
+   <string name="setting_provider_page_claude_prompt_cache_ttl_1h">1 小时</string>
+   <string name="setting_provider_page_claude_prompt_cache_ttl_5m">5 分钟</string>
++  <string name="setting_provider_page_prompt_cache_routing">提示词缓存键</string>
++  <string name="setting_provider_page_prompt_cache_routing_auto">自动</string>
++  <string name="setting_provider_page_prompt_cache_routing_enabled">开启</string>
++  <string name="setting_provider_page_prompt_cache_routing_disabled">关闭</string>
++  <string name="setting_provider_page_prompt_cache_routing_desc">自动只对已确认支持的接口发送缓存键。接口支持就选开启；接口会因为不认识的字段报 400 就选关闭。键只用稳定的对话 ID。</string>
++  <string name="setting_display_page_prompt_cache">提示词缓存</string>
++  <string name="setting_display_page_prompt_cache_enabled_title">主动发送缓存提示</string>
++  <string name="setting_display_page_prompt_cache_enabled_desc">关闭后应用不再主动带缓存字段；这不会删掉服务商已经存的缓存。</string>
+   <string name="setting_provider_page_claude_prompt_caching">提示缓存 (cache_control)</string>
+   <string name="setting_provider_page_configuration">配置</string>
+   <string name="setting_provider_page_configure_provider_override">配置提供商重写</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 8853b09a..c7985469 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -219,6 +219,31 @@
+   <string name="chat_input_placeholder">Chat with AI</string>
+   <string name="chat_input_unsupported_file_type">Unsupported file type: %s</string>
+   <string name="chat_input_file_read_failed">Failed to read file: %s</string>
++  <string name="chat_log_cache_hit_rate">Cache hit rate</string>
++  <string name="chat_log_cache_read">Cache read</string>
++  <string name="chat_log_cache_write">Cache write</string>
++  <string name="chat_log_clear">Clear</string>
++  <string name="chat_log_completion_tokens">Output</string>
++  <string name="chat_log_crash_thread">Thread</string>
++  <string name="chat_log_empty">Nothing logged yet.</string>
++  <string name="chat_log_error_type">Error type</string>
++  <string name="chat_log_level_all">Everything</string>
++  <string name="chat_log_level_errors">Errors only</string>
++  <string name="chat_log_level_off">Off</string>
++  <string name="chat_log_level_title">What to record</string>
++  <string name="chat_log_model">Model</string>
++  <string name="chat_log_page_title">Runtime Log</string>
++  <string name="chat_log_prompt_tokens">Input</string>
++  <string name="chat_log_provider">Provider</string>
++  <string name="chat_log_reason">Reason</string>
++  <string name="chat_log_refresh">Refresh</string>
++  <string name="chat_log_retention_hint">Kept for 24 hours and cleared on each app launch.</string>
++  <string name="chat_log_tool_name">Tool</string>
++  <string name="chat_log_total_tokens">Total</string>
++  <string name="chat_log_type_crash">Crash</string>
++  <string name="chat_log_type_tool_failure">Tool failure</string>
++  <string name="chat_log_type_usage">Request tokens</string>
++  <string name="chat_log_upstream_code">Upstream code</string>
+   <string name="chat_message_add_favorite">Add Favorite</string>
+   <string name="chat_message_remove_favorite">Remove Favorite</string>
+   <string name="chat_message_tool_approve">Approve</string>
+@@ -584,6 +609,8 @@
+   <string name="setting_display_page_auto_retry_interval_desc">How long to wait before trying the same request again.</string>
+   <string name="setting_display_page_auto_retry_interval_title">Retry interval</string>
+   <string name="setting_display_page_auto_retry_interval_value">%1$d s</string>
++  <string name="setting_display_page_auto_retry_max_attempts_title">Maximum retry count</string>
++  <string name="setting_display_page_auto_retry_max_attempts_value">%1$d times</string>
+   <string name="setting_display_page_auto_retry_max_duration_desc">Total time allowed for retrying one generation. Retrying stops when it runs out.</string>
+   <string name="setting_display_page_auto_retry_max_duration_title">Maximum retry time</string>
+   <string name="setting_display_page_auto_retry_max_duration_value">%1$d min</string>
+@@ -734,6 +761,8 @@
+   <string name="setting_page_built_in_tools_url_context_desc">Enable URL content processing</string>
+   <string name="setting_page_chat_storage">Chat Storage</string>
+   <string name="setting_page_chat_storage_desc">%1$d files, %2$.2f MB</string>
++  <string name="setting_page_chat_log">Runtime Log</string>
++  <string name="setting_page_chat_log_desc">Cache hit rate, tool failures, crashes</string>
+   <string name="setting_page_code_display_settings">Code Display</string>
+   <string name="setting_page_color_mode">Color Mode</string>
+   <string name="setting_page_color_mode_dark">Dark</string>
+@@ -820,6 +849,14 @@
+   <string name="setting_provider_page_claude_prompt_cache_ttl">Prompt cache TTL</string>
+   <string name="setting_provider_page_claude_prompt_cache_ttl_1h">1 hour</string>
+   <string name="setting_provider_page_claude_prompt_cache_ttl_5m">5 minutes</string>
++  <string name="setting_provider_page_prompt_cache_routing">Prompt cache key</string>
++  <string name="setting_provider_page_prompt_cache_routing_auto">Auto</string>
++  <string name="setting_provider_page_prompt_cache_routing_enabled">On</string>
++  <string name="setting_provider_page_prompt_cache_routing_disabled">Off</string>
++  <string name="setting_provider_page_prompt_cache_routing_desc">Auto sends the cache key only to servers already known to accept it. Choose On if your endpoint supports it, or Off if a strict server answers 400 for unknown fields. The key only ever uses the stable conversation ID.</string>
++  <string name="setting_display_page_prompt_cache">Prompt cache</string>
++  <string name="setting_display_page_prompt_cache_enabled_title">Send prompt cache hints</string>
++  <string name="setting_display_page_prompt_cache_enabled_desc">When off, the app stops sending cache fields. It does not delete any cache the provider already stored.</string>
+   <string name="setting_provider_page_claude_prompt_caching">Prompt caching (cache_control)</string>
+   <string name="setting_provider_page_configuration">Configuration</string>
+   <string name="setting_provider_page_configure_provider_override">Configure Provider Override</string>
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/MemorySnapshotTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/MemorySnapshotTest.kt
+index c56f7f46..acac4ea5 100644
+--- a/app/src/test/java/me/rerere/rikkahub/data/ai/MemorySnapshotTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/MemorySnapshotTest.kt
+@@ -123,7 +123,6 @@ class MemorySnapshotTest {
+         )
+ 
+         assertTrue(resolution.delta.isEmpty())
+-        assertEquals(0, snapshots.getValue("conversation").patchCount)
+     }
+ 
+     @Test
+@@ -141,70 +140,92 @@ class MemorySnapshotTest {
+         }
+ 
+         val blocks = snapshots.getValue("conversation").cacheBlocks.map { it.text }
+-        assertEquals(4, blocks.size)
++        assertEquals(1, blocks.size)
+         assertTrue(blocks[0].contains("Memory Base"))
+         assertTrue(blocks[0].contains("base"))
+-        assertTrue(blocks[1].contains("edited"))
+-        assertTrue(Regex("\\\"deleted\\\"\\s*:\\s*\\[\\s*1\\s*]").containsMatchIn(blocks[2]))
+-        assertTrue(blocks[3].contains("recreated"))
++        val patches = snapshots.getValue("conversation").committedPatches
++        assertEquals(3, patches.size)
++        assertTrue(patches[0].contains("edited"))
++        assertTrue(Regex("\\\"deleted\\\"\\s*:\\s*\\[\\s*1\\s*]").containsMatchIn(patches[1]))
++        assertTrue(patches[2].contains("recreated"))
+         assertEquals("recreated", snapshots.getValue("conversation").snapshot.single().content)
+     }
+ 
+     @Test
+-    fun `threshold candidate preserves committed patch state until commit then compacts`() {
++    fun `committed patches stay after history instead of rewriting the stable base`() {
+         val snapshots = mutableMapOf<String, MemorySnapshotState>()
+-        var current = listOf(memory(1, "v0"))
+-        prepareMemorySnapshot(snapshots, "conversation", current)
+-
+-        repeat(MEMORY_PATCH_COMPACTION_COUNT - 1) { index ->
+-            current = listOf(memory(1, "v${index + 1}"))
+-            val resolution = prepareMemorySnapshot(snapshots, "conversation", current)
+-            commitMemorySnapshot(snapshots, resolution.commit, current)
+-        }
+-        val beforeCandidate = snapshots.getValue("conversation")
+-        assertEquals(MEMORY_PATCH_COMPACTION_COUNT, beforeCandidate.cacheBlocks.size)
+-        assertEquals(MEMORY_PATCH_COMPACTION_COUNT - 1, beforeCandidate.patchCount)
++        prepareMemorySnapshot(snapshots, "conversation", listOf(memory(1, "base")))
+ 
+-        current = listOf(memory(1, "v$MEMORY_PATCH_COMPACTION_COUNT"))
+-        val thresholdCandidate = prepareMemorySnapshot(snapshots, "conversation", current)
+-        val uncommitted = snapshots.getValue("conversation")
++        val first = prepareMemorySnapshot(snapshots, "conversation", listOf(memory(1, "edited")))
++        assertEquals(1, first.delta.size)
++        assertEquals(1, first.claudePatches.size)
++        commitMemorySnapshot(snapshots, first.commit, listOf(memory(1, "edited")))
++
++        // The next request keeps the same stable Base and repeats the patch after history.
++        val second = prepareMemorySnapshot(snapshots, "conversation", listOf(memory(1, "edited")))
++        assertEquals(1, second.claudeCacheBlocks!!.size)
++        assertTrue(second.claudeCacheBlocks.single().text.contains("base"))
++        assertTrue(!second.claudeCacheBlocks.single().text.contains("edited"))
++        assertEquals(1, second.claudePatches.size)
++        assertTrue(second.claudePatches.single().toText().contains("edited"))
++    }
+ 
+-        assertEquals(beforeCandidate.cacheBlocks, uncommitted.cacheBlocks)
+-        assertEquals(beforeCandidate.patchCount, uncommitted.patchCount)
+-        assertEquals(beforeCandidate.patchBytes, uncommitted.patchBytes)
+-        assertEquals(beforeCandidate.revision, uncommitted.revision)
+-        assertEquals(beforeCandidate.cacheBlocks, thresholdCandidate.claudeCacheBlocks)
+-        assertEquals(1, thresholdCandidate.commit!!.nextState.cacheBlocks.size)
+-        assertEquals(0, thresholdCandidate.commit.nextState.patchCount)
++    @Test
++    fun `threshold candidate preserves committed patch state until commit then compacts`() {
++        val snapshots = mutableMapOf<String, MemorySnapshotState>()
++        prepareMemorySnapshot(snapshots, "conversation", listOf(memory(1, "v0")))
++
++        // Small patches stay dynamic until the next one crosses the byte cap.
++        var index = 0
++        while (true) {
++            val next = listOf(memory(1, "v${index + 1}"))
++            val before = snapshots.getValue("conversation")
++            val candidate = prepareMemorySnapshot(snapshots, "conversation", next)
++            val compacts = candidate.commit!!.nextState.patchBytes == 0
++            if (compacts) {
++                // The pending request still uses the old Base and re-sends every committed patch.
++                assertEquals(before.cacheBlocks, snapshots.getValue("conversation").cacheBlocks)
++                assertEquals(before.committedPatches, snapshots.getValue("conversation").committedPatches)
++                assertEquals(before.patchBytes, snapshots.getValue("conversation").patchBytes)
++                assertEquals(before.revision, snapshots.getValue("conversation").revision)
++                assertEquals(before.cacheBlocks, candidate.claudeCacheBlocks)
++                assertEquals(before.committedPatches.size + 1, candidate.claudePatches.size)
++                assertEquals(1, candidate.commit.nextState.cacheBlocks.size)
++                commitMemorySnapshot(snapshots, candidate.commit, next)
++                break
++            }
++            commitMemorySnapshot(snapshots, candidate.commit, next)
++            index += 1
++        }
++        assertTrue(index >= 1)
+ 
+-        commitMemorySnapshot(snapshots, thresholdCandidate.commit, current)
+         val compacted = snapshots.getValue("conversation")
+         assertEquals(1, compacted.cacheBlocks.size)
+-        assertTrue(compacted.cacheBlocks.single().text.contains("v$MEMORY_PATCH_COMPACTION_COUNT"))
+-        assertEquals(0, compacted.patchCount)
++        assertTrue(compacted.committedPatches.isEmpty())
+         assertEquals(0, compacted.patchBytes)
++        assertTrue(compacted.cacheBlocks.single().text.contains("v${index + 1}"))
+     }
+ 
+     @Test
+-    fun `sixteen KiB candidate compacts only after commit`() {
++    fun `single oversized memory compacts in one commit instead of staying a dynamic patch`() {
+         val snapshots = mutableMapOf<String, MemorySnapshotState>()
+         prepareMemorySnapshot(snapshots, "conversation", listOf(memory(1, "small")))
+-        val beforeCandidate = snapshots.getValue("conversation")
+         val current = listOf(memory(1, "x".repeat(MEMORY_PATCH_COMPACTION_BYTES)))
+ 
+         val resolution = prepareMemorySnapshot(snapshots, "conversation", current)
+         val uncommitted = snapshots.getValue("conversation")
+ 
+-        assertEquals(beforeCandidate.cacheBlocks, uncommitted.cacheBlocks)
+-        assertEquals(beforeCandidate.patchCount, uncommitted.patchCount)
+-        assertEquals(beforeCandidate.patchBytes, uncommitted.patchBytes)
+-        assertEquals(beforeCandidate.revision, uncommitted.revision)
++        // The pending patch is still sent once, then the Base absorbs it on the next request.
++        assertEquals(1, resolution.claudePatches.size)
++        assertTrue(uncommitted.committedPatches.isEmpty())
+         assertEquals(1, resolution.commit!!.nextState.cacheBlocks.size)
+         assertEquals(0, resolution.commit.nextState.patchBytes)
+ 
+         commitMemorySnapshot(snapshots, resolution.commit, current)
+-        assertEquals(1, snapshots.getValue("conversation").cacheBlocks.size)
+-        assertEquals(0, snapshots.getValue("conversation").patchBytes)
++        val afterCommit = prepareMemorySnapshot(snapshots, "conversation", current)
++        assertTrue(afterCommit.claudePatches.isEmpty())
++        assertEquals(1, afterCommit.claudeCacheBlocks!!.size)
++        assertTrue(afterCommit.claudeCacheBlocks.single().text.contains("x".repeat(64)))
+     }
+ 
+     @Test
+@@ -227,7 +248,6 @@ class MemorySnapshotTest {
+ 
+         commitMemorySnapshot(snapshots, resolution.commit, created)
+         assertEquals(1, snapshots.getValue("conversation").cacheBlocks.size)
+-        assertEquals(0, snapshots.getValue("conversation").patchCount)
+     }
+ 
+     @Test
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/datastore/AutoRetrySettingsTest.kt b/app/src/test/java/me/rerere/rikkahub/data/datastore/AutoRetrySettingsTest.kt
+index 21bc3cdc..5998c6d8 100644
+--- a/app/src/test/java/me/rerere/rikkahub/data/datastore/AutoRetrySettingsTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/datastore/AutoRetrySettingsTest.kt
+@@ -1,8 +1,11 @@
+ package me.rerere.rikkahub.data.datastore
+ 
+ import kotlinx.serialization.json.Json
++import me.rerere.ai.provider.RetryPolicy
++import me.rerere.rikkahub.data.ai.AUTO_RETRY_MAX_ATTEMPTS
+ import me.rerere.rikkahub.data.ai.AUTO_RETRY_MAX_DURATION_MINUTES
+ import me.rerere.rikkahub.data.ai.AUTO_RETRY_MAX_INTERVAL_SECONDS
++import me.rerere.rikkahub.data.ai.AUTO_RETRY_MIN_ATTEMPTS
+ import me.rerere.rikkahub.data.ai.AUTO_RETRY_MIN_DURATION_MINUTES
+ import me.rerere.rikkahub.data.ai.AUTO_RETRY_MIN_INTERVAL_SECONDS
+ import me.rerere.rikkahub.data.ai.toRetryPolicy
+@@ -23,6 +26,12 @@ class AutoRetrySettingsTest {
+             Settings.DEFAULT_AUTO_RETRY_MAX_DURATION_MINUTES,
+             settings.autoRetryMaxDurationMinutes,
+         )
++        assertEquals(Settings.DEFAULT_AUTO_RETRY_MAX_ATTEMPTS, settings.autoRetryMaxAttempts)
++    }
++
++    @Test
++    fun `the default attempt limit matches the request layer default`() {
++        assertEquals(RetryPolicy.DEFAULT_MAX_ATTEMPTS, Settings.DEFAULT_AUTO_RETRY_MAX_ATTEMPTS)
+     }
+ 
+     @Test
+@@ -31,6 +40,7 @@ class AutoRetrySettingsTest {
+             autoRetryEnabled = false,
+             autoRetryIntervalSeconds = 12,
+             autoRetryMaxDurationMinutes = 7,
++            autoRetryMaxAttempts = 15,
+         )
+ 
+         val restored = json.decodeFromString<Settings>(json.encodeToString(settings))
+@@ -38,6 +48,7 @@ class AutoRetrySettingsTest {
+         assertEquals(false, restored.autoRetryEnabled)
+         assertEquals(12, restored.autoRetryIntervalSeconds)
+         assertEquals(7, restored.autoRetryMaxDurationMinutes)
++        assertEquals(15, restored.autoRetryMaxAttempts)
+     }
+ 
+     @Test
+@@ -51,10 +62,12 @@ class AutoRetrySettingsTest {
+             autoRetryEnabled = true,
+             autoRetryIntervalSeconds = 5,
+             autoRetryMaxDurationMinutes = 3,
++            autoRetryMaxAttempts = 17,
+         ).toRetryPolicy()
+ 
+         assertEquals(5_000L, policy?.intervalMillis)
+         assertEquals(180_000L, policy?.maxDurationMillis)
++        assertEquals(17, policy?.maxAttempts)
+     }
+ 
+     @Test
+@@ -62,15 +75,19 @@ class AutoRetrySettingsTest {
+         val overMax = Settings(
+             autoRetryIntervalSeconds = 600,
+             autoRetryMaxDurationMinutes = 999,
++            autoRetryMaxAttempts = 99,
+         ).toRetryPolicy()
+         val underMin = Settings(
+             autoRetryIntervalSeconds = 0,
+             autoRetryMaxDurationMinutes = -5,
++            autoRetryMaxAttempts = 0,
+         ).toRetryPolicy()
+ 
+         assertEquals(AUTO_RETRY_MAX_INTERVAL_SECONDS * 1_000L, overMax?.intervalMillis)
+         assertEquals(AUTO_RETRY_MAX_DURATION_MINUTES * 60_000L, overMax?.maxDurationMillis)
++        assertEquals(AUTO_RETRY_MAX_ATTEMPTS, overMax?.maxAttempts)
+         assertEquals(AUTO_RETRY_MIN_INTERVAL_SECONDS * 1_000L, underMin?.intervalMillis)
+         assertEquals(AUTO_RETRY_MIN_DURATION_MINUTES * 60_000L, underMin?.maxDurationMillis)
++        assertEquals(AUTO_RETRY_MIN_ATTEMPTS, underMin?.maxAttempts)
+     }
+ }
+diff --git a/app/src/test/java/me/rerere/rikkahub/service/ConversationSessionTest.kt b/app/src/test/java/me/rerere/rikkahub/service/ConversationSessionTest.kt
+index f0e26083..83be6358 100644
+--- a/app/src/test/java/me/rerere/rikkahub/service/ConversationSessionTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/service/ConversationSessionTest.kt
+@@ -8,6 +8,7 @@ import kotlinx.coroutines.awaitCancellation
+ import kotlinx.coroutines.cancel
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.runBlocking
++import me.rerere.ai.ui.UIMessagePart
+ import me.rerere.rikkahub.data.model.Conversation
+ import org.junit.Assert.assertEquals
+ import org.junit.Assert.assertFalse
+@@ -98,4 +99,56 @@ class ConversationSessionTest {
+             scope.cancel()
+         }
+     }
++
++    @Test
++    fun `queued messages keep the session alive even when the queue is paused`() = runBlocking {
++        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
++        try {
++            val conversationId = Uuid.parse("44444444-4444-4444-4444-444444444444")
++            val session = ConversationSession(
++                id = conversationId,
++                initial = Conversation.ofId(conversationId),
++                scope = scope,
++                onIdle = {},
++            )
++
++            assertFalse(session.isInUse)
++            session.messageQueue.enqueue(listOf(UIMessagePart.Text("next")))
++            session.messageQueue.pause()
++
++            assertTrue(session.isInUse)
++        } finally {
++            scope.cancel()
++        }
++    }
++
++    @Test
++    fun `generation finished callback fires once for the current job only`() = runBlocking {
++        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
++        try {
++            val conversationId = Uuid.parse("55555555-5555-5555-5555-555555555555")
++            val finished = mutableListOf<Uuid>()
++            val session = ConversationSession(
++                id = conversationId,
++                initial = Conversation.ofId(conversationId),
++                scope = scope,
++                onIdle = {},
++                onGenerationFinished = { id, _ -> finished.add(id) },
++            )
++            val first = scope.launch { awaitCancellation() }
++            val second = scope.launch { awaitCancellation() }
++
++            assertTrue(session.setJob(first))
++            assertTrue(session.setJob(second))
++            first.join()
++            // 被替掉的旧任务不算「生成结束」，否则队列会被误推进
++            assertEquals(emptyList<Uuid>(), finished)
++
++            second.cancel()
++            second.join()
++            assertEquals(listOf(conversationId), finished)
++        } finally {
++            scope.cancel()
++        }
++    }
+ }
