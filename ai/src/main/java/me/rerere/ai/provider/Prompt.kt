@@ -114,16 +114,3 @@ data class LogicalPrompt(
         }
     }
 }
-
-/** A stable, non-sensitive key for one conversation's implicit provider cache. */
-object PromptCacheKey {
-    private const val PREFIX = "chat_"
-    private const val APP_ID = "rikkahub"
-
-    fun forSession(sessionId: String, appId: String = APP_ID): String {
-        require(sessionId.isNotBlank()) { "sessionId must not be blank" }
-        val digest = java.security.MessageDigest.getInstance("SHA-256")
-            .digest((appId + sessionId).toByteArray(Charsets.UTF_8))
-        return PREFIX + digest.joinToString("") { byte -> "%02x".format(byte) }
-    }
-}

@@ -346,12 +346,18 @@ private fun ChatPageContent(
                             onClear = vm::clearSummaryContext,
                         )
                     }
+                    val messageQueue by vm.messageQueue.collectAsStateWithLifecycle()
                     ChatInput(
                     state = inputState,
                     loading = loadingJob != null,
                     settings = setting,
                     hazeState = hazeState,
                     completionProviders = completionProviders,
+                    messageQueue = messageQueue,
+                    onRemoveQueuedMessage = vm::removeQueuedMessage,
+                    onBeginEditQueuedMessage = vm::beginEditQueuedMessage,
+                    onFinishEditQueuedMessage = vm::finishEditQueuedMessage,
+                    onResumeMessageQueue = vm::resumeMessageQueue,
                     onCancelClick = {
                         vm.stopGeneration()
                     },

@@ -16,8 +16,6 @@ import me.rerere.ai.util.KeyRoulette
 import okhttp3.OkHttpClient
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNull
-import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
@@ -53,46 +51,6 @@ class PromptCacheRequestTest {
     }
 
     @Test
-    fun `enabled OpenAI requests carry only stable session key`() {
-        val key = "chat_" + "a".repeat(64)
-        val params = TextGenerationParams(
-            model = Model(modelId = "gpt-test"),
-            promptCacheEnabled = true,
-            promptCacheKey = key,
-        )
-        val body = buildChatRequest(params, listOf(UIMessage.user("hello")))
-
-        assertEquals(key, body["prompt_cache_key"]?.jsonPrimitive?.content)
-        assertFalse(body.containsKey("cache_control"))
-        assertTrue(body["messages"]!!.jsonArray.isNotEmpty())
-        body["messages"]!!.jsonArray.forEach { message ->
-            message.jsonObject.forEach { (_, value) ->
-                assertFalse(value.toString().contains("cache_control"))
-            }
-        }
-    }
-
-    @Test
-    fun `disabled OpenAI requests omit prompt cache key`() {
-        val params = TextGenerationParams(
-            model = Model(modelId = "gpt-test"),
-            promptCacheEnabled = false,
-            promptCacheKey = "chat_" + "b".repeat(64),
-        )
-        val chatBody = buildChatRequest(params, listOf(UIMessage.user("hello")))
-        val responseBody = responses.buildRequestBody(
-            ProviderSetting.OpenAI(baseUrl = "https://api.openai.com/v1"),
-            listOf(UIMessage.user("hello")),
-            params,
-            stream = false,
-        )
-
-        assertNull(chatBody["prompt_cache_key"])
-        assertNull(responseBody["prompt_cache_key"])
-        assertFalse(responseBody.containsKey("cache_control"))
-    }
-
-    @Test
     fun `Responses and Chat adapters use explicit logical order without explicit cache boundaries`() {
         val prompt = LogicalPrompt(
             system = listOf(UIMessage.system("system")),
@@ -105,8 +63,6 @@ class PromptCacheRequestTest {
         )
         val params = TextGenerationParams(
             model = Model(modelId = "gpt-test"),
-            promptCacheEnabled = true,
-            promptCacheKey = "chat_" + "c".repeat(64),
             logicalPrompt = prompt,
         )
         val messages = prompt.toMessages()
@@ -118,8 +74,6 @@ class PromptCacheRequestTest {
             stream = false,
         )
 
-        assertEquals(params.promptCacheKey, chatBody["prompt_cache_key"]?.jsonPrimitive?.content)
-        assertEquals(params.promptCacheKey, responseBody["prompt_cache_key"]?.jsonPrimitive?.content)
         assertFalse(chatBody.containsKey("cache_control"))
         assertFalse(responseBody.containsKey("cache_control"))
 

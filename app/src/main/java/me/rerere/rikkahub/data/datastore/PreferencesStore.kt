@@ -77,7 +77,6 @@ private fun MutablePreferences.writeSettings(settings: Settings) {
     this[SettingsStore.CUSTOM_THEMES] = JsonInstant.encodeToString(settings.customThemes)
     this[SettingsStore.DISPLAY_SETTING] = JsonInstant.encodeToString(settings.displaySetting)
     this[SettingsStore.CHAT_LOG_LEVEL] = settings.chatLogLevel.name
-    this[SettingsStore.PROMPT_CACHE_ENABLED] = settings.promptCacheEnabled
     this[SettingsStore.AUTO_RETRY_ENABLED] = settings.autoRetryEnabled
     this[SettingsStore.AUTO_RETRY_INTERVAL_SECONDS] = settings.autoRetryIntervalSeconds
     this[SettingsStore.AUTO_RETRY_MAX_DURATION_MINUTES] = settings.autoRetryMaxDurationMinutes
@@ -146,7 +145,6 @@ class SettingsStore(
         val CUSTOM_THEMES = stringPreferencesKey("custom_themes")
         val DISPLAY_SETTING = stringPreferencesKey("display_setting")
         val CHAT_LOG_LEVEL = stringPreferencesKey("chat_log_level")
-        val PROMPT_CACHE_ENABLED = booleanPreferencesKey("prompt_cache_enabled")
 
         // 自动重试
         val AUTO_RETRY_ENABLED = booleanPreferencesKey("auto_retry_enabled")
@@ -247,7 +245,6 @@ class SettingsStore(
                 chatLogLevel = preferences[CHAT_LOG_LEVEL]
                     ?.let { runCatching { ChatLogLevel.valueOf(it) }.getOrNull() }
                     ?: ChatLogLevel.ALL,
-                promptCacheEnabled = preferences[PROMPT_CACHE_ENABLED] != false,
                 searchServices = preferences[SEARCH_SERVICES]?.let {
                     JsonInstant.decodeFromString(it)
                 } ?: listOf(SearchServiceOptions.DEFAULT),
@@ -529,7 +526,6 @@ data class Settings(
     val displaySetting: DisplaySetting = DisplaySetting(),
     /** 运行日志等级：关 / 只记错误 / 全记。 */
     val chatLogLevel: ChatLogLevel = ChatLogLevel.ALL,
-    val promptCacheEnabled: Boolean = true,
     /** 生成失败后是否自动重试。 */
     val autoRetryEnabled: Boolean = true,
     /** 两次尝试之间的等待秒数。 */

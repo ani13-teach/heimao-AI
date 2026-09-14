@@ -62,8 +62,13 @@ private const val TAG = "GenerationHandler"
 private const val MAX_TOOL_OUTPUT_CHARS = 32 * 1024
 private const val TOOL_OUTPUT_PREVIEW_CHARS = 4 * 1024
 private const val MAX_MEMORY_SNAPSHOT_ENTRIES = 32
-internal const val MEMORY_PATCH_COMPACTION_COUNT = 16
-internal const val MEMORY_PATCH_COMPACTION_BYTES = 16 * 1024
+/**
+ * Committed patches are re-sent after history, so their tokens are rewritten into the cache on
+ * every turn. Compaction instead rewrites the stable prefix once (system + history).
+ * Break-even is roughly `stable prefix tokens / patch tokens` turns, so accumulate at most one
+ * turn's worth of a medium-size prefix before folding the patches back into the Base.
+ */
+internal const val MEMORY_PATCH_COMPACTION_BYTES = 4 * 1024
 
 
 @Serializable
@@ -91,10 +96,12 @@ internal data class MemoryPromptEntry(
 
 internal data class MemorySnapshotState(
     val projection: List<MemoryPromptEntry>,
+    /** Stable Memory Base blocks that live before history and stay unchanged across edits. */
     val cacheBlocks: List<ClaudeMemoryCacheBlock>,
+    /** Committed patches that are re-sent after history so the cached prefix survives edits. */
+    val committedPatches: List<String> = emptyList(),
     val revision: Long = 0,
     val lastIssuedRevision: Long = revision,
-    val patchCount: Int = 0,
     val patchBytes: Int = 0,
 ) {
     val snapshot: List<AssistantMemory>
@@ -110,10 +117,12 @@ internal data class MemorySnapshotCommit(
 internal data class MemorySnapshotResolution(
     /** The current Room projection used by provider-independent flattened prompts. */
     val snapshot: List<AssistantMemory>,
-    /** Stable append-only Base/Patch blocks used only by Claude; null keeps legacy fallback. */
+    /** Stable append-only Base blocks used only by Claude; null keeps legacy fallback. */
     val claudeCacheBlocks: List<ClaudeMemoryCacheBlock>? = null,
     /** Request-local patch against [claudeCacheBlocks], committed only after provider success. */
     val delta: List<UIMessage> = emptyList(),
+    /** Committed patches that must stay after history, plus the pending [delta] text. */
+    val claudePatches: List<UIMessage> = emptyList(),
     val commit: MemorySnapshotCommit? = null,
 )
 
@@ -154,6 +163,7 @@ internal fun prepareMemorySnapshot(
             )
         }
 
+        val committedPatches = state.committedPatches.map { UIMessage.user(it) }
         val oldById = state.projection.associateBy { it.id }
         val currentById = currentProjection.associateBy { it.id }
         val changed = currentProjection.filter { oldById[it.id]?.content != it.content }
@@ -162,6 +172,7 @@ internal fun prepareMemorySnapshot(
             return MemorySnapshotResolution(
                 snapshot = current,
                 claudeCacheBlocks = state.cacheBlocks,
+                claudePatches = committedPatches,
             )
         }
 
@@ -172,26 +183,25 @@ internal fun prepareMemorySnapshot(
         val candidateRevision = state.lastIssuedRevision + 1
         val issuedState = state.copy(lastIssuedRevision = candidateRevision)
         memorySnapshots[key] = issuedState
-        val nextPatchCount = state.patchCount + 1
         val nextPatchBytes = state.patchBytes + patchText.toByteArray(Charsets.UTF_8).size
         val shouldCompact = state.cacheBlocks.isEmpty() ||
-            nextPatchCount >= MEMORY_PATCH_COMPACTION_COUNT ||
             nextPatchBytes >= MEMORY_PATCH_COMPACTION_BYTES
         val nextState = issuedState.copy(
             projection = currentProjection,
             cacheBlocks = if (shouldCompact) {
                 memoryBaseBlocks(currentProjection)
             } else {
-                state.cacheBlocks + ClaudeMemoryCacheBlock(patchText)
+                state.cacheBlocks
             },
+            committedPatches = if (shouldCompact) emptyList() else state.committedPatches + patchText,
             revision = candidateRevision,
-            patchCount = if (shouldCompact) 0 else nextPatchCount,
             patchBytes = if (shouldCompact) 0 else nextPatchBytes,
         )
         return MemorySnapshotResolution(
             snapshot = current,
             claudeCacheBlocks = state.cacheBlocks,
             delta = listOf(UIMessage.user(patchText)),
+            claudePatches = committedPatches + UIMessage.user(patchText),
             commit = MemorySnapshotCommit(
                 key = key,
                 revision = candidateRevision,
@@ -264,7 +274,7 @@ class GenerationHandler(
         outputTransformers: List<OutputMessageTransformer> = emptyList(),
         assistant: Assistant,
         memories: List<AssistantMemory>? = null,
-        promptCacheKey: String? = null,
+        memorySnapshotKey: String? = null,
         tools: List<Tool> = emptyList(),
         maxSteps: Int = 256,
         processingStatus: MutableStateFlow<String?> = MutableStateFlow(null),
@@ -302,7 +312,7 @@ class GenerationHandler(
             val memoryResolution = if (memoryAssistantId != null && !useLayeredMemory) {
                 prepareMemorySnapshot(
                     memorySnapshots = memorySnapshots,
-                    key = promptCacheKey,
+                    key = memorySnapshotKey,
                     current = currentMemories,
                 )
             } else {
@@ -413,11 +423,12 @@ class GenerationHandler(
                     memorySnapshot = memoryResolution.snapshot,
                     claudeMemoryCacheBlocks = memoryResolution.claudeCacheBlocks,
                     memoryDelta = memoryResolution.delta,
+                    claudeMemoryPatches = memoryResolution.claudePatches,
                     layeredMemoryContext = layeredMemoryContext,
                     processingStatus = processingStatus,
                     conversationSystemPrompt = conversationSystemPrompt,
                     conversationModeInjectionIds = conversationModeInjectionIds,
-                    promptCacheKey = promptCacheKey,
+                    memorySnapshotKey = memorySnapshotKey,
                     workspaceId = workspaceId,
                     workspaceCwd = workspaceCwd,
                 )
@@ -654,10 +665,11 @@ class GenerationHandler(
         memorySnapshot: List<AssistantMemory>,
         claudeMemoryCacheBlocks: List<ClaudeMemoryCacheBlock>?,
         memoryDelta: List<UIMessage>,
+        claudeMemoryPatches: List<UIMessage> = emptyList(),
         processingStatus: MutableStateFlow<String?> = MutableStateFlow(null),
         conversationSystemPrompt: String? = null,
         conversationModeInjectionIds: Set<Uuid> = emptySet(),
-        promptCacheKey: String? = null,
+        memorySnapshotKey: String? = null,
         workspaceId: String? = null,
         workspaceCwd: String? = null,
         layeredMemoryContext: LayeredMemoryContext? = null,
@@ -695,7 +707,7 @@ class GenerationHandler(
         }
 
         val transformed = buildList {
-            add(UIMessage.system(prompt = stableSystemPrompt))
+            add(UIMessage.system(prompt = stableSystemPrompt).copy(isSynthetic = true))
             addAll(limitedMessages)
         }.transforms(
             transformers = transformers,
@@ -721,13 +733,22 @@ class GenerationHandler(
                 conversationMessages
             },
             transientContext = additionalContextMessages,
-            memorySnapshot = if (hasMemoryContent) listOf(UIMessage.system(prompt = memoryPrompt)) else emptyList(),
+            memorySnapshot = if (hasMemoryContent) {
+                listOf(UIMessage.system(prompt = memoryPrompt).copy(isSynthetic = true))
+            } else {
+                emptyList()
+            },
             claudeMemoryCacheBlocks = if (assistant.enableMemory && layeredMemoryContext == null) {
                 claudeMemoryCacheBlocks
             } else {
                 null
             },
-            claudeMemoryDelta = if (assistant.enableMemory && layeredMemoryContext == null) memoryDelta else emptyList(),
+            claudeMemoryDelta = if (assistant.enableMemory && layeredMemoryContext == null) {
+                // Committed patches already include the pending delta; adding both would duplicate it.
+                claudeMemoryPatches.ifEmpty { memoryDelta }
+            } else {
+                emptyList()
+            },
             latestUser = conversationMessages.getOrNull(latestUserIndex),
             currentToolLoop = if (latestUserIndex >= 0) {
                 conversationMessages.drop(latestUserIndex + 1)
@@ -753,8 +774,6 @@ class GenerationHandler(
                 addAll(assistant.customBodies)
                 addAll(model.customBodies)
             },
-            promptCacheEnabled = settings.promptCacheEnabled,
-            promptCacheKey = promptCacheKey,
             logicalPrompt = logicalPrompt,
         )
         messages = providerImpl.generateTextWithModelTransport(

@@ -7,7 +7,6 @@ import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.UsageNormalizer
 import me.rerere.ai.ui.UIMessage
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -39,20 +38,6 @@ class PromptCacheModelTest {
         )
         assertEquals(MessageRole.USER, prompt.toProviderMessages(false)[2].role)
         assertTrue(prompt.toMessages().none { it.toText().contains("claude") })
-    }
-
-    @Test
-    fun `session cache key is stable opaque and session scoped`() {
-        val first = PromptCacheKey.forSession("conversation-1")
-        val repeat = PromptCacheKey.forSession("conversation-1")
-        val other = PromptCacheKey.forSession("conversation-2")
-        val otherApp = PromptCacheKey.forSession("conversation-1", appId = "other-app")
-
-        assertEquals(first, repeat)
-        assertNotEquals(first, other)
-        assertNotEquals(first, otherApp)
-        assertTrue(first.startsWith("chat_"))
-        assertTrue(first.removePrefix("chat_").matches(Regex("[0-9a-f]{64}")))
     }
 
     @Test

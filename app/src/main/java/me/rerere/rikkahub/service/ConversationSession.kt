@@ -21,9 +21,18 @@ class ConversationSession(
     initial: Conversation,
     private val scope: CoroutineScope,
     private val onIdle: (Uuid) -> Unit,
+    private val onGenerationFinished: (Uuid, Throwable?) -> Unit = { _, _ -> },
 ) {
     // 会话状态
     val state = MutableStateFlow(initial)
+
+    // 生成中排队等发送的消息
+    val messageQueue = MessageQueue()
+
+    // 从队列取出到写进会话历史之间，附件仍要当成有效引用，否则会被误删
+    @Volatile
+    var submittingMessage: QueuedMessage? = null
+        internal set
 
     // ChatVM 创建 session 后才异步加载持久化会话；发送必须等待这一步完成，
     // 否则临时初始值中的 workspaceId=null 可能覆盖新会话的助手默认值。
@@ -51,7 +60,9 @@ class ConversationSession(
     private val _generationJob = MutableStateFlow<Job?>(null)
     val generationJob: StateFlow<Job?> = _generationJob.asStateFlow()
     val isGenerating: Boolean get() = _generationJob.value?.isActive == true
-    val isInUse: Boolean get() = refCount.get() > 0 || isGenerating
+    val isInUse: Boolean
+        get() = refCount.get() > 0 || _generationJob.value != null ||
+                messageQueue.state.value.messages.isNotEmpty()
 
     // 空闲检查任务
     private var idleCheckJob: Job? = null
@@ -99,14 +110,21 @@ class ConversationSession(
             _generationJob.value.also { _generationJob.value = job }
         }
         previous?.cancel()
-        job?.invokeOnCompletion {
-            _generationJob.compareAndSet(job, null)
-            if (refCount.get() <= 0) {
-                scheduleIdleCheck()
+        job?.invokeOnCompletion { cause ->
+            // 被替掉的旧任务不能清掉或推进接替它的新任务
+            val isCurrent = _generationJob.compareAndSet(job, null)
+            if (isCurrent) {
+                onGenerationFinished(id, cause)
+                if (refCount.get() <= 0) {
+                    scheduleIdleCheck()
+                }
             }
         }
         return true
     }
+
+    /** 会话正处于临时禁生成窗口（搬家、归档等）时为 true。 */
+    val isGenerationPaused: Boolean get() = !acceptsGenerationJobs
 
     fun pauseGeneration(): Job? = synchronized(generationJobLock) {
         acceptsGenerationJobs = false

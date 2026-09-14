@@ -123,7 +123,6 @@ class MemorySnapshotTest {
         )
 
         assertTrue(resolution.delta.isEmpty())
-        assertEquals(0, snapshots.getValue("conversation").patchCount)
     }
 
     @Test
@@ -141,70 +140,92 @@ class MemorySnapshotTest {
         }
 
         val blocks = snapshots.getValue("conversation").cacheBlocks.map { it.text }
-        assertEquals(4, blocks.size)
+        assertEquals(1, blocks.size)
         assertTrue(blocks[0].contains("Memory Base"))
         assertTrue(blocks[0].contains("base"))
-        assertTrue(blocks[1].contains("edited"))
-        assertTrue(Regex("\\\"deleted\\\"\\s*:\\s*\\[\\s*1\\s*]").containsMatchIn(blocks[2]))
-        assertTrue(blocks[3].contains("recreated"))
+        val patches = snapshots.getValue("conversation").committedPatches
+        assertEquals(3, patches.size)
+        assertTrue(patches[0].contains("edited"))
+        assertTrue(Regex("\\\"deleted\\\"\\s*:\\s*\\[\\s*1\\s*]").containsMatchIn(patches[1]))
+        assertTrue(patches[2].contains("recreated"))
         assertEquals("recreated", snapshots.getValue("conversation").snapshot.single().content)
+    }
+
+    @Test
+    fun `committed patches stay after history instead of rewriting the stable base`() {
+        val snapshots = mutableMapOf<String, MemorySnapshotState>()
+        prepareMemorySnapshot(snapshots, "conversation", listOf(memory(1, "base")))
+
+        val first = prepareMemorySnapshot(snapshots, "conversation", listOf(memory(1, "edited")))
+        assertEquals(1, first.delta.size)
+        assertEquals(1, first.claudePatches.size)
+        commitMemorySnapshot(snapshots, first.commit, listOf(memory(1, "edited")))
+
+        // The next request keeps the same stable Base and repeats the patch after history.
+        val second = prepareMemorySnapshot(snapshots, "conversation", listOf(memory(1, "edited")))
+        assertEquals(1, second.claudeCacheBlocks!!.size)
+        assertTrue(second.claudeCacheBlocks.single().text.contains("base"))
+        assertTrue(!second.claudeCacheBlocks.single().text.contains("edited"))
+        assertEquals(1, second.claudePatches.size)
+        assertTrue(second.claudePatches.single().toText().contains("edited"))
     }
 
     @Test
     fun `threshold candidate preserves committed patch state until commit then compacts`() {
         val snapshots = mutableMapOf<String, MemorySnapshotState>()
-        var current = listOf(memory(1, "v0"))
-        prepareMemorySnapshot(snapshots, "conversation", current)
+        prepareMemorySnapshot(snapshots, "conversation", listOf(memory(1, "v0")))
 
-        repeat(MEMORY_PATCH_COMPACTION_COUNT - 1) { index ->
-            current = listOf(memory(1, "v${index + 1}"))
-            val resolution = prepareMemorySnapshot(snapshots, "conversation", current)
-            commitMemorySnapshot(snapshots, resolution.commit, current)
+        // Small patches stay dynamic until the next one crosses the byte cap.
+        var index = 0
+        while (true) {
+            val next = listOf(memory(1, "v${index + 1}"))
+            val before = snapshots.getValue("conversation")
+            val candidate = prepareMemorySnapshot(snapshots, "conversation", next)
+            val compacts = candidate.commit!!.nextState.patchBytes == 0
+            if (compacts) {
+                // The pending request still uses the old Base and re-sends every committed patch.
+                assertEquals(before.cacheBlocks, snapshots.getValue("conversation").cacheBlocks)
+                assertEquals(before.committedPatches, snapshots.getValue("conversation").committedPatches)
+                assertEquals(before.patchBytes, snapshots.getValue("conversation").patchBytes)
+                assertEquals(before.revision, snapshots.getValue("conversation").revision)
+                assertEquals(before.cacheBlocks, candidate.claudeCacheBlocks)
+                assertEquals(before.committedPatches.size + 1, candidate.claudePatches.size)
+                assertEquals(1, candidate.commit.nextState.cacheBlocks.size)
+                commitMemorySnapshot(snapshots, candidate.commit, next)
+                break
+            }
+            commitMemorySnapshot(snapshots, candidate.commit, next)
+            index += 1
         }
-        val beforeCandidate = snapshots.getValue("conversation")
-        assertEquals(MEMORY_PATCH_COMPACTION_COUNT, beforeCandidate.cacheBlocks.size)
-        assertEquals(MEMORY_PATCH_COMPACTION_COUNT - 1, beforeCandidate.patchCount)
+        assertTrue(index >= 1)
 
-        current = listOf(memory(1, "v$MEMORY_PATCH_COMPACTION_COUNT"))
-        val thresholdCandidate = prepareMemorySnapshot(snapshots, "conversation", current)
-        val uncommitted = snapshots.getValue("conversation")
-
-        assertEquals(beforeCandidate.cacheBlocks, uncommitted.cacheBlocks)
-        assertEquals(beforeCandidate.patchCount, uncommitted.patchCount)
-        assertEquals(beforeCandidate.patchBytes, uncommitted.patchBytes)
-        assertEquals(beforeCandidate.revision, uncommitted.revision)
-        assertEquals(beforeCandidate.cacheBlocks, thresholdCandidate.claudeCacheBlocks)
-        assertEquals(1, thresholdCandidate.commit!!.nextState.cacheBlocks.size)
-        assertEquals(0, thresholdCandidate.commit.nextState.patchCount)
-
-        commitMemorySnapshot(snapshots, thresholdCandidate.commit, current)
         val compacted = snapshots.getValue("conversation")
         assertEquals(1, compacted.cacheBlocks.size)
-        assertTrue(compacted.cacheBlocks.single().text.contains("v$MEMORY_PATCH_COMPACTION_COUNT"))
-        assertEquals(0, compacted.patchCount)
+        assertTrue(compacted.committedPatches.isEmpty())
         assertEquals(0, compacted.patchBytes)
+        assertTrue(compacted.cacheBlocks.single().text.contains("v${index + 1}"))
     }
 
     @Test
-    fun `sixteen KiB candidate compacts only after commit`() {
+    fun `single oversized memory compacts in one commit instead of staying a dynamic patch`() {
         val snapshots = mutableMapOf<String, MemorySnapshotState>()
         prepareMemorySnapshot(snapshots, "conversation", listOf(memory(1, "small")))
-        val beforeCandidate = snapshots.getValue("conversation")
         val current = listOf(memory(1, "x".repeat(MEMORY_PATCH_COMPACTION_BYTES)))
 
         val resolution = prepareMemorySnapshot(snapshots, "conversation", current)
         val uncommitted = snapshots.getValue("conversation")
 
-        assertEquals(beforeCandidate.cacheBlocks, uncommitted.cacheBlocks)
-        assertEquals(beforeCandidate.patchCount, uncommitted.patchCount)
-        assertEquals(beforeCandidate.patchBytes, uncommitted.patchBytes)
-        assertEquals(beforeCandidate.revision, uncommitted.revision)
+        // The pending patch is still sent once, then the Base absorbs it on the next request.
+        assertEquals(1, resolution.claudePatches.size)
+        assertTrue(uncommitted.committedPatches.isEmpty())
         assertEquals(1, resolution.commit!!.nextState.cacheBlocks.size)
         assertEquals(0, resolution.commit.nextState.patchBytes)
 
         commitMemorySnapshot(snapshots, resolution.commit, current)
-        assertEquals(1, snapshots.getValue("conversation").cacheBlocks.size)
-        assertEquals(0, snapshots.getValue("conversation").patchBytes)
+        val afterCommit = prepareMemorySnapshot(snapshots, "conversation", current)
+        assertTrue(afterCommit.claudePatches.isEmpty())
+        assertEquals(1, afterCommit.claudeCacheBlocks!!.size)
+        assertTrue(afterCommit.claudeCacheBlocks.single().text.contains("x".repeat(64)))
     }
 
     @Test
@@ -227,7 +248,6 @@ class MemorySnapshotTest {
 
         commitMemorySnapshot(snapshots, resolution.commit, created)
         assertEquals(1, snapshots.getValue("conversation").cacheBlocks.size)
-        assertEquals(0, snapshots.getValue("conversation").patchCount)
     }
 
     @Test

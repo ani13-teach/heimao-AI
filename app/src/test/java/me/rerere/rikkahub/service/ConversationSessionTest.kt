@@ -8,6 +8,7 @@ import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.model.Conversation
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -94,6 +95,58 @@ class ConversationSessionTest {
             val accepted = scope.launch { awaitCancellation() }
             assertTrue(session.setJob(accepted))
             accepted.cancel()
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `queued messages keep the session alive even when the queue is paused`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        try {
+            val conversationId = Uuid.parse("44444444-4444-4444-4444-444444444444")
+            val session = ConversationSession(
+                id = conversationId,
+                initial = Conversation.ofId(conversationId),
+                scope = scope,
+                onIdle = {},
+            )
+
+            assertFalse(session.isInUse)
+            session.messageQueue.enqueue(listOf(UIMessagePart.Text("next")))
+            session.messageQueue.pause()
+
+            assertTrue(session.isInUse)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `generation finished callback fires once for the current job only`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        try {
+            val conversationId = Uuid.parse("55555555-5555-5555-5555-555555555555")
+            val finished = mutableListOf<Uuid>()
+            val session = ConversationSession(
+                id = conversationId,
+                initial = Conversation.ofId(conversationId),
+                scope = scope,
+                onIdle = {},
+                onGenerationFinished = { id, _ -> finished.add(id) },
+            )
+            val first = scope.launch { awaitCancellation() }
+            val second = scope.launch { awaitCancellation() }
+
+            assertTrue(session.setJob(first))
+            assertTrue(session.setJob(second))
+            first.join()
+            // 被替掉的旧任务不算「生成结束」，否则队列会被误推进
+            assertEquals(emptyList<Uuid>(), finished)
+
+            second.cancel()
+            second.join()
+            assertEquals(listOf(conversationId), finished)
         } finally {
             scope.cancel()
         }

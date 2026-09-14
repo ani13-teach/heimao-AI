@@ -91,9 +91,13 @@ import me.rerere.rikkahub.ui.components.ai.completion.ChatCompletionItem
 import me.rerere.rikkahub.ui.components.ai.completion.ChatCompletionList
 import me.rerere.rikkahub.ui.components.ai.completion.ChatCompletionProvider
 import me.rerere.rikkahub.ui.components.ui.KeepScreenOn
+import me.rerere.rikkahub.service.MessageQueueState
+import me.rerere.rikkahub.service.QueuedMessage
+import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.ui.context.LocalSettings
 import me.rerere.rikkahub.ui.context.LocalToaster
 import me.rerere.rikkahub.ui.hooks.ChatInputState
+import kotlin.uuid.Uuid
 import org.koin.compose.koinInject
 import kotlin.time.Duration.Companion.seconds
 
@@ -114,6 +118,11 @@ fun ChatInput(
     onCancelClick: () -> Unit,
     onSendClick: () -> Unit,
     onLongSendClick: () -> Unit,
+    messageQueue: MessageQueueState = MessageQueueState(),
+    onRemoveQueuedMessage: (Uuid) -> Unit = {},
+    onBeginEditQueuedMessage: (Uuid) -> QueuedMessage? = { null },
+    onFinishEditQueuedMessage: (Uuid, List<UIMessagePart>?) -> Unit = { _, _ -> },
+    onResumeMessageQueue: () -> Unit = {},
 ) {
     val toaster = LocalToaster.current
     val assistant = settings.getCurrentAssistant()
@@ -139,13 +148,14 @@ fun ChatInput(
     fun sendMessage() {
         focusManager.clearFocus(force = true)
         keyboardController?.hide()
-        if (loading) onCancelClick() else onSendClick()
+        // 生成中如果输入框里有内容就排队发送，只有空输入才当作「停止」
+        if (loading && state.isEmpty()) onCancelClick() else onSendClick()
     }
 
     fun sendMessageWithoutAnswer() {
         focusManager.clearFocus(force = true)
         keyboardController?.hide()
-        if (loading) onCancelClick() else onLongSendClick()
+        if (loading && state.isEmpty()) onCancelClick() else onLongSendClick()
     }
 
     Surface(
@@ -159,6 +169,13 @@ fun ChatInput(
                 .padding(bottom = if (imeVisible) 0.dp else 8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            MessageQueuePanel(
+                state = messageQueue,
+                onRemove = onRemoveQueuedMessage,
+                onBeginEdit = onBeginEditQueuedMessage,
+                onFinishEdit = onFinishEditQueuedMessage,
+                onResume = onResumeMessageQueue,
+            )
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -261,6 +278,7 @@ fun ChatInput(
                             )
                         }
 
+                        val showStop = loading && state.isEmpty()
                         Box(
                             contentAlignment = Alignment.Center,
                             modifier = Modifier
@@ -268,7 +286,7 @@ fun ChatInput(
                                 .testTag("chat_send_button")
                                 .clip(CircleShape)
                                 .combinedClickable(
-                                    enabled = loading || !state.isEmpty(),
+                                    enabled = showStop || !state.isEmpty(),
                                     onClick = {
                                         sendMessage()
                                     }, onLongClick = {
@@ -277,12 +295,12 @@ fun ChatInput(
                                 )
                         ) {
                             val containerColor = when {
-                                loading -> MaterialTheme.colorScheme.errorContainer
+                                showStop -> MaterialTheme.colorScheme.errorContainer
                                 state.isEmpty() -> MaterialTheme.colorScheme.surfaceContainerHigh
                                 else -> MaterialTheme.colorScheme.primary
                             }
                             val contentColor = when {
-                                loading -> MaterialTheme.colorScheme.onErrorContainer
+                                showStop -> MaterialTheme.colorScheme.onErrorContainer
                                 state.isEmpty() -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
                                 else -> MaterialTheme.colorScheme.onPrimary
                             }
@@ -293,20 +311,15 @@ fun ChatInput(
                                 content = {})
                             if (loading) {
                                 KeepScreenOn()
-                                Icon(
-                                    imageVector = HugeIcons.Cancel01,
-                                    contentDescription = stringResource(R.string.stop),
-                                    tint = contentColor,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                            } else {
-                                Icon(
-                                    imageVector = HugeIcons.ArrowUp02,
-                                    contentDescription = stringResource(R.string.send),
-                                    tint = contentColor,
-                                    modifier = Modifier.size(18.dp)
-                                )
                             }
+                            Icon(
+                                imageVector = if (showStop) HugeIcons.Cancel01 else HugeIcons.ArrowUp02,
+                                contentDescription = stringResource(
+                                    if (showStop) R.string.stop else R.string.send
+                                ),
+                                tint = contentColor,
+                                modifier = Modifier.size(18.dp)
+                            )
                         }
                     }
                 }

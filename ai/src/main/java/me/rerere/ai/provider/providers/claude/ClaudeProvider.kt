@@ -569,7 +569,7 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
             }
         }.mergeCustomBody(params.customBody)
 
-        if (!providerSetting.promptCaching || !params.promptCacheEnabled) return request
+        if (!providerSetting.promptCaching) return request
         // Custom body values can replace the arrays used by the logical layout. Applying
         // cached indices after such a replacement could attach a boundary to unrelated
         // content, so leave the caller-owned wire shape untouched and skip caching.

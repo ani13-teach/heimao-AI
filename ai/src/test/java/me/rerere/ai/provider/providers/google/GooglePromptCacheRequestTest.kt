@@ -29,8 +29,6 @@ class GooglePromptCacheRequestTest {
         )
         val params = TextGenerationParams(
             model = Model(modelId = "gemini-test"),
-            promptCacheEnabled = true,
-            promptCacheKey = "must-not-be-sent-to-gemini",
             logicalPrompt = prompt,
         )
         val method = GoogleProvider::class.java.getDeclaredMethod(

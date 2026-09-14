@@ -26,7 +26,6 @@ class SettingVM(
                     themeId = settings.themeId,
                     customThemes = settings.customThemes,
                     displaySetting = settings.displaySetting,
-                    promptCacheEnabled = settings.promptCacheEnabled,
                     autoRetryEnabled = settings.autoRetryEnabled,
                     autoRetryIntervalSeconds = settings.autoRetryIntervalSeconds,
                     autoRetryMaxDurationMinutes = settings.autoRetryMaxDurationMinutes,

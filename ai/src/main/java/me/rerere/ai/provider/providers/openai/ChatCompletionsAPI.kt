@@ -252,10 +252,6 @@ class ChatCompletionsAPI(
                     supportInputModalities = params.model.inputModalities,
                 )
             )
-            if (params.promptCacheEnabled && !params.promptCacheKey.isNullOrBlank()) {
-                put("prompt_cache_key", params.promptCacheKey)
-            }
-
             if (isModelAllowTemperature(params.model)) {
                 if (params.temperature != null) put("temperature", params.temperature)
                 if (params.topP != null) put("top_p", params.topP)

@@ -228,15 +228,11 @@ class ResponseAPI(
             val prompt = params.logicalPrompt ?: LogicalPrompt.fromMessages(messages, params.tools)
 
             // Responses has no explicit breakpoint mapping in this phase. Its stable
-            // session key lets OpenAI perform implicit caching without exposing an ID.
             val systemParts = prompt.system.flatMap { message ->
                 message.parts.filterIsInstance<UIMessagePart.Text>()
             }
             if (systemParts.isNotEmpty()) {
                 put("instructions", systemParts.joinToString("\n") { it.text })
-            }
-            if (params.promptCacheEnabled && !params.promptCacheKey.isNullOrBlank()) {
-                put("prompt_cache_key", params.promptCacheKey)
             }
 
             // messages

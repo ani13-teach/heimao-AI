@@ -241,10 +241,6 @@ data class TextGenerationParams(
     val reasoningLevel: ReasoningLevel = ReasoningLevel.OFF,
     val customHeaders: List<CustomHeader> = emptyList(),
     val customBody: List<CustomBody> = emptyList(),
-    /** Application-level switch; providers must not send cache controls when this is false. */
-    val promptCacheEnabled: Boolean = true,
-    /** Stable session-scoped key used by OpenAI implicit caching. */
-    val promptCacheKey: String? = null,
     /** Logical prompt supplied by the request builder; omitted from serialization. */
     @Transient val logicalPrompt: LogicalPrompt? = null,
 )

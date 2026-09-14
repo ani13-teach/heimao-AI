@@ -258,33 +258,6 @@ class ClaudePromptCacheRequestTest {
     }
 
     @Test
-    fun `global prompt cache switch disables Claude boundaries`() {
-        val request = buildRequest(
-            providerSetting = ProviderSetting.Claude(promptCaching = true),
-            messages = listOf(
-                UIMessage.system("stable"),
-                UIMessage.user("old"),
-                UIMessage.assistant("answer"),
-                UIMessage.user("latest"),
-            ),
-            params = TextGenerationParams(
-                model = Model(modelId = "claude-test"),
-                promptCacheEnabled = false,
-            ),
-        )
-
-        val controls = buildList {
-            request["system"]?.jsonArray?.forEach { add(it.jsonObject) }
-            request["tools"]?.jsonArray?.forEach { add(it.jsonObject) }
-            request["messages"]?.jsonArray?.forEach { message ->
-                message.jsonObject["content"]?.jsonArray?.forEach { add(it.jsonObject) }
-            }
-        }
-        assertTrue(controls.isNotEmpty())
-        controls.forEach { assertNull(it["cache_control"]) }
-    }
-
-    @Test
     fun `transient context and memory stay between history and latest user`() {
         val prompt = LogicalPrompt(
             system = listOf(UIMessage.system("stable")),
