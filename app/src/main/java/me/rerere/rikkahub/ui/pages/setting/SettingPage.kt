@@ -36,6 +36,7 @@ import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.AiMagic
 import me.rerere.hugeicons.stroke.Alert01
 import me.rerere.hugeicons.stroke.Brain02
+import me.rerere.hugeicons.stroke.ChartColumn
 import me.rerere.hugeicons.stroke.Database02
 import me.rerere.hugeicons.stroke.GlobalSearch
 import me.rerere.hugeicons.stroke.ImageUpload
@@ -216,6 +217,12 @@ fun SettingPage(vm: SettingVM = koinViewModel()) {
                             }
                         },
                         headlineContent = { Text(stringResource(R.string.setting_page_chat_storage)) },
+                    )
+                    item(
+                        onClick = { navController.navigate(Screen.ChatLogs) },
+                        leadingContent = { Icon(HugeIcons.ChartColumn, null) },
+                        supportingContent = { Text(stringResource(R.string.setting_page_chat_log_desc)) },
+                        headlineContent = { Text(stringResource(R.string.setting_page_chat_log)) },
                     )
                 }
             }

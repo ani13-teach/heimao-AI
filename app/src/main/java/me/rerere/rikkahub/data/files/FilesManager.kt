@@ -493,6 +493,9 @@ object FileFolders {
     const val TOOL_OUTPUTS = "tool_outputs"
     /** App-private workspace snapshots; deliberately not included in any shell bind mount. */
     const val SNAPSHOTS = "snapshots"
+
+    /** App-private 运行日志，只保留 24 小时。 */
+    const val LOGS = "logs"
 }
 
 suspend fun FilesManager.saveUploadFromUri(

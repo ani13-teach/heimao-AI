@@ -12,6 +12,7 @@ import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import me.rerere.rikkahub.data.files.FileFolders
+import me.rerere.rikkahub.data.log.ChatLogStore
 import java.io.File
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -104,6 +105,9 @@ class RikkaHubApp : Application() {
         // cleanup stale tool output files
         cleanupToolOutputs()
 
+        // 清掉过期的运行日志（只留 24 小时）
+        pruneExpiredChatLogs()
+
         // cleanup workspace temp dirs (proot + rootfs /tmp)
         cleanupWorkspaceTempDirs()
 
@@ -179,6 +183,16 @@ class RikkaHubApp : Application() {
                 if (dir.exists()) {
                     dir.deleteRecursively()
                 }
+            }
+        }
+    }
+
+    private fun pruneExpiredChatLogs() {
+        get<AppScope>().launch(Dispatchers.IO) {
+            runCatching {
+                get<ChatLogStore>().pruneExpired()
+            }.onFailure {
+                Log.e(TAG, "pruneExpiredChatLogs failed", it)
             }
         }
     }

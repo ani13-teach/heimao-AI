@@ -20,6 +20,7 @@ import me.rerere.rikkahub.data.ai.GenerationHandler
 import me.rerere.rikkahub.data.ai.transformers.TemplateTransformer
 import me.rerere.rikkahub.data.api.RikkaHubAPI
 import me.rerere.rikkahub.data.datastore.SettingsStore
+import me.rerere.rikkahub.data.log.ChatLogStore
 import me.rerere.rikkahub.data.db.AppDatabase
 import me.rerere.rikkahub.data.db.fts.MessageFtsManager
 import me.rerere.rikkahub.data.db.fts.SimpleDictManager
@@ -179,7 +180,15 @@ val dataSourceModule = module {
         MessageFtsManager(get())
     }
 
-    single { McpManager(settingsStore = get(), appScope = get(), filesManager = get(), appEventBus = get()) }
+    single {
+        ChatLogStore(
+            context = get(),
+            settingsStore = get(),
+            appScope = get(),
+        )
+    }
+
+    single { McpManager(settingsStore = get(), appScope = get(), filesManager = get(), chatLogStore = get(), appEventBus = get()) }
 
     single {
         GenerationHandler(
@@ -189,6 +198,7 @@ val dataSourceModule = module {
             memoryRepo = get(),
             workspaceRepository = get(),
             workspaceAccessGate = get(),
+            chatLogStore = get(),
         )
     }
 

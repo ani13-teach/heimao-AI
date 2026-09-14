@@ -82,7 +82,7 @@ import me.rerere.rikkahub.ui.pages.assistant.detail.AssistantPromptPage
 import me.rerere.rikkahub.ui.pages.assistant.detail.AssistantRequestPage
 import me.rerere.rikkahub.ui.pages.backup.BackupPage
 import me.rerere.rikkahub.ui.pages.chat.ChatPage
-import me.rerere.rikkahub.ui.pages.debug.DebugPage
+import me.rerere.rikkahub.ui.pages.chatlog.ChatLogPage
 import me.rerere.rikkahub.ui.pages.extensions.ExtensionsPage
 import me.rerere.rikkahub.ui.pages.extensions.PromptPage
 import me.rerere.rikkahub.ui.pages.extensions.skills.SkillDetailPage
@@ -437,8 +437,8 @@ class RouteActivity : ComponentActivity() {
                                 SettingFilesPage()
                             }
 
-                            entry<Screen.Debug> {
-                                DebugPage()
+                            entry<Screen.ChatLogs> {
+                                ChatLogPage()
                             }
 
                             entry<Screen.Extensions> {
@@ -634,7 +634,7 @@ sealed interface Screen : NavKey {
     data object SettingFiles : Screen
 
     @Serializable
-    data object Debug : Screen
+    data object ChatLogs : Screen
 
     @Serializable
     data object Extensions : Screen

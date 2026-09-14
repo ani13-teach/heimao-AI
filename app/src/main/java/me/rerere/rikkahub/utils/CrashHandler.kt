@@ -3,6 +3,7 @@ package me.rerere.rikkahub.utils
 import android.content.Context
 import android.util.Log
 import androidx.core.content.edit
+import me.rerere.rikkahub.data.log.ChatLogFile
 
 private const val TAG = "CrashHandler"
 private const val PREFS_NAME = "crash_handler"
@@ -17,6 +18,8 @@ object CrashHandler {
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             Log.e(TAG, "Uncaught exception on thread ${thread.name}", throwable)
             markCrashed(appContext, thread, throwable)
+            // 同一份运行日志里也留一条。崩溃线程上同步写，写失败不影响原有处理。
+            ChatLogFile.appendCrash(appContext, thread.name, throwable)
             defaultHandler?.uncaughtException(thread, throwable)
         }
     }

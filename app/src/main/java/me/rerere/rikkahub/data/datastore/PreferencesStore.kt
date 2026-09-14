@@ -36,6 +36,7 @@ import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV1Migration
 import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV2Migration
 import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV4Migration
 import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV5Migration
+import me.rerere.rikkahub.data.log.ChatLogLevel
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.Avatar
 import me.rerere.rikkahub.data.model.InjectionPosition
@@ -74,8 +75,8 @@ private fun MutablePreferences.writeSettings(settings: Settings) {
     this[SettingsStore.DYNAMIC_COLOR] = settings.dynamicColor
     this[SettingsStore.THEME_ID] = settings.themeId
     this[SettingsStore.CUSTOM_THEMES] = JsonInstant.encodeToString(settings.customThemes)
-    this[SettingsStore.DEVELOPER_MODE] = settings.developerMode
     this[SettingsStore.DISPLAY_SETTING] = JsonInstant.encodeToString(settings.displaySetting)
+    this[SettingsStore.CHAT_LOG_LEVEL] = settings.chatLogLevel.name
     this[SettingsStore.PROMPT_CACHE_ENABLED] = settings.promptCacheEnabled
     this[SettingsStore.AUTO_RETRY_ENABLED] = settings.autoRetryEnabled
     this[SettingsStore.AUTO_RETRY_INTERVAL_SECONDS] = settings.autoRetryIntervalSeconds
@@ -143,7 +144,7 @@ class SettingsStore(
         val THEME_ID = stringPreferencesKey("theme_id")
         val CUSTOM_THEMES = stringPreferencesKey("custom_themes")
         val DISPLAY_SETTING = stringPreferencesKey("display_setting")
-        val DEVELOPER_MODE = booleanPreferencesKey("developer_mode")
+        val CHAT_LOG_LEVEL = stringPreferencesKey("chat_log_level")
         val PROMPT_CACHE_ENABLED = booleanPreferencesKey("prompt_cache_enabled")
 
         // 自动重试
@@ -240,8 +241,10 @@ class SettingsStore(
                 customThemes = preferences[CUSTOM_THEMES]?.let {
                     JsonInstant.decodeFromString(it)
                 } ?: emptyList(),
-                developerMode = preferences[DEVELOPER_MODE] == true,
                 displaySetting = JsonInstant.decodeFromString(preferences[DISPLAY_SETTING] ?: "{}"),
+                chatLogLevel = preferences[CHAT_LOG_LEVEL]
+                    ?.let { runCatching { ChatLogLevel.valueOf(it) }.getOrNull() }
+                    ?: ChatLogLevel.ALL,
                 promptCacheEnabled = preferences[PROMPT_CACHE_ENABLED] != false,
                 searchServices = preferences[SEARCH_SERVICES]?.let {
                     JsonInstant.decodeFromString(it)
@@ -519,8 +522,9 @@ data class Settings(
     val dynamicColor: Boolean = true,
     val themeId: String = PresetThemes[0].id,
     val customThemes: List<CustomTheme> = emptyList(),
-    val developerMode: Boolean = false,
     val displaySetting: DisplaySetting = DisplaySetting(),
+    /** 运行日志等级：关 / 只记错误 / 全记。 */
+    val chatLogLevel: ChatLogLevel = ChatLogLevel.ALL,
     val promptCacheEnabled: Boolean = true,
     /** 生成失败后是否自动重试。 */
     val autoRetryEnabled: Boolean = true,

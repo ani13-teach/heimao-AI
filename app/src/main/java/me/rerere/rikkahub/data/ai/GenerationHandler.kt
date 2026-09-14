@@ -45,6 +45,7 @@ import me.rerere.rikkahub.data.ai.tools.buildMemoryTools
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.datastore.findProvider
+import me.rerere.rikkahub.data.log.ChatLogStore
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.AssistantMemory
 import me.rerere.rikkahub.data.repository.LayeredMemoryContext
@@ -247,6 +248,7 @@ class GenerationHandler(
     private val memoryRepo: MemoryRepository,
     private val workspaceRepository: WorkspaceRepository,
     private val workspaceAccessGate: AssistantWorkspaceAccessGate,
+    private val chatLogStore: ChatLogStore,
 ) {
     private val memorySnapshots = object : LinkedHashMap<String, MemorySnapshotState>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, MemorySnapshotState>): Boolean =
@@ -419,6 +421,12 @@ class GenerationHandler(
                     workspaceId = workspaceId,
                     workspaceCwd = workspaceCwd,
                 )
+                // 一轮模型请求结束，记下这一轮的 token 明细和缓存命中情况。
+                chatLogStore.recordTokenUsage(
+                    model = model,
+                    provider = provider,
+                    usage = messages.lastOrNull()?.usage,
+                )
                 memoryResolution.commit?.let { commit ->
                     refreshAndCommitMemorySnapshot(
                         memorySnapshots = memorySnapshots,
@@ -570,6 +578,7 @@ class GenerationHandler(
                             // 取消必须向上传播，否则停止生成会被误报为工具执行错误
                             if (it is CancellationException) throw it
                             it.printStackTrace()
+                            chatLogStore.recordToolFailure(toolName = tool.toolName, error = it)
                             executedTools += tool.copy(
                                 output = listOf(
                                     UIMessagePart.Text(

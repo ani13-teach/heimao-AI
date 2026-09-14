@@ -26,6 +26,7 @@ import me.rerere.rikkahub.data.datastore.getCurrentAssistant
 import me.rerere.rikkahub.data.event.AppEventBus
 import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.files.saveUploadFromBytes
+import me.rerere.rikkahub.data.log.ChatLogStore
 import me.rerere.rikkahub.utils.JsonInstant
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
@@ -42,6 +43,7 @@ class McpManager(
     private val settingsStore: SettingsStore,
     private val appScope: AppScope,
     private val filesManager: FilesManager,
+    private val chatLogStore: ChatLogStore,
     appEventBus: AppEventBus,
 ) {
     private val okHttpClient = OkHttpClient.Builder()
@@ -116,6 +118,8 @@ class McpManager(
         } catch (e: CancellationException) {
             throw e
         } catch (e: McpClientUnavailableException) {
+            // 这里把异常吞成了文本返回，工具执行层看不到，所以单独记一笔。
+            chatLogStore.recordToolFailure(toolName = toolName, error = e)
             return listOf(UIMessagePart.Text("Failed to execute MCP tool: ${e.message ?: e.javaClass.name}"))
         }
         return result.content.map { content ->

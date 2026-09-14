@@ -25,7 +25,6 @@ class SettingVM(
                     dynamicColor = settings.dynamicColor,
                     themeId = settings.themeId,
                     customThemes = settings.customThemes,
-                    developerMode = settings.developerMode,
                     displaySetting = settings.displaySetting,
                     promptCacheEnabled = settings.promptCacheEnabled,
                     autoRetryEnabled = settings.autoRetryEnabled,
