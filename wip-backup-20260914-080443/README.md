@@ -25,6 +25,10 @@
 - `gh.patch` / `gh-cl.patch`：两份 GenerationHandler 的对照改法
 - `ar-msg.txt` / `cl-msg.txt`：当时的提交信息草稿
 
+这些文件入库时被 git 统一成了 LF 行尾，内容一字未改（逐文件比对过哈希，只差 `\r`）。
+严格一致的原始字节在 `untracked.tgz` 和仓库外那份
+`C:\Users\jch\heimaoai\_wip-backup-20260914-080443\` 里。
+
 ## 注意
 
 - 根目录三个文件（`PromptCacheRouting.kt`、测试、方案文档）**不会编译**：`PromptCacheRouting.kt`
