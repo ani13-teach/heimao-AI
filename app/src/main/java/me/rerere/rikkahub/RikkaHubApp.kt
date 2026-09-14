@@ -5,6 +5,8 @@ import android.util.Log
 import androidx.compose.foundation.ComposeFoundationFlags
 import androidx.compose.runtime.Composer
 import androidx.compose.runtime.tooling.ComposeStackTraceMode
+import androidx.compose.ui.ComposeUiFlags
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.core.app.NotificationChannelCompat
 import androidx.core.app.NotificationManagerCompat
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -48,7 +50,14 @@ const val CHAT_COMPLETED_NOTIFICATION_CHANNEL_ID = "chat_completed"
 const val CHAT_LIVE_UPDATE_NOTIFICATION_CHANNEL_ID = "chat_live_update"
 
 class RikkaHubApp : Application() {
+    @OptIn(ExperimentalComposeUiApi::class)
     override fun onCreate() {
+        // Compose 1.12 的 Android View 焦点接管路径会在 AndroidView 被移除时同步发起二维焦点搜索,
+        // 越界搜索会强制重新测量 LazyColumn, 在 applyChanges 期间重入 compose,
+        // 抛出 "pending composition has not been applied" 崩溃 (Google issue 469958424).
+        // 关掉这个开关可绕开该路径. 官方仍未修复, 这个标记是 Google 自己给出的临时办法.
+        // 必须在 super.onCreate() 之前设置: Compose UI 可能在此之前被初始化.
+        ComposeUiFlags.isBypassUnfocusableComposeViewEnabled = false
         super.onCreate()
 
         // Recover the database and workspace root before Koin can open a half-restored Room
