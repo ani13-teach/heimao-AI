@@ -30,6 +30,7 @@ class SettingVM(
                     autoRetryEnabled = settings.autoRetryEnabled,
                     autoRetryIntervalSeconds = settings.autoRetryIntervalSeconds,
                     autoRetryMaxDurationMinutes = settings.autoRetryMaxDurationMinutes,
+                    autoRetryMaxAttempts = settings.autoRetryMaxAttempts,
                     favoriteModels = settings.favoriteModels,
                     chatModelId = settings.chatModelId,
                     fastModelId = settings.fastModelId,

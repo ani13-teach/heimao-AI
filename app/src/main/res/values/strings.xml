@@ -609,6 +609,8 @@
   <string name="setting_display_page_auto_retry_interval_desc">How long to wait before trying the same request again.</string>
   <string name="setting_display_page_auto_retry_interval_title">Retry interval</string>
   <string name="setting_display_page_auto_retry_interval_value">%1$d s</string>
+  <string name="setting_display_page_auto_retry_max_attempts_title">Maximum retry count</string>
+  <string name="setting_display_page_auto_retry_max_attempts_value">%1$d times</string>
   <string name="setting_display_page_auto_retry_max_duration_desc">Total time allowed for retrying one generation. Retrying stops when it runs out.</string>
   <string name="setting_display_page_auto_retry_max_duration_title">Maximum retry time</string>
   <string name="setting_display_page_auto_retry_max_duration_value">%1$d min</string>

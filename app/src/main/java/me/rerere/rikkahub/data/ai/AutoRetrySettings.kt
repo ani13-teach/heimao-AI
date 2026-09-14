@@ -11,6 +11,10 @@ const val AUTO_RETRY_MAX_INTERVAL_SECONDS = 60
 const val AUTO_RETRY_MIN_DURATION_MINUTES = 1
 const val AUTO_RETRY_MAX_DURATION_MINUTES = 30
 
+/** 最多尝试次数的可选范围（次，含首次尝试）。 */
+const val AUTO_RETRY_MIN_ATTEMPTS = 2
+const val AUTO_RETRY_MAX_ATTEMPTS = 20
+
 /**
  * 把用户设置映射成请求层使用的重试策略。
  *
@@ -26,5 +30,7 @@ fun Settings.toRetryPolicy(): RetryPolicy? {
         maxDurationMillis = autoRetryMaxDurationMinutes
             .coerceIn(AUTO_RETRY_MIN_DURATION_MINUTES, AUTO_RETRY_MAX_DURATION_MINUTES)
             .toLong() * 60_000L,
+        maxAttempts = autoRetryMaxAttempts
+            .coerceIn(AUTO_RETRY_MIN_ATTEMPTS, AUTO_RETRY_MAX_ATTEMPTS),
     )
 }

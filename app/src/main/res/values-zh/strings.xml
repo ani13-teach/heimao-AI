@@ -600,6 +600,8 @@
   <string name="setting_display_page_auto_retry_interval_desc">两次尝试同一个请求之间等待多久</string>
   <string name="setting_display_page_auto_retry_interval_title">重试间隔</string>
   <string name="setting_display_page_auto_retry_interval_value">%1$d 秒</string>
+  <string name="setting_display_page_auto_retry_max_attempts_title">最大自动重试次数</string>
+  <string name="setting_display_page_auto_retry_max_attempts_value">%1$d 次</string>
   <string name="setting_display_page_auto_retry_max_duration_desc">一次生成允许用于重试的总时长，用完就停止重试</string>
   <string name="setting_display_page_auto_retry_max_duration_title">最大重试时间</string>
   <string name="setting_display_page_auto_retry_max_duration_value">%1$d 分钟</string>

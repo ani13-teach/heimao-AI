@@ -25,8 +25,10 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.ai.AUTO_RETRY_MAX_ATTEMPTS
 import me.rerere.rikkahub.data.ai.AUTO_RETRY_MAX_DURATION_MINUTES
 import me.rerere.rikkahub.data.ai.AUTO_RETRY_MAX_INTERVAL_SECONDS
+import me.rerere.rikkahub.data.ai.AUTO_RETRY_MIN_ATTEMPTS
 import me.rerere.rikkahub.data.ai.AUTO_RETRY_MIN_DURATION_MINUTES
 import me.rerere.rikkahub.data.ai.AUTO_RETRY_MIN_INTERVAL_SECONDS
 import me.rerere.rikkahub.data.datastore.DisplaySetting
@@ -261,6 +263,9 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
             }
 
             item {
+                var maxAttempts by remember(settings.autoRetryMaxAttempts) {
+                    mutableStateOf(settings.autoRetryMaxAttempts)
+                }
                 var intervalSeconds by remember(settings.autoRetryIntervalSeconds) {
                     mutableStateOf(settings.autoRetryIntervalSeconds)
                 }
@@ -288,6 +293,38 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
                         },
                     )
                     if (settings.autoRetryEnabled) {
+                        item(
+                            headlineContent = {
+                                Text(stringResource(R.string.setting_display_page_auto_retry_max_attempts_title))
+                            },
+                            supportingContent = {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Slider(
+                                        value = maxAttempts.toFloat(),
+                                        // 拖动时先动本地状态，松手才写入设置，避免每个滑过位置都落盘
+                                        onValueChange = { maxAttempts = it.toInt() },
+                                        onValueChangeFinished = {
+                                            vm.updateSettings(
+                                                settings.copy(autoRetryMaxAttempts = maxAttempts)
+                                            )
+                                        },
+                                        valueRange = AUTO_RETRY_MIN_ATTEMPTS.toFloat()..AUTO_RETRY_MAX_ATTEMPTS.toFloat(),
+                                        steps = AUTO_RETRY_MAX_ATTEMPTS - AUTO_RETRY_MIN_ATTEMPTS - 1,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    Text(
+                                        text = stringResource(
+                                            R.string.setting_display_page_auto_retry_max_attempts_value,
+                                            maxAttempts,
+                                        )
+                                    )
+                                }
+                            },
+                        )
                         item(
                             headlineContent = {
                                 Text(stringResource(R.string.setting_display_page_auto_retry_interval_title))
