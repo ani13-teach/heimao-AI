@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  runtimeprobe - standalone availability probe.
+
+  Deliberately minimal:
+    * no <uses-permission> at all (no network, no storage, no package queries)
+    * no resources (no res/ directory), so aapt2 link needs no -R input
+    * single exported launcher activity
+
+  extractNativeLibs="true" keeps lib/<abi>/libruntimeprobe.so as a real file on
+  disk (instead of loading it from the APK), which makes the artifact easy to
+  inspect after install.
+  debuggable="true" is required only so `adb shell run-as` can read the result
+  file from /data/data/<pkg>/files/. It does not grant the app any capability it
+  would not already have.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="me.rerere.heimao.runtimeprobe"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk
+        android:minSdkVersion="26"
+        android:targetSdkVersion="37" />
+
+    <application
+        android:allowBackup="false"
+        android:debuggable="true"
+        android:extractNativeLibs="true"
+        android:hasCode="true"
+        android:label="Runtime Probe">
+
+        <activity
+            android:name=".ProbeActivity"
+            android:exported="true"
+            android:label="Runtime Probe">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

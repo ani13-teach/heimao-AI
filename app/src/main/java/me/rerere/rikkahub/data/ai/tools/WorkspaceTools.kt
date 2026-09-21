@@ -294,11 +294,12 @@ private fun createEditFileTool(
 )
 
 internal fun workspaceShellDescription(defaultCwd: String = ""): String = buildString {
-    append("Run a shell command in the current workspace's private Linux Rootfs. ")
+    append("Run a shell command in the current workspace's selected Linux environment. ")
     append("The working directory is always /workspace or one of its subdirectories, and user files are confined to /workspace. ")
     append("Package mode provides the workspace's full Linux Rootfs, so installed tools such as python3, pip, npm, Go, and Cargo can be used when present. ")
     append("Sandbox mode is intentionally minimal and only provides basic shell/toybox commands; python3, pip, bash, and other full Linux tools are unavailable there. ")
-    append("apt, pip, npm, Go, Cargo, and other CLI tools installed here persist in this workspace. ")
+    append("The Linux environment may be shared with other workspaces. Use the public environment maintenance UI for system-wide package installation, upgrades, and removal. ")
+    append("For project-specific Python dependencies use python3 -m venv /workspace/.venv and /workspace/.venv/bin/python -m pip; use --system-site-packages only when the project should inherit public libraries. ")
     append("The workspace does not mount or expose /skills, /upload, /tool_outputs, /proc, /sys, or external app directories. ")
     append("The PRoot guest root is not Android host root. ")
     if (defaultCwd.isNotBlank()) {

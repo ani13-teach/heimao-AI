@@ -42,10 +42,23 @@ object WorkspaceArchiveTar {
         val maxPayloadBytes: Long = 32L * 1024 * 1024 * 1024,
     )
 
+    /**
+     * Write [sourceRoot] as a TAR payload.
+     *
+     * [directoryOverrides] replaces one logical directory member (and its whole subtree) with a
+     * directory that lives outside [sourceRoot]. It exists for a workspace whose guest `HOME` is
+     * not the rootfs's own `/root`: the member `root` has to carry the workspace-local HOME, and
+     * whatever the shared rootfs still stores below `/root` must never leak into that workspace's
+     * archive. The override keeps the member name, directory entry attributes, permission bits,
+     * symbolic links and hardlinks of the replacement tree, and the replaced on-disk subtree is
+     * skipped entirely, so no logical member can be written twice. A missing replacement directory
+     * yields an empty directory member rather than falling back to the replaced content.
+     */
     fun create(
         sourceRoot: File,
         output: File,
         excludedPaths: Set<String> = emptySet(),
+        directoryOverrides: Map<String, File> = emptyMap(),
         limits: Limits = Limits(),
         onEntry: () -> Unit = {},
         onFileBytes: (Long) -> Unit = {},
@@ -55,17 +68,25 @@ object WorkspaceArchiveTar {
         val digest = MessageDigest.getInstance("SHA-256")
         var count = 0
         val state = WriteState()
+        val overrides = normalizeOverrides(directoryOverrides)
         DigestOutputStream(output.outputStream(), digest, onOutputBytes).use { digestOut ->
             TarArchiveOutputStream(digestOut).use { tarOut ->
                 tarOut.setLongFileMode(TarArchiveOutputStream.LONGFILE_POSIX)
                 tarOut.setBigNumberMode(TarArchiveOutputStream.BIGNUMBER_POSIX)
-                if (Files.exists(sourceRoot.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+                val sourcePath = sourceRoot.toPath()
+                val sourceExists = Files.exists(sourcePath, LinkOption.NOFOLLOW_LINKS)
+                // A source-less payload is still written when an override has to be archived: the
+                // replacement may be the only copy of the state this payload represents.
+                if (sourceExists || overrides.isNotEmpty()) {
                     count = writeTree(
-                        root = sourceRoot,
-                        current = sourceRoot.toPath(),
+                        physicalDirectory = sourcePath.takeIf { sourceExists },
+                        logicalPrefix = "",
                         tarOut = tarOut,
                         hardLinks = HashMap(),
                         excludedPaths = excludedPaths.map { WorkspaceArchivePathSafety.normalize(it) }.toSet(),
+                        overrides = overrides,
+                        members = HashSet(),
+                        visitedDirectories = HashSet(),
                         limits = limits,
                         state = state,
                         onEntry = onEntry,
@@ -195,27 +216,174 @@ object WorkspaceArchiveTar {
         return entries
     }
 
+    /**
+     * Reject ambiguous overrides before any archive byte is written: a key has to be a safe archive
+     * path, its replacement must be a real directory (or absent, which means "no state yet") and no
+     * two keys may normalize to the same member.
+     */
+    private fun normalizeOverrides(directoryOverrides: Map<String, File>): Map<String, java.nio.file.Path> {
+        if (directoryOverrides.isEmpty()) return emptyMap()
+        val normalized = LinkedHashMap<String, java.nio.file.Path>()
+        directoryOverrides.forEach { (logicalPath, replacement) ->
+            val key = WorkspaceArchivePathSafety.normalize(logicalPath)
+            val path = replacement.toPath()
+            require(!Files.isSymbolicLink(path)) {
+                "TAR directory override must not be a symbolic link: ${replacement.path}"
+            }
+            if (Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
+                require(Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)) {
+                    "TAR directory override is not a directory: ${replacement.path}"
+                }
+            }
+            require(normalized.put(key, path) == null) {
+                "Duplicate TAR directory override: $key"
+            }
+        }
+        return normalized
+    }
+
+    /** The direct child member name of [logicalPrefix] that leads to [overrideKey], if any. */
+    private fun overrideChildName(logicalPrefix: String, overrideKey: String): String? {
+        if (logicalPrefix.isEmpty()) return overrideKey.substringBefore('/').takeIf { it.isNotEmpty() }
+        if (!overrideKey.startsWith("$logicalPrefix/")) return null
+        return overrideKey.removePrefix("$logicalPrefix/").substringBefore('/').takeIf { it.isNotEmpty() }
+    }
+
+    private fun writeDirectoryEntry(
+        relative: String,
+        mode: Int,
+        modifiedAt: Long,
+        tarOut: TarArchiveOutputStream,
+        limits: Limits,
+        state: WriteState,
+        onEntry: () -> Unit,
+    ) {
+        val entry = TarArchiveEntry(relative, TarConstants.LF_DIR)
+        entry.mode = mode
+        entry.modTime = Date(modifiedAt)
+        recordEntry(limits, state, onEntry)
+        tarOut.putArchiveEntry(entry)
+        tarOut.closeArchiveEntry()
+    }
+
     private fun writeTree(
-        root: File,
-        current: java.nio.file.Path,
+        physicalDirectory: java.nio.file.Path?,
+        logicalPrefix: String,
         tarOut: TarArchiveOutputStream,
         hardLinks: MutableMap<Any, String>,
         excludedPaths: Set<String>,
+        overrides: Map<String, java.nio.file.Path>,
+        members: MutableSet<String>,
+        visitedDirectories: MutableSet<String>,
         limits: Limits,
         state: WriteState,
         onEntry: () -> Unit,
         onFileBytes: (Long) -> Unit,
     ): Int {
         var count = 0
-        val children = ArrayList<java.nio.file.Path>()
-        // Do not use Stream.toList(): it is only available on newer Java runtimes than API 26.
-        Files.list(current).use { stream ->
-            stream.forEach { children.add(it) }
+        physicalDirectory?.let { directory ->
+            // An override may point at a directory that contains the archived root. Walking it
+            // again would duplicate members instead of failing, so refuse the projection.
+            require(visitedDirectories.add(directory.toAbsolutePath().normalize().toString())) {
+                "TAR directory is archived twice: $directory"
+            }
         }
-        children.sortBy { it.fileName.toString() }
-        children.forEach { path ->
-            val relative = root.toPath().relativize(path).toString().replace(File.separatorChar, '/')
+        val names = sortedSetOf<String>()
+        physicalDirectory?.let { directory ->
+            // Do not use Stream.toList(): it is only available on newer Java runtimes than API 26.
+            Files.list(directory).use { stream ->
+                stream.forEach { names += it.fileName.toString() }
+            }
+        }
+        // An override may name a member that the replaced tree does not have at all (a shared
+        // rootfs without /root, or an intermediate directory such as var for var/tmp).
+        overrides.keys.forEach { key ->
+            overrideChildName(logicalPrefix, key)?.let { names += it }
+        }
+        names.forEach { name ->
+            val relative = if (logicalPrefix.isEmpty()) name else "$logicalPrefix/$name"
             if (excludedPaths.any { relative == it || relative.startsWith("$it/") }) return@forEach
+            require(members.add(relative)) { "Duplicate TAR member: $relative" }
+            val override = overrides[relative]
+            if (override != null) {
+                val exists = Files.exists(override, LinkOption.NOFOLLOW_LINKS)
+                if (!exists) {
+                    writeDirectoryEntry(
+                        relative,
+                        OWNER_DIRECTORY_MODE,
+                        0L,
+                        tarOut,
+                        limits,
+                        state,
+                        onEntry,
+                    )
+                    count++
+                    return@forEach
+                }
+                val attributes = Files.readAttributes(
+                    override,
+                    BasicFileAttributes::class.java,
+                    LinkOption.NOFOLLOW_LINKS,
+                )
+                require(attributes.isDirectory) {
+                    "TAR directory override is not a directory: $override"
+                }
+                writeDirectoryEntry(
+                    relative,
+                    readMode(override, isDirectory = true),
+                    attributes.lastModifiedTime().toMillis(),
+                    tarOut,
+                    limits,
+                    state,
+                    onEntry,
+                )
+                count++
+                count += writeTree(
+                    physicalDirectory = override,
+                    logicalPrefix = relative,
+                    tarOut = tarOut,
+                    hardLinks = hardLinks,
+                    excludedPaths = excludedPaths,
+                    overrides = overrides,
+                    members = members,
+                    visitedDirectories = visitedDirectories,
+                    limits = limits,
+                    state = state,
+                    onEntry = onEntry,
+                    onFileBytes = onFileBytes,
+                )
+                return@forEach
+            }
+            val path = physicalDirectory?.resolve(name)
+            if (path == null || !Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
+                // The directory only exists to hold an override below it; emit the mount point so
+                // the projected tree keeps the shape the replacement expects.
+                writeDirectoryEntry(
+                    relative,
+                    OWNER_DIRECTORY_MODE,
+                    0L,
+                    tarOut,
+                    limits,
+                    state,
+                    onEntry,
+                )
+                count++
+                count += writeTree(
+                    physicalDirectory = null,
+                    logicalPrefix = relative,
+                    tarOut = tarOut,
+                    hardLinks = hardLinks,
+                    excludedPaths = excludedPaths,
+                    overrides = overrides,
+                    members = members,
+                    visitedDirectories = visitedDirectories,
+                    limits = limits,
+                    state = state,
+                    onEntry = onEntry,
+                    onFileBytes = onFileBytes,
+                )
+                return@forEach
+            }
             val attributes = Files.readAttributes(
                 path,
                 BasicFileAttributes::class.java,
@@ -223,23 +391,29 @@ object WorkspaceArchiveTar {
             )
             when {
                 attributes.isDirectory -> {
-                    val entry = TarArchiveEntry(relative, TarConstants.LF_DIR)
-                    entry.mode = readMode(path, isDirectory = true)
-                    entry.modTime = Date(attributes.lastModifiedTime().toMillis())
-                    recordEntry(limits, state, onEntry)
-                    tarOut.putArchiveEntry(entry)
-                    tarOut.closeArchiveEntry()
-                    count++
-                    count += writeTree(
-                        root,
-                        path,
+                    writeDirectoryEntry(
+                        relative,
+                        readMode(path, isDirectory = true),
+                        attributes.lastModifiedTime().toMillis(),
                         tarOut,
-                        hardLinks,
-                        excludedPaths,
                         limits,
                         state,
                         onEntry,
-                        onFileBytes,
+                    )
+                    count++
+                    count += writeTree(
+                        physicalDirectory = path,
+                        logicalPrefix = relative,
+                        tarOut = tarOut,
+                        hardLinks = hardLinks,
+                        excludedPaths = excludedPaths,
+                        overrides = overrides,
+                        members = members,
+                        visitedDirectories = visitedDirectories,
+                        limits = limits,
+                        state = state,
+                        onEntry = onEntry,
+                        onFileBytes = onFileBytes,
                     )
                 }
 
@@ -385,12 +559,16 @@ object WorkspaceArchiveTar {
             val ok = file.setReadable(permissions and 0x100 != 0, ownerOnly) &&
                 file.setWritable(permissions and 0x080 != 0, ownerOnly) &&
                 file.setExecutable(permissions and 0x040 != 0, ownerOnly)
-            require(ok) {
-                "Unable to apply mode ${permissions.toString(8)} to ${file.path}: ${error.message}"
+            if (isAndroidRuntime()) {
+                require(ok) {
+                    "Unable to apply mode ${permissions.toString(8)} to ${file.path}: ${error.message}"
+                }
             }
         }
     }
 
+    private fun isAndroidRuntime(): Boolean =
+        System.getProperty("java.runtime.name")?.contains("Android", ignoreCase = true) == true
     private fun ByteArray.toHexString(): String = joinToString("") {
         "%02x".format(Locale.US, it.toInt() and 0xff)
     }

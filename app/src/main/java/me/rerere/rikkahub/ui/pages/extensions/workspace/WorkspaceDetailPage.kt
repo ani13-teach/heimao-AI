@@ -100,6 +100,17 @@ fun WorkspaceDetailPage(id: String) {
     val navController = LocalNavController.current
     val vm: WorkspaceDetailVM = koinViewModel(parameters = { parametersOf(id) })
     val state by vm.state.collectAsStateWithLifecycle()
+    var showMaintenanceTerminal by remember { mutableStateOf(false) }
+    if (showMaintenanceTerminal) {
+        // 维护终端是页面级模式: 复用同一 VM 和已有终端页, 不新增导航路由.
+        val leaveMaintenance = {
+            showMaintenanceTerminal = false
+            vm.refreshSharedEnvironment()
+        }
+        BackHandler { leaveMaintenance() }
+        WorkspaceTerminalPage(id = id, maintenance = true, onBack = leaveMaintenance)
+        return
+    }
     val installProgress by vm.installProgress.collectAsStateWithLifecycle()
     val installError by vm.installError.collectAsStateWithLifecycle()
     val pagerState = rememberPagerState { 2 }
@@ -202,10 +213,21 @@ fun WorkspaceDetailPage(id: String) {
                     snapshotBusy = state.snapshotBusy,
                     snapshotLimitExceeded = state.snapshotLimitExceeded,
                     installProgress = installProgress,
+                    sharedEnvironment = state.sharedEnvironment,
+                    sharedLoading = state.sharedLoading,
+                    sharedBusy = state.sharedBusy,
+                    referencingWorkspaces = state.referencingWorkspaces,
+                    toolChecks = state.toolChecks,
+                    toolCheckRunning = state.toolCheckRunning,
                     onInstallRootfs = { showInstallDialog = true },
                     onCreateSnapshot = vm::createSnapshot,
                     onRestoreSnapshot = { restoreTarget = it },
                     onDeleteSnapshot = { deleteSnapshotTarget = it },
+                    onSwitchToShared = vm::switchToSharedEnvironment,
+                    onSwitchToPrivate = vm::switchToPrivateEnvironment,
+                    onRestoreSharedRecovery = vm::restoreSharedRecovery,
+                    onOpenMaintenance = { showMaintenanceTerminal = true },
+                    onCheckTools = vm::checkSharedEnvironmentTools,
                 )
 
                 1 -> WorkspaceFilesPage(
@@ -277,6 +299,7 @@ fun WorkspaceDetailPage(id: String) {
         if (showInstallDialog) {
             InstallRootfsDialog(
                 workspace = workspace,
+                shared = state.sharedEnvironment.isShared,
                 onDismiss = { showInstallDialog = false },
                 onConfirm = { url ->
                     vm.installRootfs(url)
@@ -293,6 +316,19 @@ fun WorkspaceDetailPage(id: String) {
             text = { Text(message) },
             confirmButton = {
                 TextButton(onClick = vm::dismissInstallError) {
+                    Text(stringResource(R.string.common_confirm))
+                }
+            },
+        )
+    }
+
+    state.sharedError?.let { message ->
+        AlertDialog(
+            onDismissRequest = vm::dismissSharedError,
+            title = { Text(stringResource(R.string.workspace_shared_error_title)) },
+            text = { Text(message) },
+            confirmButton = {
+                TextButton(onClick = vm::dismissSharedError) {
                     Text(stringResource(R.string.common_confirm))
                 }
             },
@@ -403,10 +439,21 @@ private fun WorkspaceBasicPage(
     snapshotBusy: Boolean,
     snapshotLimitExceeded: WorkspaceSnapshotLimitUiState?,
     installProgress: RootfsInstallProgress?,
+    sharedEnvironment: SharedEnvironmentUiState,
+    sharedLoading: Boolean,
+    sharedBusy: Boolean,
+    referencingWorkspaces: List<WorkspaceEntity>,
+    toolChecks: List<WorkspaceToolCheck>,
+    toolCheckRunning: Boolean,
     onInstallRootfs: () -> Unit,
     onCreateSnapshot: () -> Unit,
     onRestoreSnapshot: (WorkspaceSnapshotEntity) -> Unit,
     onDeleteSnapshot: (WorkspaceSnapshotEntity) -> Unit,
+    onSwitchToShared: () -> Unit,
+    onSwitchToPrivate: () -> Unit,
+    onRestoreSharedRecovery: () -> Unit,
+    onOpenMaintenance: () -> Unit,
+    onCheckTools: () -> Unit,
 ) {
     val shellStatus = workspace?.shellStatus
     val installing = installProgress != null || shellStatus == WorkspaceShellStatus.INSTALLING.name
@@ -445,6 +492,23 @@ private fun WorkspaceBasicPage(
 
         item {
             WorkspaceRuntimeMetadataCard(workspace?.runtimeMetadataOrDefault())
+        }
+
+        item {
+            WorkspaceSharedEnvironmentCard(
+                state = sharedEnvironment,
+                loading = sharedLoading,
+                busy = sharedBusy,
+                referencingWorkspaces = referencingWorkspaces,
+                toolChecks = toolChecks,
+                toolCheckRunning = toolCheckRunning,
+                rootfsReady = rootfsReady,
+                onSwitchToShared = onSwitchToShared,
+                onSwitchToPrivate = onSwitchToPrivate,
+                onRestoreRecovery = onRestoreSharedRecovery,
+                onOpenMaintenance = onOpenMaintenance,
+                onCheckTools = onCheckTools,
+            )
         }
 
         item {
@@ -788,7 +852,7 @@ private fun WorkspaceRuntimeMetadataCard(
 }
 
 @Composable
-private fun WorkspaceInfoRow(
+internal fun WorkspaceInfoRow(
     label: String,
     value: String,
     maxLines: Int = 1,
@@ -858,6 +922,7 @@ private fun RootfsProgress(progress: RootfsInstallProgress) {
 @Composable
 private fun InstallRootfsDialog(
     workspace: WorkspaceEntity,
+    shared: Boolean,
     onDismiss: () -> Unit,
     onConfirm: (String) -> Unit,
 ) {
@@ -873,6 +938,14 @@ private fun InstallRootfsDialog(
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                if (shared) {
+                    // 安装按共享自动分流: 共用对话框, 但必须说明影响全体引用者.
+                    Text(
+                        text = stringResource(R.string.workspace_shared_install_affects_all),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
                 OutlinedTextField(
                     value = url,
                     onValueChange = { url = it },

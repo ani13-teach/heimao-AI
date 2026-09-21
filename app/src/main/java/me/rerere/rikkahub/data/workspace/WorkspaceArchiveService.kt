@@ -42,6 +42,7 @@ import me.rerere.rikkahub.data.files.FileFolders
 import me.rerere.rikkahub.data.model.WorkspaceRuntimeMetadata
 import me.rerere.rikkahub.data.model.redactWorkspaceUrl
 import me.rerere.rikkahub.utils.JsonInstant
+import me.rerere.workspace.WorkspaceEnvironmentStore
 import me.rerere.workspace.WorkspaceShellStatus
 import me.rerere.workspace.hasUsableFullRootfs
 import me.rerere.workspace.detectRootfsArchitecture
@@ -55,9 +56,11 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
+import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.FileSystemException
 import java.nio.file.Files
 import java.nio.file.LinkOption
+import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.time.LocalDateTime
@@ -67,6 +70,39 @@ import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+
+internal fun preserveWorkspaceHomeFromSkippedRootfs(
+    workspaceStagingRoot: File,
+    workspaceRoot: File,
+    root: String,
+    extractedLinux: File,
+): File {
+    val extractedHome = File(extractedLinux, "root")
+    val externalHome = File(workspaceRoot, "home")
+    require(!Files.exists(externalHome.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+        "Workspace restore HOME already exists: ${externalHome.path}"
+    }
+    if (Files.exists(extractedHome.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+        require(Files.isDirectory(extractedHome.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+            "Archived workspace HOME is not a directory: ${extractedHome.path}"
+        }
+        require(!Files.isSymbolicLink(extractedHome.toPath())) {
+            "Archived workspace HOME must not be a symbolic link: ${extractedHome.path}"
+        }
+        try {
+            Files.move(
+                extractedHome.toPath(),
+                externalHome.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+            )
+        } catch (_: AtomicMoveNotSupportedException) {
+            Files.move(extractedHome.toPath(), externalHome.toPath())
+        }
+    }
+    WorkspaceEnvironmentStore(workspaceStagingRoot)
+        .initializePrivateWithExternalHome(root)
+    return externalHome
+}
 
 /**
  * The single archive implementation used by local export, WebDAV and S3.
@@ -84,22 +120,38 @@ class WorkspaceArchiveService(
     private val database: AppDatabase,
     private val bindingCoordinator: AssistantWorkspaceBindingCoordinator,
 ) {
+    /**
+     * The rootfs a workspace actually runs on. Every read below (placeholder repair, fingerprint,
+     * payload, directory validation) goes through this projection instead of `<root>/linux`.
+     */
+    private val environments by lazy {
+        WorkspaceEnvironmentStore(File(context.filesDir, "workspaces"))
+    }
+
+    private fun effectiveLinux(root: String): File =
+        if (environments.isShared(root)) environments.sharedLinuxDir() else environments.privateLinuxDir(root)
+
+    private fun homeOverrides(root: String): Map<String, File> =
+        if (environments.hasExternalHome(root)) mapOf("root" to environments.homeDir(root)) else emptyMap()
+
     suspend fun createBackupFile(
         includeDatabase: Boolean,
         includeFiles: Boolean,
-    ): File = withContext(Dispatchers.IO) {
-        workspaceRepository.withWorkspaceCatalogArchiveLock {
-            try {
-                createBackupFileLocked(includeDatabase, includeFiles)
-            } catch (error: FileSystemException) {
-                // A java.nio file error carries nothing but a path as its message, so a failed
-                // backup would otherwise be undiagnosable from the transport UI. Name the file
-                // and the reason ("Permission denied", "No such file or directory", ...).
-                throw IllegalStateException(
-                    "Cannot read workspace archive source: ${error.file} " +
-                        "(${error.reason ?: error.javaClass.simpleName})",
-                    error,
-                )
+    ): File = workspaceRepository.withEnvironmentArchiveLease {
+        withContext(Dispatchers.IO) {
+            workspaceRepository.withWorkspaceCatalogArchiveLock {
+                try {
+                    createBackupFileLocked(includeDatabase, includeFiles)
+                } catch (error: FileSystemException) {
+                    // A java.nio file error carries nothing but a path as its message, so a failed
+                    // backup would otherwise be undiagnosable from the transport UI. Name the file
+                    // and the reason ("Permission denied", "No such file or directory", ...).
+                    throw IllegalStateException(
+                        "Cannot read workspace archive source: ${error.file} " +
+                            "(${error.reason ?: error.javaClass.simpleName})",
+                        error,
+                    )
+                }
             }
         }
     }
@@ -132,6 +184,13 @@ class WorkspaceArchiveService(
             // Workspace payloads are the portable unit and are always included. The legacy
             // FILES switch only controls upload/skills/fonts compatibility entries.
             val workspaces = workspaceRepository.getAll()
+            val rawWorkspaceCatalog = database.workspaceDao().getAll()
+                .map(::workspaceCatalogRecord)
+                .sorted()
+            // The portable manifest carries the environment-aware projection of every workspace
+            // (a shared-rootfs workspace reports its shared status, not the device-local column),
+            // and the database copy is written with exactly the same values.
+            val exportedWorkspaceCatalog = workspaces.map(::workspaceCatalogRecord).sorted()
             val sourceFingerprints = mutableMapOf<String, WorkspaceSourceFingerprint>()
             val payloads = workspaces.map { workspace ->
                 workspaceRepository.withWorkspaceArchiveLock(workspace.id) {
@@ -139,7 +198,7 @@ class WorkspaceArchiveService(
                     // directory aborts the fingerprint and TAR walks below. Repair it first so
                     // both fingerprints and the payloads see the same directory tree.
                     val repaired = repairProotRootfsPlaceholders(
-                        File(File(context.filesDir, "workspaces"), "${workspace.root}/linux")
+                        effectiveLinux(workspace.root)
                     )
                     if (repaired.isNotEmpty()) {
                         Log.i(TAG, "Repaired rootfs placeholders: ${repaired.joinToString(",")}")
@@ -158,16 +217,15 @@ class WorkspaceArchiveService(
             }
 
             val databaseSnapshot = if (includeDatabase) {
-                createDatabaseSnapshot(payloadDirectory, budget)
+                createDatabaseSnapshot(payloadDirectory, budget, exportedWorkspaceCatalog)
             } else {
                 null
             }
             val databaseFiles = listOfNotNull(databaseSnapshot?.source)
-            val expectedWorkspaceCatalog = workspaces.map(::workspaceCatalogRecord).sorted()
-            val databaseWorkspaceCatalog = databaseSnapshot?.workspaceCatalog
-                ?: expectedWorkspaceCatalog
+            val databaseWorkspaceCatalog = databaseSnapshot?.liveWorkspaceCatalog
+                ?: rawWorkspaceCatalog
             databaseSnapshot?.let { snapshot ->
-                require(snapshot.workspaceCatalog.sorted() == expectedWorkspaceCatalog) {
+                require(snapshot.exportedWorkspaceCatalog.sorted() == exportedWorkspaceCatalog) {
                     "Workspace catalog changed while creating database snapshot"
                 }
             }
@@ -312,7 +370,8 @@ class WorkspaceArchiveService(
         includeFiles: Boolean,
         password: CharArray? = null,
         allowLegacy: Boolean = false,
-    ): WorkspaceArchiveRestoreResult = withContext(Dispatchers.IO) {
+    ): WorkspaceArchiveRestoreResult = workspaceRepository.withEnvironmentArchiveLease {
+        withContext(Dispatchers.IO) {
         require(Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS) && file.canRead()) {
             "Backup file does not exist or is unreadable"
         }
@@ -402,6 +461,24 @@ class WorkspaceArchiveService(
                 deleteIfPresent(authenticatedZip)
             }
         }
+        }
+    }
+
+    private fun requireWorkspaceCatalogProjectionCompatible(
+        liveCatalog: List<WorkspaceCatalogRecord>,
+        exportedCatalog: List<WorkspaceCatalogRecord>,
+    ) {
+        val liveById = liveCatalog.associateBy { it.id }
+        val exportedById = exportedCatalog.associateBy { it.id }
+        require(liveById.keys == exportedById.keys) {
+            "Workspace catalog changed while projecting environment"
+        }
+        liveById.forEach { (id, live) ->
+            val exported = exportedById.getValue(id)
+            require(live.copy(shellStatus = exported.shellStatus, runtimeMetadata = exported.runtimeMetadata) == exported) {
+                "Workspace catalog projection changed non-environment fields: $id"
+            }
+        }
     }
 
     private fun createWorkspacePayloads(
@@ -435,7 +512,7 @@ class WorkspaceArchiveService(
                 budget.recordStagingBytes(bytes, context.cacheDir)
             },
         )
-        val linuxDir = File(workspaceDir, "linux")
+        val linuxDir = effectiveLinux(workspace.root)
         val linuxPayloadFile = File(payloadDirectory, "${workspace.root}-linux.tar")
         // An absent/disabled rootfs is represented by a validated empty TAR, so every manifest
         // still has an explicit files and linux length/hash pair.
@@ -445,6 +522,7 @@ class WorkspaceArchiveService(
         WorkspaceArchiveTar.create(
             sourceRoot = linuxDir,
             output = linuxPayloadFile,
+            directoryOverrides = homeOverrides(workspace.root),
             excludedPaths = setOf("tmp", "var/tmp"),
             limits = tarLimits,
             onEntry = budget::recordTarEntry,
@@ -487,6 +565,7 @@ class WorkspaceArchiveService(
     private fun createDatabaseSnapshot(
         payloadDirectory: File,
         budget: WorkspaceArchiveBudget,
+        exportedWorkspaceCatalog: List<WorkspaceCatalogRecord>,
     ): DatabaseSnapshot? {
         val source = context.getDatabasePath("rikka_hub")
         if (!Files.isRegularFile(source.toPath(), LinkOption.NOFOLLOW_LINKS)) return null
@@ -495,7 +574,7 @@ class WorkspaceArchiveService(
         var retryCause: Throwable? = null
         var completed = false
         var conversationReferences = emptyList<WorkspaceConversationReference>()
-        var workspaceCatalog = emptyList<WorkspaceCatalogRecord>()
+        var liveWorkspaceCatalog = emptyList<WorkspaceCatalogRecord>()
         repeat(MAX_DATABASE_SNAPSHOT_ATTEMPTS) {
             checkpointWal(writableDatabase)
             try {
@@ -509,11 +588,20 @@ class WorkspaceArchiveService(
                         "Active Room database user_version does not match current schema"
                     }
                     conversationReferences = readWorkspaceReferences(writableDatabase)
-                    workspaceCatalog = readWorkspaceCatalog(writableDatabase)
+                    // The raw catalog is read once, inside the exclusive transaction, so the
+                    // copy can be checked against the live rows even though the exported
+                    // projection rewrites status and metadata below.
+                    liveWorkspaceCatalog = readWorkspaceCatalog(writableDatabase)
+                    requireWorkspaceCatalogProjectionCompatible(
+                        liveCatalog = liveWorkspaceCatalog,
+                        exportedCatalog = exportedWorkspaceCatalog,
+                    )
                     copyStableDatabaseFile(source, destination, budget)
                     // Snapshot files live only on this device. Sanitize the isolated copy, never
-                    // the Room-owned source database, before it becomes a backup payload.
-                    removeWorkspaceSnapshotsFromDatabaseCopy(destination)
+                    // the Room-owned source database, before it becomes a backup payload. The
+                    // copy is also rewritten to the exported environment projection so a restored
+                    // database describes the environment it was exported from.
+                    removeWorkspaceSnapshotsFromDatabaseCopy(destination, exportedWorkspaceCatalog)
                     require(walIsEmpty(wal)) {
                         "Database WAL changed while creating the exclusive snapshot"
                     }
@@ -524,7 +612,7 @@ class WorkspaceArchiveService(
                     file = destination,
                     expectedVersion = AppDatabase.CURRENT_VERSION,
                     expectedReferences = WorkspaceArchiveReferences(conversations = conversationReferences),
-                    expectedWorkspaceCatalog = workspaceCatalog,
+                    expectedWorkspaceCatalog = exportedWorkspaceCatalog,
                     expectedSnapshotsEmpty = true,
                 )
                 completed = true
@@ -542,7 +630,8 @@ class WorkspaceArchiveService(
         return DatabaseSnapshot(
             source = ArchiveSource(destination, "database/rikka_hub.db"),
             conversationReferences = authoritativeArchiveConversationReferences(conversationReferences),
-            workspaceCatalog = workspaceCatalog,
+            liveWorkspaceCatalog = liveWorkspaceCatalog,
+            exportedWorkspaceCatalog = exportedWorkspaceCatalog,
             snapshotsExcluded = true,
         )
     }
@@ -627,8 +716,20 @@ class WorkspaceArchiveService(
      * never pass the live Room database path here: this function intentionally opens and mutates
      * only the isolated backup file.
      */
-    private fun removeWorkspaceSnapshotsFromDatabaseCopy(file: File) {
-        sanitizeWorkspaceDatabaseCopy(file)
+    private fun removeWorkspaceSnapshotsFromDatabaseCopy(
+        file: File,
+        exportedWorkspaceCatalog: List<WorkspaceCatalogRecord>,
+    ) {
+        sanitizeWorkspaceDatabaseCopy(
+            file = file,
+            workspaceProjection = exportedWorkspaceCatalog.map { record ->
+                WorkspaceRowProjection(
+                    id = record.id,
+                    shellStatus = record.shellStatus,
+                    runtimeMetadata = record.runtimeMetadata,
+                )
+            },
+        )
     }
 
     private fun checkpointStandaloneDatabase(database: SQLiteDatabase) {
@@ -681,7 +782,7 @@ class WorkspaceArchiveService(
         val workspaceDir = File(File(context.filesDir, "workspaces"), workspace.root)
         return WorkspaceSourceFingerprint(
             entries = fingerprintTree(File(workspaceDir, "files"), "files") +
-                fingerprintTree(File(workspaceDir, "linux"), "linux"),
+                fingerprintTree(effectiveLinux(workspace.root), "linux", homeOverrides(workspace.root)),
         )
     }
 
@@ -714,7 +815,7 @@ class WorkspaceArchiveService(
             require(filesDir.isDirectory && !Files.isSymbolicLink(filesDir.toPath())) {
                 "Workspace files directory changed while creating archive: ${workspace.id}"
             }
-            require(!Files.isSymbolicLink(File(workspaceDir, "linux").toPath())) {
+            require(!Files.isSymbolicLink(effectiveLinux(workspace.root).toPath())) {
                 "Workspace Linux directory changed while creating archive: ${workspace.id}"
             }
         }
@@ -776,7 +877,7 @@ class WorkspaceArchiveService(
         require(actualRoots == expectedDirectoryRoots) {
             "Workspace directory catalog changed while creating archive"
         }
-        val actualCatalog = workspaceRepository.getAll().map(::workspaceCatalogRecord).sorted()
+        val actualCatalog = database.workspaceDao().getAll().map(::workspaceCatalogRecord).sorted()
         require(actualCatalog == expectedDatabaseCatalog.sorted()) {
             "Workspace catalog changed while creating archive"
         }
@@ -836,12 +937,16 @@ class WorkspaceArchiveService(
         }
     }
 
-    private fun fingerprintTree(root: File, label: String): List<WorkspaceSourceFingerprintEntry> {
+    private fun fingerprintTree(root: File, label: String, overrides: Map<String, File> = emptyMap()): List<WorkspaceSourceFingerprintEntry> {
         val result = mutableListOf<WorkspaceSourceFingerprintEntry>()
-        fun visit(path: File, relative: String) {
+        fun visit(original: File, relative: String) {
+            val path = overrides[relative] ?: original
             val nioPath = path.toPath()
             if (!Files.exists(nioPath, LinkOption.NOFOLLOW_LINKS)) {
                 result += WorkspaceSourceFingerprintEntry(relativePath = relative, type = "missing")
+                if (relative.isEmpty()) {
+                    overrides.forEach { (name, replacement) -> visit(replacement, name) }
+                }
                 return
             }
             val attributes = Files.readAttributes(
@@ -878,6 +983,11 @@ class WorkspaceArchiveService(
             if (attributes.isDirectory) {
                 val children = ArrayList<File>()
                 Files.list(nioPath).use { stream -> stream.forEach { children.add(it.toFile()) } }
+                if (relative.isEmpty()) {
+                    overrides.forEach { (name, replacement) ->
+                        if (children.none { it.name == name }) children.add(File(path, name))
+                    }
+                }
                 children.sortBy { it.name }
                 children.forEach { child ->
                     val childRelative = if (relative.isEmpty()) child.name else "$relative/${child.name}"
@@ -1755,6 +1865,7 @@ class WorkspaceArchiveService(
             budget.checkStagingDirectory(staging)
 
             var linuxRoot: File? = null
+            var externalHome: File? = null
             val linuxPayload = manifestWorkspace.linux
             if (linuxPayload != null) {
                 val linuxPayloadFile = prepared.payloadFiles[linuxPayload.path]
@@ -1788,31 +1899,40 @@ class WorkspaceArchiveService(
                 val expected = manifestWorkspace.runtimeMetadata.detectedArchitecture
                     ?: manifestWorkspace.runtimeMetadata.expectedArchitecture
                     ?: prepared.manifest.createdAbi.firstOrNull()?.let(::canonicalAbi)
-                if (!abiCompatible) {
-                    warnings += "Workspace ${manifestWorkspace.name}: ABI mismatch; files restored, Linux skipped"
+                val skipReason = when {
+                    !abiCompatible ->
+                        "ABI mismatch"
+
+                    !extractedLinux.hasUsableFullRootfs() -> {
+                        if (manifestWorkspace.shellStatus == WorkspaceShellStatus.READY.name) {
+                            error("Workspace ${manifestWorkspace.name} Linux payload lacks required rootfs capabilities")
+                        }
+                        "Linux rootfs is unavailable"
+                    }
+
+                    !isRootfsArchitectureCompatible(expected, detected, supportedRootfsAbis()) ->
+                        "rootfs architecture mismatch"
+
+                    else -> null
+                }
+                if (skipReason != null) {
+                    externalHome = preserveWorkspaceHomeFromSkippedRootfs(
+                        workspaceStagingRoot = workspaceStagingRoot,
+                        workspaceRoot = workspaceRoot,
+                        root = manifestWorkspace.root,
+                        extractedLinux = extractedLinux,
+                    )
                     require(extractedLinux.deleteRecursively()) {
-                        "Unable to remove incompatible Linux rootfs staging: ${extractedLinux.path}"
+                        "Unable to remove skipped Linux rootfs staging: ${extractedLinux.path}"
                     }
-                } else if (!extractedLinux.hasUsableFullRootfs()) {
-                    if (manifestWorkspace.shellStatus == WorkspaceShellStatus.READY.name) {
-                        error("Workspace ${manifestWorkspace.name} Linux payload lacks required rootfs capabilities")
-                    }
-                    warnings += "Workspace ${manifestWorkspace.name}: Linux rootfs is unavailable; files restored"
-                    require(extractedLinux.deleteRecursively()) {
-                        "Unable to remove unavailable Linux rootfs staging: ${extractedLinux.path}"
-                    }
-                } else if (!isRootfsArchitectureCompatible(expected, detected, supportedRootfsAbis())) {
-                    warnings += "Workspace ${manifestWorkspace.name}: rootfs architecture mismatch; files restored, Linux skipped"
-                    require(extractedLinux.deleteRecursively()) {
-                        "Unable to remove mismatched Linux rootfs staging: ${extractedLinux.path}"
-                    }
+                    warnings += "Workspace ${manifestWorkspace.name}: $skipReason; files and HOME restored, Linux skipped"
                 } else {
                     linuxRoot = extractedLinux
                 }
             } else {
                 warnings += "Workspace ${manifestWorkspace.name}: Linux payload is absent; files restored"
             }
-            result += PreparedWorkspace(manifestWorkspace, workspaceRoot, linuxRoot)
+            result += PreparedWorkspace(manifestWorkspace, workspaceRoot, linuxRoot, externalHome)
         }
         return result
     }
@@ -1838,6 +1958,10 @@ class WorkspaceArchiveService(
             val expectedChildren = buildSet {
                 add("files")
                 if (candidate.linuxRoot != null) add("linux")
+                if (candidate.externalHome != null) {
+                    add("home")
+                    add("environment")
+                }
             }
             val actualChildren = workspaceRoot.listFiles().orEmpty().map { child ->
                 require(!Files.isSymbolicLink(child.toPath())) {
@@ -1851,9 +1975,14 @@ class WorkspaceArchiveService(
             require(File(workspaceRoot, "files").isDirectory) {
                 "Prepared workspace files directory is missing: ${candidate.manifest.id}"
             }
-            if (candidate.linuxRoot != null) {
-                require(File(workspaceRoot, "linux").isDirectory) {
-                    "Prepared workspace Linux directory is missing: ${candidate.manifest.id}"
+            if (candidate.externalHome != null) {
+                require(File(workspaceRoot, "home").isDirectory) {
+                    "Prepared workspace HOME directory is missing: ${candidate.manifest.id}"
+                }
+                val stagedEnvironments = WorkspaceEnvironmentStore(stagingRoot)
+                require(!stagedEnvironments.isShared(candidate.manifest.root) &&
+                    stagedEnvironments.hasExternalHome(candidate.manifest.root)) {
+                    "Prepared workspace HOME is not marked private: ${candidate.manifest.id}"
                 }
             }
         }
@@ -1931,6 +2060,19 @@ class WorkspaceArchiveService(
                 validateDatabasePayload(
                     file = stagedDatabase,
                     descriptor = prepared.manifest.databasePayloadFor("database/rikka_hub.db"),
+                )
+                sanitizeWorkspaceDatabaseCopy(
+                    file = stagedDatabase,
+                    workspaceProjection = preparedWorkspaces.map { candidate ->
+                        candidate.toEntity(json).let { entity ->
+                            WorkspaceRowProjection(
+                                id = entity.id,
+                                shellStatus = entity.shellStatus,
+                                runtimeMetadata = entity.runtimeMetadata,
+                            )
+                        }
+                    },
+                    removeSnapshots = false,
                 )
                 validateStagedDatabase(
                     file = stagedDatabase,
@@ -3423,7 +3565,8 @@ class WorkspaceArchiveService(
     private data class DatabaseSnapshot(
         val source: ArchiveSource,
         val conversationReferences: List<WorkspaceConversationReference>,
-        val workspaceCatalog: List<WorkspaceCatalogRecord>,
+        val liveWorkspaceCatalog: List<WorkspaceCatalogRecord>,
+        val exportedWorkspaceCatalog: List<WorkspaceCatalogRecord>,
         val snapshotsExcluded: Boolean,
     )
 
@@ -3486,6 +3629,7 @@ class WorkspaceArchiveService(
         val manifest: WorkspaceArchiveWorkspace,
         val stagingRoot: File,
         val linuxRoot: File?,
+        val externalHome: File?,
     )
 
     private data class MessageFtsSchemaObject(
@@ -3588,10 +3732,30 @@ class WorkspaceArchiveService(
 }
 
 /**
+ * Effective, environment-aware workspace values written into an isolated backup database copy.
+ * Only the columns that describe the runtime environment are projected; identity, timestamps and
+ * tool approvals always stay exactly as the device holds them.
+ */
+internal data class WorkspaceRowProjection(
+    val id: String,
+    val shellStatus: String,
+    val runtimeMetadata: String,
+)
+
+/**
  * Sanitize only an isolated backup database copy. This is intentionally package-visible so the
  * device regression test can prove that source rows remain intact while the copy is cleaned.
+ *
+ * [workspaceProjection] rewrites the copy's workspace rows to the exported projection. An empty
+ * projection (the plain sanitize-only call) leaves the workspace rows untouched. [removeSnapshots]
+ * is disabled while preparing a restore: that path only adjusts workspace availability after an
+ * incompatible Linux payload was skipped and must not remove other archived data.
  */
-internal fun sanitizeWorkspaceDatabaseCopy(file: File) {
+internal fun sanitizeWorkspaceDatabaseCopy(
+    file: File,
+    workspaceProjection: List<WorkspaceRowProjection> = emptyList(),
+    removeSnapshots: Boolean = true,
+) {
     require(Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS)) {
         "Database backup copy is not a regular file"
     }
@@ -3603,7 +3767,22 @@ internal fun sanitizeWorkspaceDatabaseCopy(file: File) {
     try {
         database.beginTransaction()
         try {
-            database.execSQL("DELETE FROM workspace_snapshots")
+            if (removeSnapshots) database.execSQL("DELETE FROM workspace_snapshots")
+            workspaceProjection.forEach { row ->
+                database.execSQL(
+                    "UPDATE workspaces SET shell_status = ?, runtime_metadata = ? WHERE id = ?",
+                    arrayOf(row.shellStatus, row.runtimeMetadata, row.id),
+                )
+                database.rawQuery(
+                    "SELECT COUNT(*) FROM workspaces WHERE id = ?",
+                    arrayOf(row.id),
+                ).use { cursor ->
+                    require(cursor.moveToFirst()) { "Database backup copy workspace count is unavailable" }
+                    require(cursor.getLong(0) == 1L) {
+                        "Database backup copy is missing workspace row: ${row.id}"
+                    }
+                }
+            }
             database.setTransactionSuccessful()
         } finally {
             database.endTransaction()

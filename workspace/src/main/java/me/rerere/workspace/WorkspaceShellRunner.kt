@@ -22,6 +22,20 @@ data class WorkspaceShellContext(
     val accessMode: WorkspaceShellAccessMode = WorkspaceShellAccessMode.FULL_ROOTFS,
     val bindMounts: List<WorkspaceBindMount> = emptyList(),
     val rootfsPatchOptions: RootfsPatchOptions = RootfsPatchOptions(),
+    /**
+     * Host directory bound as the guest HOME. Null keeps the legacy behavior where HOME is the
+     * rootfs's own `/root` (private rootfs) or `/workspace` (workspace-only mode).
+     */
+    val homeDir: File? = null,
+    /** Host directory bound as guest `/tmp`. Null keeps the rootfs's own `/tmp`. */
+    val guestTempDir: File? = null,
+    /** Host directory bound as guest `/var/tmp`. Null keeps the rootfs's own `/var/tmp`. */
+    val guestVarTempDir: File? = null,
+    /**
+     * Whether the runner may patch the rootfs before starting. Must be false for a shared rootfs,
+     * which belongs to every workspace and is never modified by an ordinary execution.
+     */
+    val patchRootfs: Boolean = true,
 )
 
 class HostShellRunner : WorkspaceShellRunner {
@@ -43,14 +57,24 @@ class HostShellRunner : WorkspaceShellRunner {
 // 单个流保留的最大字符数, 防止命令疯狂输出导致 OOM 或撑爆 LLM 上下文
 const val MAX_OUTPUT_CHARS = 128 * 1024
 
+class WorkspaceProcessTerminationException(cause: Throwable? = null) : IOException(
+    "The workspace process has not stopped; environment maintenance remains blocked until the app restarts.",
+    cause,
+)
+
 fun Process.readResult(timeoutMillis: Long, stdin: ByteArray? = null): WorkspaceCommandResult {
     val stdout = StreamCollector(inputStream)
     val stderr = StreamCollector(errorStream)
     val stdinWriter = stdin?.let { bytes -> StreamWriter(outputStream, bytes) }
     try {
         val finished = waitFor(timeoutMillis, TimeUnit.MILLISECONDS)
+        var terminated = true
         if (!finished) {
             destroyForcibly()
+            // destroyForcibly() only *requests* termination. Wait for the process to actually exit
+            // before returning, but never block the caller forever: if it is still alive after the
+            // bounded reap window, report it so the runtime worker keeps the workspace occupied.
+            terminated = awaitExit()
         }
         stdinWriter?.join(1_000)
         stdout.join(1_000)
@@ -61,10 +85,12 @@ fun Process.readResult(timeoutMillis: Long, stdin: ByteArray? = null): Workspace
             stderr = stderr.text(),
             timedOut = !finished,
             truncated = stdout.truncated || stderr.truncated,
+            terminationPending = !terminated,
         )
     } catch (e: InterruptedException) {
         // 调用方线程被中断（如协程取消时的 runInterruptible），杀掉进程避免命令继续执行
         destroyForcibly()
+        if (!awaitExit()) throw WorkspaceProcessTerminationException(e)
         // 进程被杀后 stdout/stderr 会关闭, 这里 join 回收两个采集线程, 避免每次取消泄漏一对线程
         stdinWriter?.join(1_000)
         stdout.join(1_000)
@@ -72,6 +98,30 @@ fun Process.readResult(timeoutMillis: Long, stdin: ByteArray? = null): Workspace
         throw e
     }
 }
+
+/**
+ * Blocks until a destroyed process is really gone, so its handles are released before the next
+ * caller reuses the same paths, but gives up after a bounded window instead of hanging the caller.
+ * Returns true when the process is confirmed gone, false when it is still alive. The interrupt flag
+ * is preserved: cancellation still propagates after the bounded wait.
+ */
+private fun Process.awaitExit(): Boolean {
+    if (!isAlive) return true
+    var interrupted: InterruptedException? = null
+    val deadline = System.nanoTime() + DESTROY_WAIT_TIMEOUT_MS * 1_000_000L
+    while (isAlive && System.nanoTime() < deadline) {
+        try {
+            waitFor(50, TimeUnit.MILLISECONDS)
+        } catch (e: InterruptedException) {
+            interrupted = e
+        }
+    }
+    val exited = !isAlive
+    if (interrupted != null) Thread.currentThread().interrupt()
+    return exited
+}
+
+private const val DESTROY_WAIT_TIMEOUT_MS = 5_000L
 
 private class StreamWriter(
     private val stream: java.io.OutputStream,

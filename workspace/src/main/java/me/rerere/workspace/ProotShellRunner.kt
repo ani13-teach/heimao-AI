@@ -67,7 +67,12 @@ class ProotShellRunner(
             ensureCommandDispatchers(context.tempDir)
         }
         if (usesFullRootfs) {
-            patcher.patch(context.linuxDir, context.rootfsPatchOptions)
+            ensureGuestDirectories(context)
+            // A shared rootfs belongs to every workspace, so an ordinary execution must never
+            // patch it; only a private rootfs is patched here.
+            if (context.patchRootfs) {
+                patcher.patch(context.linuxDir, context.rootfsPatchOptions)
+            }
         }
         val process = ProcessBuilder(buildCommand(context, proot))
             .directory(context.filesDir)
@@ -77,7 +82,10 @@ class ProotShellRunner(
                 environment()["PROOT_TMP_DIR"] = context.tempDir.absolutePath
                 environment()["TMPDIR"] = context.tempDir.absolutePath
                 if (context.accessMode == WorkspaceShellAccessMode.WORKSPACE_ONLY ||
-                    context.accessMode == WorkspaceShellAccessMode.WORKSPACE_PACKAGE
+                    context.accessMode == WorkspaceShellAccessMode.WORKSPACE_PACKAGE ||
+                    // A shared rootfs belongs to every workspace, so an ordinary execution must
+                    // not let PRoot write its link2symlink placeholders into the tree either.
+                    !context.patchRootfs
                 ) {
                     environment()["PROOT_DONT_POLLUTE_ROOTFS"] = "1"
                 } else {
@@ -226,7 +234,30 @@ class ProotShellRunner(
                 }
             }
         }
+
+        // Both full Linux modes (FULL_ROOTFS and WORKSPACE_PACKAGE) bind the workspace-local HOME
+        // and temp areas on top of the rootfs, so a shared rootfs keeps per-workspace state.
+        if (!workspaceOnly) {
+            context.homeDir?.let {
+                command += "-b"
+                command += "${it.absolutePath}:$GUEST_HOME_DIR"
+            }
+            context.guestTempDir?.let {
+                command += "-b"
+                command += "${it.absolutePath}:$GUEST_TMP_DIR"
+            }
+            context.guestVarTempDir?.let {
+                command += "-b"
+                command += "${it.absolutePath}:$GUEST_VAR_TMP_DIR"
+            }
+        }
         return command
+    }
+
+    private fun ensureGuestDirectories(context: WorkspaceShellContext) {
+        context.homeDir?.mkdirs()
+        context.guestTempDir?.mkdirs()
+        context.guestVarTempDir?.mkdirs()
     }
 
     private fun packageRootfsShellCommand(): List<String> = listOf(
@@ -415,5 +446,8 @@ class ProotShellRunner(
             "/dev/zero",
         )
         private val WORKSPACE_DIR = WorkspaceManager.ROOTFS_WORKSPACE_DIR
+        private const val GUEST_HOME_DIR = "/root"
+        private const val GUEST_TMP_DIR = "/tmp"
+        private const val GUEST_VAR_TMP_DIR = "/var/tmp"
     }
 }

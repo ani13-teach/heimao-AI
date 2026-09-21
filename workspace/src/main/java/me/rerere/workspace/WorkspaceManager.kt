@@ -15,6 +15,12 @@ class WorkspaceManager(
 ) {
     private val fileSystem = WorkspaceFileSystem(config)
 
+    /**
+     * Per-root Linux environment selection (private rootfs vs the shared rootfs). Callers may use
+     * this to inspect or switch environments; the manager itself only reads it.
+     */
+    val environments = WorkspaceEnvironmentStore(baseDir)
+
     // 按 target 长度降序, 保证 /a/b 优先于 /a 匹配
     private val sortedBindMounts = bindMounts.sortedByDescending { it.target.trimEnd('/').length }
 
@@ -24,7 +30,16 @@ class WorkspaceManager(
 
     fun ensureWorkspace(root: String): File {
         val dir = ensureWorkspaceFiles(root)
-        linuxDir(root).mkdirs()
+        if (environments.hasExternalHome(root)) {
+            // HOME and the guest temp areas are workspace-local for both the shared and the
+            // explicit-private environment; only the legacy no-marker layout keeps them in rootfs.
+            environments.homeDir(root).mkdirs()
+            environments.guestTempDir(root).mkdirs()
+            environments.guestVarTempDir(root).mkdirs()
+        }
+        if (!environments.isShared(root)) {
+            privateLinuxDir(root).mkdirs()
+        }
         return dir
     }
 
@@ -47,7 +62,19 @@ class WorkspaceManager(
 
     fun filesDir(root: String): File = File(workspaceDir(root), FILES_DIR)
 
-    fun linuxDir(root: String): File = File(workspaceDir(root), LINUX_DIR)
+    /** The rootfs actually used by [root]: the shared one when selected, otherwise its own. */
+    fun linuxDir(root: String): File =
+        if (environments.isShared(root)) environments.sharedLinuxDir()
+        else environments.privateLinuxDir(root)
+
+    /** The workspace's own rootfs, independent of the current environment selection. */
+    fun privateLinuxDir(root: String): File = environments.privateLinuxDir(root)
+
+    /**
+     * Guest HOME for [root]. When the shared rootfs is selected this is a workspace-local
+     * directory, so sharing one rootfs does not merge every workspace's `/root`.
+     */
+    fun homeDir(root: String): File = environments.homeDir(root)
 
     fun tempDir(root: String): File = File(workspaceDir(root), TEMP_DIR)
 
@@ -137,6 +164,12 @@ class WorkspaceManager(
             )
         }
 
+        // A workspace-local HOME is one physical tree for every workspace, so its per-user
+        // directories must resolve to the workspace-local copy instead of the rootfs ones.
+        if (environments.hasExternalHome(root)) {
+            externalHomeMapping(root, trimmed)?.let { return it }
+        }
+
         // 内核伪文件系统: 显式拒绝, 而不是回落到一个必然读不到的物理路径
         KERNEL_FS_MOUNTS.firstOrNull { trimmed == it || trimmed.startsWith("$it/") }?.let {
             error("$it is a kernel filesystem and cannot be read as a file, use workspace_shell instead")
@@ -197,41 +230,76 @@ class WorkspaceManager(
         accessMode: WorkspaceShellAccessMode = WorkspaceShellAccessMode.FULL_ROOTFS,
     ): WorkspaceCommandResult {
         require(command.isNotBlank()) { "Command is required" }
+        return shellRunner.execute(
+            createShellContext(root, command, cwd, timeoutMillis, stdin, accessMode)
+        )
+    }
+
+    /**
+     * Builds the exact context [executeCommand] would pass to the shell runner, so the interactive
+     * terminal can reuse it (same mounts, HOME, temp areas and patch decision) without executing a
+     * command. [command] may be blank for the terminal, which builds its own command line.
+     */
+    fun createShellContext(
+        root: String,
+        command: String,
+        cwd: String = "",
+        timeoutMillis: Long = DEFAULT_COMMAND_TIMEOUT_MS,
+        stdin: ByteArray? = null,
+        accessMode: WorkspaceShellAccessMode = WorkspaceShellAccessMode.FULL_ROOTFS,
+    ): WorkspaceShellContext {
         val workingDir = fileSystem.resolve(filesDir(root), cwd)
         require(workingDir.exists()) { "Working directory does not exist: $cwd" }
         require(workingDir.isDirectory) { "Working path is not a directory: $cwd" }
 
-        return shellRunner.execute(
-            WorkspaceShellContext(
-                root = root,
-                command = command,
-                cwd = cwd,
-                filesDir = filesDir(root),
-                linuxDir = linuxDir(root),
-                tempDir = tempDir(root),
-                workingDir = workingDir,
-                timeoutMillis = timeoutMillis,
-                stdin = stdin,
-                accessMode = accessMode,
-                bindMounts = if (accessMode == WorkspaceShellAccessMode.FULL_ROOTFS) {
-                    bindMounts
-                } else {
-                    emptyList()
-                },
-                rootfsPatchOptions = if (
-                    accessMode == WorkspaceShellAccessMode.FULL_ROOTFS ||
-                    accessMode == WorkspaceShellAccessMode.WORKSPACE_PACKAGE
-                ) {
-                    rootfsPatchOptionsProvider()
-                } else {
-                    RootfsPatchOptions()
-                },
-            )
+        val fullLinux = accessMode == WorkspaceShellAccessMode.FULL_ROOTFS ||
+            accessMode == WorkspaceShellAccessMode.WORKSPACE_PACKAGE
+        // Shared execution does not automatically patch the common rootfs. An external HOME is
+        // workspace-local. Switching back to private must keep that HOME while the private rootfs becomes patchable again, so
+        // the two decisions are deliberately separate.
+        val externalHome = fullLinux && environments.hasExternalHome(root)
+        return WorkspaceShellContext(
+            root = root,
+            command = command,
+            cwd = cwd,
+            filesDir = filesDir(root),
+            linuxDir = linuxDir(root),
+            tempDir = tempDir(root),
+            workingDir = workingDir,
+            timeoutMillis = timeoutMillis,
+            stdin = stdin,
+            accessMode = accessMode,
+            bindMounts = if (accessMode == WorkspaceShellAccessMode.FULL_ROOTFS) {
+                bindMounts
+            } else {
+                emptyList()
+            },
+            rootfsPatchOptions = if (fullLinux) {
+                rootfsPatchOptionsProvider()
+            } else {
+                RootfsPatchOptions()
+            },
+            homeDir = if (externalHome) environments.homeDir(root) else null,
+            guestTempDir = if (externalHome) environments.guestTempDir(root) else null,
+            guestVarTempDir = if (externalHome) environments.guestVarTempDir(root) else null,
+            patchRootfs = !environments.isShared(root),
         )
     }
 
+    private fun externalHomeMapping(root: String, path: String): RootfsLocation? {
+        fun under(prefix: String) = path == prefix || path.startsWith("$prefix/")
+        fun relative(prefix: String) = path.removePrefix(prefix).trimStart('/')
+        return when {
+            under(ROOTFS_HOME_DIR) -> RootfsLocation(environments.homeDir(root), relative(ROOTFS_HOME_DIR))
+            under(ROOTFS_TMP_DIR) -> RootfsLocation(environments.guestTempDir(root), relative(ROOTFS_TMP_DIR))
+            under(ROOTFS_VAR_TMP_DIR) ->
+                RootfsLocation(environments.guestVarTempDir(root), relative(ROOTFS_VAR_TMP_DIR))
+            else -> null
+        }
+    }
+
     private fun requireValidRoot(root: String) {
-        require(root.matches(ROOT_NAME_REGEX)) {
+        require(root != "." && root != ".." && root.matches(ROOT_NAME_REGEX)) {
             "Invalid workspace root name: $root"
         }
     }
@@ -246,23 +314,32 @@ class WorkspaceManager(
         for (dir in roots) {
             val root = dir.name
             if (!root.matches(ROOT_NAME_REGEX)) continue
-            // PRoot temp files
+            // PRoot temp files are always workspace-local, shared or not.
             tempDir(root).let { if (it.exists()) it.deleteRecursively() }
-            // Rootfs /tmp and /var/tmp
-            File(linuxDir(root), "tmp").let { if (it.exists()) it.deleteRecursively() }
-            File(linuxDir(root), "var/tmp").let { if (it.exists()) it.deleteRecursively() }
+            environments.guestTempDir(root).let { if (it.exists()) it.deleteRecursively() }
+            environments.guestVarTempDir(root).let { if (it.exists()) it.deleteRecursively() }
+            // Only a private rootfs owns its /tmp and /var/tmp. A shared rootfs (or a marker we
+            // cannot read) may be in use by other workspaces, so its temp areas are never deleted.
+            val environment = runCatching { environments.environmentOf(root) }.getOrNull()
+            if (environment != WorkspaceEnvironment.PRIVATE) continue
+            File(privateLinuxDir(root), "tmp").let { if (it.exists()) it.deleteRecursively() }
+            File(privateLinuxDir(root), "var/tmp").let { if (it.exists()) it.deleteRecursively() }
         }
     }
 
     companion object {
         private const val FILES_DIR = "files"
-        private const val LINUX_DIR = "linux"
         private const val TEMP_DIR = "tmp"
         const val DEFAULT_COMMAND_TIMEOUT_MS = 30_000L
         const val MAX_COMMAND_TIMEOUT_MS = 600_000L
 
         /** Rootfs 内工作区文件区的挂载点 */
         const val ROOTFS_WORKSPACE_DIR = "/workspace"
+
+        /** 共享 Rootfs 下由宿主映射的每工作区目录 */
+        private const val ROOTFS_HOME_DIR = "/root"
+        private const val ROOTFS_TMP_DIR = "/tmp"
+        private const val ROOTFS_VAR_TMP_DIR = "/var/tmp"
 
         /** 由宿主机透传的内核伪文件系统, 只能通过 shell 访问 */
         val KERNEL_FS_MOUNTS = listOf("/dev", "/proc", "/sys")

@@ -15,6 +15,7 @@ import me.rerere.rikkahub.data.db.entity.WorkspaceSnapshotStatus
 import me.rerere.rikkahub.data.files.FileFolders
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
 import me.rerere.rikkahub.utils.JsonInstant
+import me.rerere.workspace.WorkspaceEnvironmentStore
 import me.rerere.workspace.WorkspaceManager
 import me.rerere.workspace.WorkspaceShellStatus
 import me.rerere.workspace.detectRootfsArchitecture
@@ -162,6 +163,15 @@ class WorkspaceSnapshotService(
     private val snapshotDao: WorkspaceSnapshotDAO,
     private val limits: WorkspaceSnapshotLimits = WorkspaceSnapshotLimits(),
 ) {
+    private val environments by lazy {
+        WorkspaceEnvironmentStore(File(context.filesDir, "workspaces"))
+    }
+
+    private fun effectiveLinux(root: String): File =
+        if (environments.isShared(root)) environments.sharedLinuxDir() else environments.privateLinuxDir(root)
+
+    private fun homeOverrides(root: String): Map<String, File> =
+        if (environments.hasExternalHome(root)) mapOf("root" to environments.homeDir(root)) else emptyMap()
     fun listFlow(workspaceId: String): Flow<List<WorkspaceSnapshotEntity>> =
         snapshotDao.listReadyFlow(workspaceId)
 
@@ -328,7 +338,7 @@ class WorkspaceSnapshotService(
             val snapshotCount = snapshotDao.countReady(workspaceId)
             WorkspaceStorageStats(
                 filesBytes = safeDirectorySize(workspaceDirectory(workspace).resolve("files")),
-                linuxBytes = safeDirectorySize(workspaceDirectory(workspace).resolve("linux")),
+                linuxBytes = projectedDirectorySize(effectiveLinux(workspace.root), homeOverrides(workspace.root)),
                 snapshotsBytes = safeDirectorySize(snapshotDirectory()),
                 snapshotCount = snapshotCount,
                 maxSnapshotsPerWorkspace = limits.maxPerWorkspace,
@@ -339,8 +349,10 @@ class WorkspaceSnapshotService(
     private suspend fun <T> withSnapshotLocks(
         workspaceId: String,
         block: suspend () -> T,
-    ): T = workspaceRepository.withWorkspaceCatalogArchiveLock {
-        workspaceRepository.withWorkspaceArchiveLock(workspaceId, block)
+    ): T = workspaceRepository.withEnvironmentArchiveLease {
+        workspaceRepository.withWorkspaceCatalogArchiveLock {
+            workspaceRepository.withWorkspaceArchiveLock(workspaceId, block)
+        }
     }
 
     /** Caller holds both the catalog and workspace archive locks. */
@@ -353,7 +365,9 @@ class WorkspaceSnapshotService(
         val sourceDirectory = validateWorkspaceSource(workspace)
         // Snapshots walk the same rootfs the archive does, so heal a PRoot placeholder before
         // anything reads the tree (fingerprints, size estimate, TAR walk).
-        val repaired = repairProotRootfsPlaceholders(File(sourceDirectory, "linux"))
+        val linuxSource = effectiveLinux(workspace.root)
+        val overrides = homeOverrides(workspace.root)
+        val repaired = repairProotRootfsPlaceholders(linuxSource)
         if (repaired.isNotEmpty()) {
             Log.i(TAG, "Repaired rootfs placeholders: ${repaired.joinToString(",")}")
         }
@@ -362,7 +376,7 @@ class WorkspaceSnapshotService(
         val estimatedBytes = Math.addExact(
             Math.addExact(
                 safeDirectorySize(File(sourceDirectory, "files")),
-                safeDirectorySize(File(sourceDirectory, "linux")),
+                projectedDirectorySize(linuxSource, overrides),
             ),
             SNAPSHOT_OVERHEAD_BYTES,
         )
@@ -446,8 +460,9 @@ class WorkspaceSnapshotService(
             )
             val linuxTar = File(payloadDirectory, "linux.tar")
             val linuxSummary = WorkspaceArchiveTar.create(
-                sourceRoot = File(sourceDirectory, "linux"),
+                sourceRoot = linuxSource,
                 output = linuxTar,
+                directoryOverrides = overrides,
                 excludedPaths = setOf("tmp", "var/tmp"),
                 limits = tarLimits,
                 onEntry = budget::recordTarEntry,
@@ -1087,7 +1102,7 @@ class WorkspaceSnapshotService(
         require(File(root, "files").isDirectory && !Files.isSymbolicLink(File(root, "files").toPath())) {
             "Workspace files directory is missing: ${workspace.id}"
         }
-        require(!Files.isSymbolicLink(File(root, "linux").toPath())) {
+        require(!Files.isSymbolicLink(effectiveLinux(workspace.root).toPath())) {
             "Workspace Linux directory is a symbolic link: ${workspace.id}"
         }
         runCatching { WorkspaceShellStatus.valueOf(workspace.shellStatus) }
@@ -1203,15 +1218,19 @@ class WorkspaceSnapshotService(
     private fun fingerprintWorkspaceSource(root: File): WorkspaceSourceFingerprint =
         WorkspaceSourceFingerprint(
             entries = fingerprintTree(File(root, "files"), "files") +
-                fingerprintTree(File(root, "linux"), "linux"),
+                fingerprintTree(effectiveLinux(root.name), "linux", homeOverrides(root.name)),
         )
 
-    private fun fingerprintTree(root: File, label: String): List<WorkspaceSourceFingerprintEntry> {
+    private fun fingerprintTree(root: File, label: String, overrides: Map<String, File> = emptyMap()): List<WorkspaceSourceFingerprintEntry> {
         val result = mutableListOf<WorkspaceSourceFingerprintEntry>()
-        fun visit(path: File, relative: String) {
+        fun visit(original: File, relative: String) {
+            val path = overrides[relative] ?: original
             val nioPath = path.toPath()
             if (!Files.exists(nioPath, LinkOption.NOFOLLOW_LINKS)) {
                 result += WorkspaceSourceFingerprintEntry(relativePath = label + relative, type = "missing")
+                if (relative.isEmpty()) {
+                    overrides.forEach { (name, replacement) -> visit(replacement, name) }
+                }
                 return
             }
             val attributes = Files.readAttributes(
@@ -1246,6 +1265,14 @@ class WorkspaceSnapshotService(
             if (attributes.isDirectory) {
                 val children = ArrayList<File>()
                 Files.list(nioPath).use { stream -> stream.forEach { children += it.toFile() } }
+                if (relative.isEmpty()) {
+                    overrides.forEach { (name, replacement) ->
+                        if (children.none { it.name == name }) children += File(path, name)
+                    }
+                }
+                children.removeAll { relative.isEmpty() && it.name in overrides.keys }
+                children.sortBy { it.name }
+                if (relative.isEmpty()) children.addAll(overrides.keys.map { File(path, it) })
                 children.sortBy { it.name }
                 children.forEach { child ->
                     val childRelative = if (relative.isEmpty()) child.name else "$relative/${child.name}"
@@ -1255,6 +1282,26 @@ class WorkspaceSnapshotService(
         }
         visit(root, "")
         return result
+    }
+
+    private fun projectedDirectorySize(root: File, overrides: Map<String, File>): Long {
+        fun size(path: File, relative: String): Long {
+            val actual = overrides[relative] ?: path
+            if (!Files.exists(actual.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+                return if (relative.isEmpty()) {
+                    overrides.values.sumOf { replacement -> size(replacement, "") }
+                } else {
+                    0L
+                }
+            }
+            if (Files.isSymbolicLink(actual.toPath())) return 0L
+            if (Files.isRegularFile(actual.toPath(), LinkOption.NOFOLLOW_LINKS)) return actual.length()
+            require(Files.isDirectory(actual.toPath(), LinkOption.NOFOLLOW_LINKS))
+            return actual.listFiles().orEmpty().sumOf { child ->
+                size(child, if (relative.isEmpty()) child.name else "$relative/${child.name}")
+            }
+        }
+        return size(root, "")
     }
 
     private fun safeDirectorySize(root: File): Long {

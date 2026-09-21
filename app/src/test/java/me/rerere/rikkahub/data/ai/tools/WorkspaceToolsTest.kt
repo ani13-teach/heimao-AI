@@ -49,7 +49,9 @@ class WorkspaceToolsTest {
 
         assertEquals(setOf("command", "cwd", "timeout"), schema.keys)
         assertFalse(schema.containsKey("mode"))
-        assertTrue(workspaceShellDescription().contains("private Linux Rootfs"))
+        assertTrue(workspaceShellDescription().contains("selected Linux environment"))
+        assertTrue(workspaceShellDescription().contains("may be shared"))
+        assertTrue(workspaceShellDescription().contains("/workspace/.venv"))
         assertFalse(workspaceShellDescription().contains("sandbox"))
         assertFalse(workspaceShellDescription().contains("package mode"))
     }

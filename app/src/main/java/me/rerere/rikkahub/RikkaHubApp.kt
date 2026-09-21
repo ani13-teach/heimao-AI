@@ -104,6 +104,11 @@ class RikkaHubApp : Application() {
         // Init QuickJS native library
         QuickJSLoader.init()
 
+        // Both of these must observe the filesystem before any temp cleanup runs: a shared install
+        // keeps its journal in the environment, and a private install keeps the previous rootfs in
+        // the workspace temp area that cleanupAllTempDirs() deletes.
+        val workspaceRecoverySucceeded = recoverWorkspaceStateBeforeCleanup()
+
         // Restore closes Room and exits before it can remove large recovery/staging trees. The
         // next process owns that cleanup after the new Room graph has been created.
         cleanupPendingArchiveArtifacts()
@@ -118,10 +123,7 @@ class RikkaHubApp : Application() {
         pruneExpiredChatLogs()
 
         // cleanup workspace temp dirs (proot + rootfs /tmp)
-        cleanupWorkspaceTempDirs()
-
-        // check workspace integrity (mark workspaces with missing files as broken after backup restore)
-        checkWorkspaceIntegrity()
+        if (workspaceRecoverySucceeded) cleanupWorkspaceTempDirs()
 
         // sync upload files to DB
         syncManagedFiles()
@@ -166,15 +168,30 @@ class RikkaHubApp : Application() {
         }
     }
 
-    private fun checkWorkspaceIntegrity() {
-        get<AppScope>().launch(Dispatchers.IO) {
-            runCatching {
-                get<WorkspaceRepository>().checkIntegrity()
+    /**
+     * Settles a journaled shared-rootfs exchange and repairs private rootfs swaps.
+     *
+     * Synchronous, and before any temp cleanup: `cleanupAllTempDirs()` deletes the temp area a
+     * private install keeps its previous rootfs in, so an integrity pass that ran later would find
+     * nothing to recover and would then delete the only good copy.
+     *
+     * It stays a direct call rather than a launch, so the two also cannot race each other.
+     */
+    private fun recoverWorkspaceStateBeforeCleanup(): Boolean =
+        runBlocking(Dispatchers.IO) {
+            val repository = get<WorkspaceRepository>()
+            val shared = runCatching {
+                repository.recoverSharedEnvironmentTransaction()
+            }.onFailure {
+                Log.e(TAG, "recoverSharedEnvironmentTransaction failed", it)
+            }
+            val private = runCatching {
+                repository.checkIntegrity()
             }.onFailure {
                 Log.e(TAG, "checkWorkspaceIntegrity failed", it)
             }
+            shared.isSuccess && private.isSuccess
         }
-    }
 
     private fun deleteTempFiles() {
         get<AppScope>().launch(Dispatchers.IO) {

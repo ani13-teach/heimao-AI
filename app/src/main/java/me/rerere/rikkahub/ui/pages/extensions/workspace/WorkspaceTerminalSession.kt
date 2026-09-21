@@ -14,86 +14,73 @@ import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import com.termux.view.TerminalView
 import com.termux.view.TerminalViewClient
-import me.rerere.rikkahub.data.workspace.workspaceBindMounts
-import me.rerere.rikkahub.data.workspace.workspaceDirectory
-import me.rerere.rikkahub.data.workspace.workspaceDnsServers
 import me.rerere.workspace.ProotShellRunner
-import me.rerere.workspace.RootfsPatchOptions
-import me.rerere.workspace.RootfsPatcher
-import me.rerere.workspace.WorkspaceShellAccessMode
 import me.rerere.workspace.WorkspaceShellContext
 import me.rerere.workspace.hasUsableFullRootfs
 import java.io.File
 
+/**
+ * Builds the interactive terminal from the shell context the repository prepared.
+ *
+ * The context is the single source of truth for paths, mounts, HOME, temp areas and whether the
+ * rootfs may be patched: a private rootfs is patched by the runner, a shared rootfs never is.
+ * Nothing here derives a workspace path or runs a patch on its own.
+ */
 internal fun createWorkspaceTerminalSession(
     context: Context,
-    root: String,
+    shellContext: WorkspaceShellContext,
     client: TerminalSessionClient,
 ): TerminalSession {
     val appContext = context.applicationContext
-    val workspaceDir = appContext.workspaceDirectory(root)
-    val filesDir = File(workspaceDir, "files")
-    val linuxDir = File(workspaceDir, "linux")
-    val tempDir = File(workspaceDir, "tmp")
     val nativeLibraryDir = File(appContext.applicationInfo.nativeLibraryDir)
     val proot = File(nativeLibraryDir, "libproot_exec.so")
     val loader = File(nativeLibraryDir, "libproot_loader.so")
-    val shellContext = WorkspaceShellContext(
-        root = root,
-        command = "",
-        cwd = "",
-        filesDir = filesDir,
-        linuxDir = linuxDir,
-        tempDir = tempDir,
-        workingDir = filesDir,
-        timeoutMillis = 2_000,
-        accessMode = WorkspaceShellAccessMode.FULL_ROOTFS,
-        bindMounts = appContext.workspaceBindMounts(),
-        // The rootfs is patched during prepareWorkspaceTerminalSession on Dispatchers.IO;
-        // this command builder does not execute another patch.
-        rootfsPatchOptions = RootfsPatchOptions(),
-    )
+    val tempDir = shellContext.tempDir.apply { mkdirs() }
     // The shared builder returns a ProcessBuilder-style list including argv[0];
     // TerminalSession receives the executable separately.
     val args = ProotShellRunner(nativeLibraryDir)
         .buildFullRootfsInteractiveCommand(shellContext, proot)
         .drop(1)
 
-    val env = arrayOf(
-        "PROOT_LOADER=${loader.absolutePath}",
-        "PROOT_TMP_DIR=${tempDir.absolutePath}",
-        "TMPDIR=${tempDir.absolutePath}",
-    )
+    val env = buildList {
+        add("PROOT_LOADER=${loader.absolutePath}")
+        add("PROOT_TMP_DIR=${tempDir.absolutePath}")
+        add("TMPDIR=${tempDir.absolutePath}")
+        if (!shellContext.patchRootfs) {
+            // Same rule the non-interactive runner applies: never let a shared rootfs grow
+            // PRoot's link2symlink placeholders.
+            add("PROOT_DONT_POLLUTE_ROOTFS=1")
+        }
+    }
 
     return TerminalSession(
         proot.absolutePath,
-        filesDir.absolutePath,
+        shellContext.filesDir.absolutePath,
         args.toTypedArray(),
-        env,
-        2_000,
+        env.toTypedArray(),
+        TERMINAL_SCROLLBACK_ROWS,
         client,
     ).apply {
-        mSessionName = root
+        mSessionName = shellContext.root
     }
 }
 
-internal fun prepareWorkspaceTerminalSession(context: Context, root: String) {
-    val appContext = context.applicationContext
-    val workspaceDir = appContext.workspaceDirectory(root)
-    val linuxDir = File(workspaceDir, "linux")
-    File(workspaceDir, "files").mkdirs()
-    File(workspaceDir, "tmp").mkdirs()
-    appContext.workspaceBindMounts()
-    RootfsPatcher().patch(
-        linuxDir,
-        RootfsPatchOptions(nameservers = appContext.workspaceDnsServers())
-    )
-}
+internal fun TerminalSession.asTerminalLeaseProcess(): TerminalLeaseProcess =
+    object : TerminalLeaseProcess {
+        override val pid: Int
+            get() = this@asTerminalLeaseProcess.pid
 
-internal fun workspaceRootfsReady(context: Context, root: String): Boolean {
-    val linuxDir = File(context.applicationContext.workspaceDirectory(root), "linux")
-    return linuxDir.hasUsableFullRootfs()
-}
+        override fun finish() {
+            this@asTerminalLeaseProcess.finishIfRunning()
+        }
+    }
+
+/** True when the rootfs the prepared context points at is complete enough to start a shell. */
+internal fun workspaceContextReady(shellContext: WorkspaceShellContext): Boolean =
+    shellContext.linuxDir.hasUsableFullRootfs()
+
+/** Maximum scrollback rows retained by the terminal emulator. */
+private const val TERMINAL_SCROLLBACK_ROWS = 2_000
 
 internal class WorkspaceTerminalSessionClient(
     private val context: Context,
@@ -109,6 +96,8 @@ internal class WorkspaceTerminalSessionClient(
 
     override fun onSessionFinished(finishedSession: TerminalSession) {
         terminalView?.onScreenUpdated()
+        // Only this callback proves the proot process is gone. The lease must survive
+        // finishIfRunning() and is released here instead.
         onFinished()
     }
 

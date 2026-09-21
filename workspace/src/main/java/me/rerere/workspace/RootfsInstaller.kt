@@ -29,12 +29,14 @@ class RootfsInstaller(
         val normalizedExpectedSha256 = normalizeExpectedSha256(expectedSha256)
         manager.ensureWorkspaceFiles(root)
         recoverPendingSwap(root)
-        manager.linuxDir(root).mkdirs()
+        // Installs always target the workspace's own rootfs. A shared rootfs is installed through a
+        // dedicated manager and moved into place by the app, never by this per-workspace path.
+        manager.privateLinuxDir(root).mkdirs()
         val format = ArchiveFormat.fromUrl(url)
         val tempDir = manager.tempDir(root)
         val archive = File(tempDir, "rootfs.${format.extension}")
         val stagingDir = File(tempDir, "rootfs-staging")
-        val linuxDir = manager.linuxDir(root)
+        val linuxDir = manager.privateLinuxDir(root)
         val expectedArchitecture = RootfsRuntimeInspector.architectureFromSourceUrl(url)
 
         try {
@@ -111,7 +113,7 @@ class RootfsInstaller(
         val workspaceDir = manager.workspaceDir(root)
         if (!workspaceDir.isDirectory) return
         val tempDir = manager.tempDir(root)
-        val linuxDir = manager.linuxDir(root)
+        val linuxDir = manager.privateLinuxDir(root)
         val previousDir = File(tempDir, ROOTFS_BACKUP_DIR)
         if (!previousDir.exists()) return
 
@@ -181,7 +183,7 @@ class RootfsInstaller(
         require(previousDir.isDirectory) {
             "Rootfs rollback backup is not a directory: ${previousDir.path}"
         }
-        val linuxDir = manager.linuxDir(root)
+        val linuxDir = manager.privateLinuxDir(root)
         val quarantineDir = File(tempDir, ROOTFS_QUARANTINE_DIR)
         require(!quarantineDir.exists() || quarantineDir.deleteRecursively()) {
             "Failed to clear rootfs rollback quarantine: ${quarantineDir.path}"

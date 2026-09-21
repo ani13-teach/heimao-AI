@@ -77,4 +77,10 @@ data class WorkspaceCommandResult(
     val stderr: String,
     val timedOut: Boolean = false,
     val truncated: Boolean = false,
+    /**
+     * True when the process was killed but could not be confirmed gone within the reap window.
+     * The runtime worker must treat the workspace as still occupied (the OS may still hold files
+     * and leases) instead of handing it to the next task.
+     */
+    val terminationPending: Boolean = false,
 )

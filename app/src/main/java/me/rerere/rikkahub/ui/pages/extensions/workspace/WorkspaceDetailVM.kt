@@ -28,6 +28,12 @@ import me.rerere.workspace.WorkspaceFileEntry
 import me.rerere.workspace.WorkspaceCommandResult
 import me.rerere.workspace.WorkspaceStorageArea
 
+/** python / git 探测: 名称 -> 命令, 供公共环境管理卡片显示. */
+private val SHARED_TOOL_COMMANDS = listOf(
+    "python3" to "python3 --version",
+    "git" to "git --version",
+)
+
 class WorkspaceDetailVM(
     private val id: String,
     private val repository: WorkspaceRepository,
@@ -228,6 +234,106 @@ class WorkspaceDetailVM(
         _installError.value = null
     }
 
+    /**
+     * 公共 (shared) Linux 环境管理.
+     *
+     * 报告、占用、引用者都来自 repository, UI 不自行读取磁盘标记; 切换/恢复/工具探测同样只经 repository.
+     */
+    fun refreshSharedEnvironment() {
+        viewModelScope.launch {
+            _state.update { it.copy(sharedLoading = true) }
+            runCatching { repository.sharedEnvironmentInfo() }
+                .onSuccess { info ->
+                    val byId = runCatching { repository.getAll().associateBy { it.id } }
+                        .getOrDefault(emptyMap())
+                    val referencing = info.referencedWorkspaceIds.mapNotNull { byId[it] }
+                    _state.update {
+                        it.copy(
+                            sharedEnvironment = info.toUiState(id),
+                            referencingWorkspaces = referencing,
+                            sharedLoading = false,
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    _state.update {
+                        it.copy(
+                            sharedLoading = false,
+                            sharedError = redactWorkspaceText(error.message ?: "加载公共环境信息失败"),
+                        )
+                    }
+                }
+        }
+    }
+
+    fun switchToSharedEnvironment() =
+        runSharedEnvironmentAction("切换到公共环境失败") { repository.switchToShared(id) }
+
+    fun switchToPrivateEnvironment() =
+        runSharedEnvironmentAction("切换到私有环境失败") { repository.switchToPrivate(id) }
+
+    fun restoreSharedRecovery() =
+        runSharedEnvironmentAction("恢复公共环境失败") { repository.restoreSharedRecovery() }
+
+    /**
+     * 公共环境操作是全局的, 同一时刻只允许一个, 失败信息原样展示 (例如切回私有但私有 rootfs 不完整).
+     */
+    private fun runSharedEnvironmentAction(
+        fallbackMessage: String,
+        action: suspend () -> Boolean,
+    ) {
+        if (_state.value.sharedBusy) return
+        viewModelScope.launch {
+            _state.update { it.copy(sharedBusy = true, sharedError = null) }
+            runCatching { action() }
+                .onSuccess {
+                    _state.update { it.copy(sharedBusy = false) }
+                    loadWorkspace()
+                }
+                .onFailure { error ->
+                    _state.update {
+                        it.copy(
+                            sharedBusy = false,
+                            sharedError = redactWorkspaceText(error.message ?: fallbackMessage),
+                        )
+                    }
+                }
+        }
+    }
+
+    /** 通过工作区自身的 shell 探测 python / git, 结果直接展示在管理卡片里. */
+    fun checkSharedEnvironmentTools() {
+        if (_state.value.toolCheckRunning) return
+        viewModelScope.launch {
+            _state.update { it.copy(toolCheckRunning = true, toolChecks = emptyList()) }
+            val checks = SHARED_TOOL_COMMANDS.map { (name, command) ->
+                runCatching { repository.executeCommand(id, command) }
+                    .fold(
+                        onSuccess = { result ->
+                            val output = result.stdout.ifBlank { result.stderr }.trim()
+                            WorkspaceToolCheck(
+                                name = name,
+                                output = output.ifBlank { "exit=${result.exitCode}" },
+                                ok = result.exitCode == 0 && !result.timedOut,
+                            )
+                        },
+                        onFailure = { error ->
+                            WorkspaceToolCheck(
+                                name = name,
+                                output = redactWorkspaceText(error.message ?: "执行失败"),
+                                ok = false,
+                            )
+                        },
+                    )
+            }
+            _state.update { it.copy(toolCheckRunning = false, toolChecks = checks) }
+        }
+    }
+
+    fun dismissSharedError() {
+        _state.update { it.copy(sharedError = null) }
+    }
+
     fun createSnapshot() {
         viewModelScope.launch {
             _state.update { it.copy(snapshotBusy = true, snapshotError = null) }
@@ -359,6 +465,7 @@ class WorkspaceDetailVM(
             val workspace = repository.getById(id)
             _state.update { it.copy(workspace = workspace) }
             refreshStorageStats()
+            refreshSharedEnvironment()
         }
     }
 
@@ -383,6 +490,14 @@ data class WorkspaceDetailState(
     val entries: List<WorkspaceFileEntry> = emptyList(),
     val loading: Boolean = false,
     val error: String? = null,
+    // 公共 (shared) Linux 环境: 本工作区是否使用、占用空间、引用者、恢复点与工具探测结果.
+    val sharedEnvironment: SharedEnvironmentUiState = SharedEnvironmentUiState(),
+    val sharedLoading: Boolean = true,
+    val sharedBusy: Boolean = false,
+    val sharedError: String? = null,
+    val referencingWorkspaces: List<WorkspaceEntity> = emptyList(),
+    val toolChecks: List<WorkspaceToolCheck> = emptyList(),
+    val toolCheckRunning: Boolean = false,
 )
 
 data class WorkspaceTerminalState(

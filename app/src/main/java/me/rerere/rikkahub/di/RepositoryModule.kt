@@ -12,6 +12,8 @@ import me.rerere.rikkahub.data.repository.FilesRepository
 import me.rerere.rikkahub.data.repository.GenMediaRepository
 import me.rerere.rikkahub.data.repository.MemoryRepository
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.rikkahub.data.workspace.WorkspaceRuntimeCoordinator
+import me.rerere.rikkahub.data.workspace.RootfsPatchOptionsProvider
 import me.rerere.workspace.ProotShellRunner
 import me.rerere.workspace.RootfsInstaller
 import me.rerere.workspace.RootfsPatchOptions
@@ -44,8 +46,16 @@ val repositoryModule = module {
         FavoriteRepository(get())
     }
 
+    single<RootfsPatchOptionsProvider> {
+        val context: Context = get()
+        RootfsPatchOptionsProvider {
+            RootfsPatchOptions(nameservers = context.workspaceDnsServers())
+        }
+    }
+
     single {
         val context: Context = get()
+        val rootfsPatchOptionsProvider: RootfsPatchOptionsProvider = get()
         // 同一份挂载表既用于 PRoot 的 -b 参数, 也用于文件工具的路径解析, 避免两处漂移。
         val bindMounts = context.workspaceBindMounts()
         WorkspaceManager(
@@ -54,9 +64,7 @@ val repositoryModule = module {
                 nativeLibraryDir = File(context.applicationInfo.nativeLibraryDir),
             ),
             bindMounts = bindMounts,
-            rootfsPatchOptionsProvider = {
-                RootfsPatchOptions(nameservers = context.workspaceDnsServers())
-            },
+            rootfsPatchOptionsProvider = rootfsPatchOptionsProvider::invoke,
         )
     }
 
@@ -65,7 +73,11 @@ val repositoryModule = module {
     }
 
     single {
-        WorkspaceRepository(get(), get(), get(), get(), get(), get())
+        WorkspaceRuntimeCoordinator()
+    }
+
+    single {
+        WorkspaceRepository(get(), get(), get(), get(), get(), get(), get(), get())
     }
 
     single {
