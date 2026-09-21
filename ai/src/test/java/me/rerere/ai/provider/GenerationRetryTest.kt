@@ -2,8 +2,11 @@ package me.rerere.ai.provider
 
 import java.io.IOException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.ui.StreamChunk
@@ -97,6 +100,67 @@ class GenerationRetryTest {
         assertEquals(2, waiting.nextAttempt)
         assertEquals(1L, waiting.delayMillis)
         assertSame(RetryStatus.Recovered, statuses[1])
+    }
+
+    @Test
+    fun `clears the waiting notice when the attempts run out`() = runBlocking {
+        val statuses = mutableListOf<RetryStatus>()
+        val provider = ScriptedProvider(
+            streamScript = listOf(
+                failing { IOException("first") },
+                failing { IOException("second") },
+            )
+        )
+
+        runCatching {
+            provider.generateTextWithModelTransport(
+                providerSetting = ProviderSetting.OpenAI(),
+                messages = prompt,
+                params = streamingParams(),
+                retryPolicy = RetryPolicy(
+                    intervalMillis = 1,
+                    maxDurationMillis = 10_000,
+                    maxAttempts = 2,
+                ),
+                onRetryStatus = { statuses += it },
+            )
+        }
+
+        assertEquals(2, statuses.size)
+        assertTrue(statuses[0] is RetryStatus.Waiting)
+        assertSame(RetryStatus.Stopped, statuses[1])
+    }
+
+    @Test
+    fun `clears the waiting notice when the wait is cancelled`() = runBlocking {
+        val statuses = mutableListOf<RetryStatus>()
+        val waiting = CompletableDeferred<Unit>()
+        val provider = ScriptedProvider(
+            streamScript = listOf(
+                failing { IOException("boom") },
+                succeeding("too late"),
+            )
+        )
+
+        val job = launch {
+            provider.generateTextWithModelTransport(
+                providerSetting = ProviderSetting.OpenAI(),
+                messages = prompt,
+                params = streamingParams(),
+                retryPolicy = RetryPolicy(intervalMillis = 60_000, maxDurationMillis = 600_000),
+                onRetryStatus = {
+                    statuses += it
+                    if (it is RetryStatus.Waiting) waiting.complete(Unit)
+                },
+            )
+        }
+
+        waiting.await()
+        job.cancelAndJoin()
+
+        assertEquals(2, statuses.size)
+        assertSame(RetryStatus.Stopped, statuses[1])
+        assertEquals(1, provider.streamCalls)
     }
 
     @Test

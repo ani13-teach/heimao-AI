@@ -7,13 +7,11 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
-import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.security.GeneralSecurityException
-import java.security.SecureRandom
 import javax.crypto.AEADBadTagException
 import javax.crypto.BadPaddingException
 import javax.crypto.Cipher
@@ -40,6 +38,20 @@ data class WorkspaceArchiveInspection(
         get() = envelope == WorkspaceArchiveEnvelope.LEGACY
 }
 
+/**
+ * Only a plaintext archive that predates the portable manifest still needs the legacy warning.
+ * An encrypted envelope authenticates itself with its GCM tag, and a current plaintext archive
+ * (no magic, portable manifest present) is an ordinary backup produced by this same version.
+ */
+internal fun WorkspaceArchiveInspection.requiresLegacyConfirmation(
+    hasPortableManifest: Boolean,
+): Boolean = isLegacy && !hasPortableManifest
+
+/** Raised when the selected archive is an encrypted legacy one and no password was supplied. */
+class WorkspaceArchivePasswordRequiredException : IllegalStateException(
+    "This backup is an encrypted legacy archive and requires its password",
+)
+
 /** Raised when an old, unauthenticated ZIP needs an explicit user decision before restore. */
 class LegacyWorkspaceArchiveRequiresConfirmationException : IllegalStateException(
     "This backup is a legacy unencrypted archive and requires explicit confirmation before restore",
@@ -51,11 +63,14 @@ class WorkspaceArchiveAuthenticationException(
     cause: Throwable? = null,
 ) : IllegalArgumentException(message, cause)
 
-/** Versioned streaming AES-256-GCM envelope for the portable ZIP archive. */
+/**
+ * Read-only support for the AES-256-GCM envelope that older versions used to write. Nothing in
+ * this app produces that format any more: backups are plaintext ZIPs, and this code exists so that
+ * previously exported `.zip.enc` files can still be authenticated and restored.
+ */
 internal object WorkspaceArchiveEncryption {
     private const val VERSION = 1
     private const val ALGORITHM_ID = 1 // AES-256-GCM with PBKDF2-HMAC-SHA256
-    private const val PBKDF2_ITERATIONS = 120_000
     private const val KEY_BITS = 256
     private const val SALT_BYTES = 16
     private const val NONCE_BYTES = 12
@@ -78,9 +93,7 @@ internal object WorkspaceArchiveEncryption {
     )
 
     const val MIN_PASSWORD_LENGTH = 8
-    const val ENCRYPTED_FILE_SUFFIX = ".zip.enc"
 
-    private val random = SecureRandom()
     private const val PREFIX_BYTES = 8 + 1 + 1 + 4 + 1 + 1
 
     fun requirePassword(password: CharArray) {
@@ -114,63 +127,6 @@ internal object WorkspaceArchiveEncryption {
                 envelope = WorkspaceArchiveEnvelope.ENCRYPTED,
                 version = header.version,
             )
-        }
-    }
-
-    /** Encrypts [source] into [target]. The caller owns cleanup of [target] on failure. */
-    fun encrypt(
-        source: File,
-        target: File,
-        password: CharArray,
-        onOutputBytes: (Long) -> Unit = {},
-    ) {
-        requirePassword(password)
-        requireRegularFile(source)
-        prepareOutput(target)
-        val salt = ByteArray(SALT_BYTES)
-        val nonce = ByteArray(NONCE_BYTES)
-        random.nextBytes(salt)
-        random.nextBytes(nonce)
-        val header = createHeader(salt, nonce)
-        val keyBytes = deriveKey(password, salt, PBKDF2_ITERATIONS)
-        try {
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(
-                Cipher.ENCRYPT_MODE,
-                SecretKeySpec(keyBytes.copyOf(), "AES"),
-                GCMParameterSpec(TAG_BITS, nonce),
-            )
-            cipher.updateAAD(header)
-            FileOutputStream(target).use { rawOutput ->
-                BufferedOutputStream(rawOutput).use { output ->
-                    output.write(header)
-                    FileInputStream(source).use { rawInput ->
-                        val input = BufferedInputStream(rawInput)
-                        val buffer = ByteArray(BUFFER_SIZE)
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read < 0) break
-                            if (read == 0) continue
-                            val encrypted = cipher.update(buffer, 0, read)
-                            if (encrypted != null && encrypted.isNotEmpty()) {
-                                output.write(encrypted)
-                                onOutputBytes(encrypted.size.toLong())
-                            }
-                        }
-                    }
-                    val finalBytes = cipher.doFinal()
-                    if (finalBytes.isNotEmpty()) {
-                        output.write(finalBytes)
-                        onOutputBytes(finalBytes.size.toLong())
-                    }
-                    output.flush()
-                    rawOutput.fd.sync()
-                }
-            }
-        } finally {
-            keyBytes.fill(0)
-            salt.fill(0)
-            nonce.fill(0)
         }
     }
 
@@ -233,20 +189,6 @@ internal object WorkspaceArchiveEncryption {
                 deleteTargetAfterFailure(target)
             }
         }
-    }
-
-    private fun createHeader(salt: ByteArray, nonce: ByteArray): ByteArray {
-        val header = ByteBuffer.allocate(PREFIX_BYTES + salt.size + nonce.size)
-            .order(ByteOrder.BIG_ENDIAN)
-        header.put(MAGIC)
-        header.put(VERSION.toByte())
-        header.put(ALGORITHM_ID.toByte())
-        header.putInt(PBKDF2_ITERATIONS)
-        header.put(salt.size.toByte())
-        header.put(nonce.size.toByte())
-        header.put(salt)
-        header.put(nonce)
-        return header.array()
     }
 
     private fun readHeader(

@@ -161,9 +161,9 @@
   <string name="backup_page_local_backup_export">导出为文件</string>
   <string name="backup_page_local_backup_import">备份文件导入</string>
   <string name="backup_page_password">密码</string>
-  <string name="backup_page_encryption_password">备份加密口令</string>
-  <string name="backup_page_encryption_password_title">加密备份</string>
-  <string name="backup_page_encryption_password_desc">完整工作区归档使用 AES-256-GCM 加密。请妥善保存口令；口令不会写入归档。</string>
+  <string name="backup_page_encryption_password">备份口令</string>
+  <string name="backup_page_encryption_password_title">需要口令</string>
+  <string name="backup_page_encryption_password_desc">这个备份是旧版本加密生成的。请输入当时设置的口令。新版已经不再加密备份。</string>
   <string name="backup_page_encryption_password_min_length">至少 %1$d 个字符</string>
   <string name="backup_page_remember_encryption_password">为此传输方式安全记住口令</string>
   <string name="backup_page_password_show">显示</string>
@@ -171,7 +171,6 @@
   <string name="backup_page_legacy_title">旧版未加密备份</string>
   <string name="backup_page_legacy_desc">此备份没有认证加密，内容可能已被篡改。仅在信任来源时继续恢复。</string>
   <string name="backup_page_legacy_continue">恢复旧版备份</string>
-  <string name="backup_page_legacy_label">旧版：%1$s</string>
   <string name="backup_page_path">路径</string>
   <string name="backup_page_reminder">提醒</string>
   <string name="backup_page_reminder_dismiss">忽略</string>
@@ -229,6 +228,8 @@
   <string name="chat_log_level_errors">只记错误</string>
   <string name="chat_log_level_off">关</string>
   <string name="chat_log_level_title">记录什么</string>
+  <string name="chat_log_memory_action">动作</string>
+  <string name="chat_log_memory_record_id">记忆编号</string>
   <string name="chat_log_model">模型</string>
   <string name="chat_log_page_title">运行日志</string>
   <string name="chat_log_prompt_tokens">输入</string>
@@ -239,6 +240,7 @@
   <string name="chat_log_tool_name">工具</string>
   <string name="chat_log_total_tokens">合计</string>
   <string name="chat_log_type_crash">崩溃</string>
+  <string name="chat_log_type_memory_failure">记忆工具失败</string>
   <string name="chat_log_type_tool_failure">工具调用失败</string>
   <string name="chat_log_type_usage">请求 token</string>
   <string name="chat_log_upstream_code">上游报错码</string>
@@ -736,6 +738,13 @@
   <string name="setting_model_page_title_model_desc">用于总结对话标题的模型。未设置时使用快速模型</string>
   <string name="setting_model_page_translate_model">翻译模型</string>
   <string name="setting_model_page_translate_model_desc">用于翻译功能的模型</string>
+  <string name="setting_model_page_title_fallback">标题备用模型</string>
+  <string name="setting_model_page_translate_fallback">翻译备用模型</string>
+  <string name="setting_model_page_fallback_desc">主模型失败后按顺序尝试的模型，只能选同一供应商下的模型。每个模型各自按「自动重试」的设置尝试，次数上限不在模型之间共享。留空则不切换</string>
+  <string name="setting_model_page_fallback_empty">未设置</string>
+  <string name="setting_model_page_fallback_clear">清空</string>
+  <string name="setting_model_page_fallback_order">第 %1$d 个</string>
+  <string name="setting_model_page_fallback_no_candidate">这个供应商下没有其它可用作备用的对话模型</string>
   <string name="setting_model_page_translate_prompt_vars">变量: 原始文本: {source_text}, 目标语言: {target_lang}</string>
   <string name="setting_page_assistant">助手</string>
   <string name="setting_page_assistant_desc">设置个性化助手 (智能体)</string>

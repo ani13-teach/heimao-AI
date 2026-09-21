@@ -84,8 +84,8 @@ class BackupVM(
         webDavSync.testConnection(settings.value.webDavConfig)
     }
 
-    suspend fun backup(password: CharArray) {
-        webDavSync.backup(settings.value.webDavConfig, password)
+    suspend fun backup() {
+        webDavSync.backup(settings.value.webDavConfig)
         recordBackupTime()
     }
 
@@ -108,11 +108,10 @@ class BackupVM(
         webDavSync.deleteBackupFile(settings.value.webDavConfig, item)
     }
 
-    suspend fun exportToFile(password: CharArray): File {
+    suspend fun exportToFile(): File {
         val file = workspaceArchiveService.createBackupFile(
             includeDatabase = true,
             includeFiles = true,
-            password = password,
         )
         recordBackupTime()
         return file
@@ -221,8 +220,8 @@ class BackupVM(
         s3Sync.testS3(settings.value.s3Config)
     }
 
-    suspend fun backupToS3(password: CharArray) {
-        s3Sync.backupToS3(settings.value.s3Config, password)
+    suspend fun backupToS3() {
+        s3Sync.backupToS3(settings.value.s3Config)
         recordBackupTime()
     }
 

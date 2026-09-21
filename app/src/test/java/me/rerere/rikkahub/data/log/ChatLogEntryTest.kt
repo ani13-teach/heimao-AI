@@ -56,11 +56,20 @@ class ChatLogEntryTest {
             errorType = "NullPointerException",
             stackTrace = "stack",
         )
+        val memoryFailure = ChatLogEntry.MemoryFailure(
+            timestamp = 1_000L,
+            toolName = "memory_write",
+            action = "edit",
+            recordId = 12,
+            errorType = "IllegalArgumentException",
+            errorMessage = "anchor not found",
+        )
 
         assertFalse(ChatLogLevel.OFF.allows(usage(prompt = 1)))
         assertFalse(ChatLogLevel.OFF.allows(failure))
         assertFalse(ChatLogLevel.ERRORS_ONLY.allows(usage(prompt = 1)))
         assertTrue(ChatLogLevel.ERRORS_ONLY.allows(failure))
+        assertTrue(ChatLogLevel.ERRORS_ONLY.allows(memoryFailure))
         assertTrue(ChatLogLevel.ERRORS_ONLY.allows(crash))
         assertTrue(ChatLogLevel.ALL.allows(usage(prompt = 1)))
         assertTrue(ChatLogLevel.ALL.allows(failure))
@@ -76,6 +85,14 @@ class ChatLogEntryTest {
                 errorType = "McpException",
                 errorMessage = "tool exploded",
                 upstreamCode = "-32602",
+            ),
+            ChatLogEntry.MemoryFailure(
+                timestamp = 2_500L,
+                toolName = "memory_write",
+                action = "edit",
+                recordId = 7,
+                errorType = "IllegalArgumentException",
+                errorMessage = "edits[0].old_text was not found in the record",
             ),
             ChatLogEntry.Crash(
                 timestamp = 3_000L,

@@ -1,5 +1,6 @@
 package me.rerere.ai.provider.providers.claude
 
+import android.util.Log
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
@@ -19,8 +20,11 @@ import me.rerere.ai.ui.toMetadata
 import me.rerere.ai.util.json
 import me.rerere.ai.util.parseErrorDetail
 
+private const val TAG = "ClaudeStreamDecoder"
+
 internal class ClaudeStreamDecoder : StreamChunkDecoder {
     private val blocks = mutableMapOf<Int, ClaudeStreamBlock>()
+    private val missingStartIndexes = mutableSetOf<Int>()
     private var responseId: String? = null
     private var responseModel: String? = null
     private var finishReason: String? = null
@@ -108,9 +112,14 @@ internal class ClaudeStreamDecoder : StreamChunkDecoder {
             }
 
             if (event.event == "content_block_delta" && index != null) {
-                val block = blocks[index] ?: error("Unknown content block index: $index")
+                val block = blocks[index]
                 val delta = dataJson["delta"]?.jsonObject ?: JsonObject(emptyMap())
-                when (delta["type"]?.jsonPrimitive?.contentOrNull) {
+                if (block == null) {
+                    // 网关丢掉 content_block_start 后，流里会冒出从没开过头的块。
+                    // 这种内容在回复里的位置不可信（常见于后端把两轮响应拼成一条流），
+                    // 所以丢掉不渲染：既不能让整轮回复报错，也不能把它当正文显示出来。
+                    warnMissingStart(index)
+                } else when (delta["type"]?.jsonPrimitive?.contentOrNull) {
                     "text_delta" -> add(StreamChunk.TextDelta(
                         block.id,
                         delta["text"]?.jsonPrimitive?.contentOrNull ?: "",
@@ -139,8 +148,12 @@ internal class ClaudeStreamDecoder : StreamChunkDecoder {
             }
 
             if (event.event == "content_block_stop" && index != null) {
-                val block = blocks.remove(index) ?: error("Unknown content block index: $index")
-                endBlock(block)?.let(::add)
+                val block = blocks.remove(index)
+                if (block == null) {
+                    warnMissingStart(index)
+                } else {
+                    endBlock(block)?.let(::add)
+                }
             }
         }
 
@@ -161,6 +174,11 @@ internal class ClaudeStreamDecoder : StreamChunkDecoder {
             blocks.clear()
             add(StreamChunk.Finish(finishReason, responseId, responseModel))
         }
+    }
+
+    private fun warnMissingStart(index: Int) {
+        if (!missingStartIndexes.add(index)) return
+        Log.w(TAG, "accept: content block $index has no content_block_start in this stream")
     }
 
     private fun endBlock(block: ClaudeStreamBlock): StreamChunk? = when (block.kind) {

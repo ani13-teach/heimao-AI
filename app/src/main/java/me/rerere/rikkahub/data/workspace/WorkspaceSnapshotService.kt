@@ -351,6 +351,12 @@ class WorkspaceSnapshotService(
         val workspace = workspaceRepository.getById(workspaceId)
             ?: error("Workspace not found: $workspaceId")
         val sourceDirectory = validateWorkspaceSource(workspace)
+        // Snapshots walk the same rootfs the archive does, so heal a PRoot placeholder before
+        // anything reads the tree (fingerprints, size estimate, TAR walk).
+        val repaired = repairProotRootfsPlaceholders(File(sourceDirectory, "linux"))
+        if (repaired.isNotEmpty()) {
+            Log.i(TAG, "Repaired rootfs placeholders: ${repaired.joinToString(",")}")
+        }
         val currentCount = snapshotDao.countReady(workspaceId)
         val currentTotalBytes = snapshotDao.totalReadySize()
         val estimatedBytes = Math.addExact(

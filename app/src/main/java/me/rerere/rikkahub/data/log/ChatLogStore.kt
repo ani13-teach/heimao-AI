@@ -58,6 +58,25 @@ class ChatLogStore(
         )
     }
 
+    /** 记一次记忆工具调用失败。成功不记。 */
+    fun recordMemoryFailure(
+        toolName: String,
+        action: String?,
+        recordId: Int?,
+        error: Throwable,
+    ) {
+        record(
+            ChatLogEntry.MemoryFailure(
+                timestamp = System.currentTimeMillis(),
+                toolName = sanitizeLogText(toolName),
+                action = action?.let(::sanitizeLogText),
+                recordId = recordId,
+                errorType = error.javaClass.name,
+                errorMessage = sanitizeLogText(error.message ?: ""),
+            )
+        )
+    }
+
     suspend fun recent(limit: Int = MAX_ENTRIES): List<ChatLogEntry> = withContext(Dispatchers.IO) {
         ChatLogFile.read(context).sortedByDescending { it.timestamp }.take(limit)
     }

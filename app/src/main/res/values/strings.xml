@@ -163,9 +163,9 @@
   <string name="backup_page_local_backup_export">Export to File</string>
   <string name="backup_page_local_backup_import">Import from File</string>
   <string name="backup_page_password">Password</string>
-  <string name="backup_page_encryption_password">Backup encryption password</string>
-  <string name="backup_page_encryption_password_title">Encrypt backup</string>
-  <string name="backup_page_encryption_password_desc">The complete workspace archive is encrypted with AES-256-GCM. Keep this password; it is never stored in the archive.</string>
+  <string name="backup_page_encryption_password">Backup password</string>
+  <string name="backup_page_encryption_password_title">Password required</string>
+  <string name="backup_page_encryption_password_desc">This archive was encrypted by an older version of the app. Enter the password you used back then; backups are no longer encrypted.</string>
   <string name="backup_page_encryption_password_min_length">At least %1$d characters</string>
   <string name="backup_page_remember_encryption_password">Remember securely for this transport</string>
   <string name="backup_page_password_show">Show</string>
@@ -173,7 +173,6 @@
   <string name="backup_page_legacy_title">Legacy unencrypted backup</string>
   <string name="backup_page_legacy_desc">This backup has no authenticated encryption and may have been modified. Continue only if you trust its source.</string>
   <string name="backup_page_legacy_continue">Restore legacy backup</string>
-  <string name="backup_page_legacy_label">Legacy: %1$s</string>
   <string name="backup_page_path">Path</string>
   <string name="backup_page_reminder">Reminder</string>
   <string name="backup_page_reminder_dismiss">Dismiss</string>
@@ -231,6 +230,8 @@
   <string name="chat_log_level_errors">Errors only</string>
   <string name="chat_log_level_off">Off</string>
   <string name="chat_log_level_title">What to record</string>
+  <string name="chat_log_memory_action">Action</string>
+  <string name="chat_log_memory_record_id">Record id</string>
   <string name="chat_log_model">Model</string>
   <string name="chat_log_page_title">Runtime Log</string>
   <string name="chat_log_prompt_tokens">Input</string>
@@ -241,6 +242,7 @@
   <string name="chat_log_tool_name">Tool</string>
   <string name="chat_log_total_tokens">Total</string>
   <string name="chat_log_type_crash">Crash</string>
+  <string name="chat_log_type_memory_failure">Memory failure</string>
   <string name="chat_log_type_tool_failure">Tool failure</string>
   <string name="chat_log_type_usage">Request tokens</string>
   <string name="chat_log_upstream_code">Upstream code</string>
@@ -748,6 +750,13 @@
   <string name="setting_model_page_title_model_desc">Model used to summarize conversation titles. If not set, uses the fast model</string>
   <string name="setting_model_page_translate_model">Translation Model</string>
   <string name="setting_model_page_translate_model_desc">The model used for translation features</string>
+  <string name="setting_model_page_title_fallback">Title fallback models</string>
+  <string name="setting_model_page_translate_fallback">Translation fallback models</string>
+  <string name="setting_model_page_fallback_desc">Models tried in order after the main model fails. Only models from the same provider are listed. Each one gets its own full auto-retry budget. Leave empty to turn switching off.</string>
+  <string name="setting_model_page_fallback_empty">Not set</string>
+  <string name="setting_model_page_fallback_clear">Clear</string>
+  <string name="setting_model_page_fallback_order">Try #%1$d</string>
+  <string name="setting_model_page_fallback_no_candidate">This provider has no other chat model to fall back to.</string>
   <string name="setting_model_page_translate_prompt_vars">Variables: Source text: {source_text}, Target language: {target_lang}</string>
   <string name="setting_page_assistant">Assistant</string>
   <string name="setting_page_assistant_desc">Set up personalized assistants (agents)</string>

@@ -29,8 +29,8 @@ class WebDavSync(
         Log.i(TAG, "testConnection: Connection successful")
     }
 
-    suspend fun backup(config: WebDavConfig, password: CharArray) = withContext(Dispatchers.IO) {
-        val file = prepareBackupFile(config, password)
+    suspend fun backup(config: WebDavConfig) = withContext(Dispatchers.IO) {
+        val file = prepareBackupFile(config)
         var failure: Throwable? = null
         try {
             val client = getClient(config)
@@ -108,12 +108,10 @@ class WebDavSync(
 
     suspend fun prepareBackupFile(
         config: WebDavConfig,
-        password: CharArray,
     ): File = withContext(Dispatchers.IO) {
         archiveService.createBackupFile(
             includeDatabase = WebDavConfig.BackupItem.DATABASE in config.items,
             includeFiles = WebDavConfig.BackupItem.FILES in config.items,
-            password = password,
         )
     }
 

@@ -1,6 +1,8 @@
 package me.rerere.rikkahub.data.ai.tools
 
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
@@ -14,6 +16,29 @@ import me.rerere.ai.core.InputSchema
 import me.rerere.ai.core.Tool
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.model.AssistantMemory
+
+/** 内置记忆工具名。日志用它把记忆失败和普通工具失败分开记。 */
+internal val MEMORY_TOOL_NAMES: Set<String> = setOf(
+    "memory_tool",
+    "memory_read",
+    "memory_write",
+    "memory_consolidate",
+)
+
+/** 记忆工具入参里跟日志有关的部分：动作和记录 id。 */
+internal data class MemoryToolCallTarget(
+    val action: String?,
+    val recordId: Int?,
+)
+
+/** 从记忆工具入参取动作和记录 id，参数不是对象或字段缺失时对应值为 null。 */
+internal fun parseMemoryToolCallTarget(input: JsonElement): MemoryToolCallTarget {
+    val params = input as? JsonObject ?: return MemoryToolCallTarget(action = null, recordId = null)
+    return MemoryToolCallTarget(
+        action = (params["action"] as? JsonPrimitive)?.contentOrNull,
+        recordId = (params["id"] as? JsonPrimitive)?.intOrNull,
+    )
+}
 
 fun buildMemoryTools(
     json: Json,

@@ -31,6 +31,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.workspace.LegacyWorkspaceArchiveRequiresConfirmationException
+import me.rerere.rikkahub.data.workspace.WorkspaceArchivePasswordRequiredException
 import me.rerere.rikkahub.ui.pages.backup.components.BackupPasswordDialog
 import me.rerere.rikkahub.ui.pages.backup.components.LegacyBackupConfirmationDialog
 import me.rerere.rikkahub.ui.components.ui.CardGroup
@@ -51,23 +52,18 @@ fun ImportExportTab(vm: BackupVM) {
     var isExporting by remember { mutableStateOf(false) }
     var isRestoring by remember { mutableStateOf(false) }
     var importType by remember { mutableStateOf("local") }
-    var passwordAction by remember { mutableStateOf<String?>(null) }
-    var passwordActionUri by remember { mutableStateOf<Uri?>(null) }
     var pendingLegacyRestore by remember { mutableStateOf<PendingLocalLegacyRestore?>(null) }
     var showLegacyConfirmation by remember { mutableStateOf(false) }
+    // Only a legacy encrypted backup needs a password, so the dialog is raised on demand instead
+    // of gating every restore.
+    var passwordRequiredUri by remember { mutableStateOf<Uri?>(null) }
 
-    fun requestPassword(action: String, uri: Uri) {
-        passwordAction = action
-        passwordActionUri = uri
-    }
-
-    fun startExport(targetUri: Uri, passwordText: String) {
+    fun startExport(targetUri: Uri) {
         scope.launch {
             isExporting = true
-            val password = passwordText.toCharArray()
             var exportFile: File? = null
             try {
-                val generatedFile = vm.exportToFile(password)
+                val generatedFile = vm.exportToFile()
                 exportFile = generatedFile
                 withContext(Dispatchers.IO) {
                     context.contentResolver.openOutputStream(targetUri)?.use { outputStream ->
@@ -90,16 +86,16 @@ fun ImportExportTab(vm: BackupVM) {
                 withContext(NonCancellable + Dispatchers.IO) {
                     exportFile?.let(::cleanupTemporaryFile)
                 }
-                password.fill('\u0000')
                 isExporting = false
             }
         }
     }
 
-    fun startLocalRestore(sourceUri: Uri, password: CharArray, allowLegacy: Boolean) {
+    fun startLocalRestore(sourceUri: Uri, password: CharArray?, allowLegacy: Boolean) {
         scope.launch {
             isRestoring = true
             var waitingForLegacyConfirmation = false
+            var waitingForPassword = false
             val tempFile = File(context.cacheDir, "temp_restore_${System.currentTimeMillis()}.zip")
             val partialFile = File(tempFile.path + ".partial")
             try {
@@ -119,6 +115,9 @@ fun ImportExportTab(vm: BackupVM) {
                     context.getString(R.string.backup_page_restore_success),
                     type = ToastType.Success,
                 )
+            } catch (passwordRequired: WorkspaceArchivePasswordRequiredException) {
+                waitingForPassword = true
+                passwordRequiredUri = sourceUri
             } catch (legacy: LegacyWorkspaceArchiveRequiresConfirmationException) {
                 if (allowLegacy) throw legacy
                 waitingForLegacyConfirmation = true
@@ -135,18 +134,18 @@ fun ImportExportTab(vm: BackupVM) {
                     cleanupTemporaryFile(partialFile)
                     cleanupTemporaryFile(tempFile)
                 }
-                if (!waitingForLegacyConfirmation) password.fill('\u0000')
+                if (!waitingForLegacyConfirmation && !waitingForPassword) password?.fill('\u0000')
                 isRestoring = false
             }
         }
     }
 
-    // The document picker returns before any archive bytes are created/read. A password is
-    // collected first, so cancellation never leaves an archive plaintext temp behind.
+    // The document picker returns before any archive bytes are created/read, so a cancelled pick
+    // never starts a backup.
     val createDocumentLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/octet-stream")
     ) { uri ->
-        uri?.let { requestPassword("export", it) }
+        uri?.let(::startExport)
     }
 
     val openDocumentLauncher = rememberLauncherForActivityResult(
@@ -154,7 +153,7 @@ fun ImportExportTab(vm: BackupVM) {
     ) { uri ->
         uri?.let { sourceUri ->
             if (importType == "local") {
-                requestPassword("restore", sourceUri)
+                startLocalRestore(sourceUri, password = null, allowLegacy = false)
             } else {
                 scope.launch {
                     isRestoring = true
@@ -196,22 +195,14 @@ fun ImportExportTab(vm: BackupVM) {
         }
     }
 
-    passwordAction?.let { action ->
+    passwordRequiredUri?.let { uri ->
         BackupPasswordDialog(
             onDismiss = {
-                passwordAction = null
-                passwordActionUri = null
+                passwordRequiredUri = null
             },
             onConfirm = { password, _ ->
-                val uri = passwordActionUri
-                passwordAction = null
-                passwordActionUri = null
-                if (uri == null) return@BackupPasswordDialog
-                if (action == "export") {
-                    startExport(uri, password)
-                } else {
-                    startLocalRestore(uri, password.toCharArray(), allowLegacy = false)
-                }
+                passwordRequiredUri = null
+                startLocalRestore(uri, password.toCharArray(), allowLegacy = false)
             },
         )
     }
@@ -250,7 +241,7 @@ fun ImportExportTab(vm: BackupVM) {
                         {
                             val timestamp = LocalDateTime.now()
                                 .format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
-                            createDocumentLauncher.launch("黑猫ai_backup_$timestamp.zip.enc")
+                            createDocumentLauncher.launch("黑猫ai_backup_$timestamp.zip")
                         }
                     } else null,
                     headlineContent = { Text(stringResource(R.string.backup_page_local_backup_export)) },
@@ -350,7 +341,7 @@ fun ImportExportTab(vm: BackupVM) {
 
 private data class PendingLocalLegacyRestore(
     val uri: Uri,
-    val password: CharArray,
+    val password: CharArray?,
 )
 
 private fun cleanupTemporaryFile(file: File) {

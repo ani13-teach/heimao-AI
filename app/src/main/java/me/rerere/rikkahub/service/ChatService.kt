@@ -38,9 +38,11 @@ import me.rerere.ai.core.Tool
 import me.rerere.ai.provider.BuiltInTools
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
+import me.rerere.ai.provider.ModelType
 import me.rerere.ai.provider.ProviderManager
 import me.rerere.ai.provider.TextGenerationParams
 import me.rerere.ai.provider.generateTextWithModelTransport
+import me.rerere.ai.registry.ModelRegistry
 import me.rerere.ai.ui.ToolApprovalState
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
@@ -53,7 +55,10 @@ import me.rerere.rikkahub.AppScope
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.ai.GenerationChunk
 import me.rerere.rikkahub.data.ai.GenerationHandler
+import me.rerere.rikkahub.data.ai.fallbackCandidates
 import me.rerere.rikkahub.data.ai.mcp.McpManager
+import me.rerere.rikkahub.data.ai.runWithModelFallback
+import me.rerere.rikkahub.data.ai.toRetryPolicy
 import me.rerere.rikkahub.data.ai.tools.createConversationTools
 import me.rerere.rikkahub.data.ai.tools.local.LocalTools
 import me.rerere.rikkahub.data.ai.tools.createSearchTools
@@ -1277,30 +1282,50 @@ class ChatService(
             val settings = settingsStore.settingsFlow.first()
             val model = settings.findModelById(settings.titleModelId, fallback = settings.fastModelId)
                 ?: return@runCatching
-            val provider = model.findProvider(settings.providers) ?: return@runCatching
-
-            val providerHandler = providerManager.getProviderByType(provider)
-            val resultMessages = providerHandler.generateTextWithModelTransport(
-                providerSetting = provider,
-                messages = listOf(
-                    UIMessage.user(
-                        prompt = settings.titlePrompt.applyPlaceholders(
-                            "locale" to Locale.getDefault().displayName,
-                            "content" to conversation.currentMessages
-                                .takeLast(4).joinToString("\n\n") { it.summaryAsText(maxLength = 500) })
-                    ),
-                ),
-                params = backgroundTextGenerationParams(model),
+            val candidates = fallbackCandidates(
+                providers = settings.providers,
+                primaryModel = model,
+                fallbackModelIds = settings.titleFallbackModelIds,
+                // 标题要的是短正文，翻译专模（Qwen MT）不算能用
+                accept = { it.type == ModelType.CHAT && !ModelRegistry.QWEN_MT.match(it.modelId) },
             )
+            val retryPolicy = settings.toRetryPolicy()
+            val prompt = settings.titlePrompt.applyPlaceholders(
+                "locale" to Locale.getDefault().displayName,
+                "content" to conversation.currentMessages
+                    .takeLast(4).joinToString("\n\n") { it.summaryAsText(maxLength = 500) }
+            )
+
+            val title = runWithModelFallback(
+                candidates = candidates,
+                onCandidateFailed = { failed, error ->
+                    Logging.log(TAG, "generateTitle: ${failed.modelId} failed: ${error.message}")
+                },
+            ) { candidate ->
+                val provider = candidate.findProvider(settings.providers)
+                    ?: return@runWithModelFallback null
+                val providerHandler = providerManager.getProviderByType(provider)
+                val resultMessages = providerHandler.generateTextWithModelTransport(
+                    providerSetting = provider,
+                    messages = listOf(UIMessage.user(prompt = prompt)),
+                    params = backgroundTextGenerationParams(candidate),
+                    // 以空助手消息为基准：空回复时最后一条就是它，不会被当成正文
+                    responseMessages = listOf(UIMessage.assistant("")),
+                    retryPolicy = retryPolicy,
+                )
+                resultMessages.lastOrNull()?.toText()?.trim()?.takeIf { it.isNotBlank() }
+            }
 
             // 生成完，conversation可能不是最新了，因此需要重新获取
             conversationRepo.getConversationById(conversation.id)?.let {
                 saveConversation(
                     conversationId,
-                    it.copy(title = resultMessages.last().toText().trim())
+                    it.copy(title = title)
                 )
             }
         }.onFailure {
+            // 取消不是生成失败：不记错误卡片，让取消照常向上传播
+            if (it is CancellationException) throw it
             it.printStackTrace()
             addError(
                 error = it,
@@ -1688,6 +1713,8 @@ class ChatService(
             } catch (e: Exception) {
                 // Clear translation field on error
                 clearTranslationField(conversationId, message.id)
+                // 用户取消只是停掉本次翻译，不当成翻译失败上报
+                if (e is CancellationException) throw e
                 addError(e, conversationId, title = context.getString(R.string.error_title_translate_message))
             }
         }

@@ -78,6 +78,9 @@ sealed interface RetryStatus {
 
     /** 重试已经恢复，可以清除等待提示。 */
     data object Recovered : RetryStatus
+
+    /** 不再等待（重试用尽或请求被取消），可以清除等待提示。 */
+    data object Stopped : RetryStatus
 }
 
 /**
@@ -157,43 +160,56 @@ private suspend fun withRetries(
     val startedAt = TimeSource.Monotonic.markNow()
     var attemptIndex = 1
 
-    while (true) {
-        var produced: List<UIMessage>? = null
-        var failure: Throwable? = null
-        try {
-            produced = attempt()
-        } catch (error: Throwable) {
-            if (error is CancellationException) throw error
-            failure = error
-        }
+    // 等待提示发出去就必须收回：成功走 Recovered，失败和取消走 finally 里的 Stopped。
+    // 漏收一次，调用方就会一直挂着那条提示，下一次生成时又把它当当前状态显示出来。
+    var waitingNoticeOutstanding = false
 
-        val result = produced
-        if (result != null && result.hasGeneratedContentSince(responseMessages)) {
-            if (attemptIndex > 1) {
-                onRetryStatus?.invoke(RetryStatus.Recovered)
+    try {
+        while (true) {
+            var produced: List<UIMessage>? = null
+            var failure: Throwable? = null
+            try {
+                produced = attempt()
+            } catch (error: Throwable) {
+                if (error is CancellationException) throw error
+                failure = error
             }
-            return result
-        }
 
-        // 失败的尝试没有异常可用时，用一个空回复异常走同一套重试判断
-        val cause = failure ?: IOException("empty response")
-        val delayMillis = policy?.delayBeforeRetry(
-            failedAttempt = attemptIndex,
-            elapsedMillis = startedAt.elapsedNow().inWholeMilliseconds,
-            error = cause,
-        )
-        if (delayMillis == null) {
-            failure?.let { throw it }
-            // 空回复且不再重试：保持加入重试之前的行为，返回拿到的空结果
-            println("[generateText] empty response and no retry left")
-            return result ?: responseMessages
-        }
+            val result = produced
+            if (result != null && result.hasGeneratedContentSince(responseMessages)) {
+                if (attemptIndex > 1) {
+                    waitingNoticeOutstanding = false
+                    onRetryStatus?.invoke(RetryStatus.Recovered)
+                }
+                return result
+            }
 
-        onDiscardAttempt()
-        onRetryStatus?.invoke(RetryStatus.Waiting(attemptIndex + 1, delayMillis, cause))
-        println("[generateText] retry #${attemptIndex + 1} in ${delayMillis}ms (${cause.message})")
-        delay(delayMillis)
-        attemptIndex++
+            // 失败的尝试没有异常可用时，用一个空回复异常走同一套重试判断
+            val cause = failure ?: IOException("empty response")
+            val delayMillis = policy?.delayBeforeRetry(
+                failedAttempt = attemptIndex,
+                elapsedMillis = startedAt.elapsedNow().inWholeMilliseconds,
+                error = cause,
+            )
+            if (delayMillis == null) {
+                failure?.let { throw it }
+                // 空回复且不再重试：保持加入重试之前的行为，返回拿到的空结果
+                println("[generateText] empty response and no retry left")
+                return result ?: responseMessages
+            }
+
+            onDiscardAttempt()
+            waitingNoticeOutstanding = true
+            onRetryStatus?.invoke(RetryStatus.Waiting(attemptIndex + 1, delayMillis, cause))
+            println("[generateText] retry #${attemptIndex + 1} in ${delayMillis}ms (${cause.message})")
+            delay(delayMillis)
+            attemptIndex++
+        }
+    } finally {
+        if (waitingNoticeOutstanding) {
+            // 这里可能已经在取消状态：通知只是同步写一次界面状态，不挂起，所以仍然发得出去
+            onRetryStatus?.invoke(RetryStatus.Stopped)
+        }
     }
 }
 

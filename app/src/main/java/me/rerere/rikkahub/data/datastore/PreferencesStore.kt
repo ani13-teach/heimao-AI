@@ -88,7 +88,10 @@ private fun MutablePreferences.writeSettings(settings: Settings) {
     settings.titleModelId?.let {
         this[SettingsStore.TITLE_MODEL] = it.toString()
     } ?: remove(SettingsStore.TITLE_MODEL)
+    this[SettingsStore.TITLE_FALLBACK_MODELS] = JsonInstant.encodeToString(settings.titleFallbackModelIds)
     this[SettingsStore.TRANSLATE_MODEL] = settings.translateModeId.toString()
+    this[SettingsStore.TRANSLATE_FALLBACK_MODELS] =
+        JsonInstant.encodeToString(settings.translateFallbackModelIds)
     this[SettingsStore.ENABLE_SUGGESTION] = settings.enableSuggestion
     settings.suggestionModelId?.let {
         this[SettingsStore.SUGGESTION_MODEL] = it.toString()
@@ -157,7 +160,9 @@ class SettingsStore(
         val SELECT_MODEL = stringPreferencesKey("chat_model")
         val FAST_MODEL = stringPreferencesKey("fast_model")
         val TITLE_MODEL = stringPreferencesKey("title_model")
+        val TITLE_FALLBACK_MODELS = stringPreferencesKey("title_fallback_models")
         val TRANSLATE_MODEL = stringPreferencesKey("translate_model")
+        val TRANSLATE_FALLBACK_MODELS = stringPreferencesKey("translate_fallback_models")
         val ENABLE_SUGGESTION = booleanPreferencesKey("enable_suggestion")
         val SUGGESTION_MODEL = stringPreferencesKey("suggestion_model")
         val IMAGE_GENERATION_MODEL = stringPreferencesKey("image_generation_model")
@@ -216,8 +221,14 @@ class SettingsStore(
                 fastModelId = preferences[FAST_MODEL]?.let { Uuid.parse(it) }
                     ?: DEFAULT_AUTO_MODEL_ID,
                 titleModelId = preferences[TITLE_MODEL]?.let { Uuid.parse(it) },
+                titleFallbackModelIds = preferences[TITLE_FALLBACK_MODELS]?.let {
+                    JsonInstant.decodeFromString(it)
+                } ?: emptyList(),
                 translateModeId = preferences[TRANSLATE_MODEL]?.let { Uuid.parse(it) }
                     ?: DEFAULT_AUTO_MODEL_ID,
+                translateFallbackModelIds = preferences[TRANSLATE_FALLBACK_MODELS]?.let {
+                    JsonInstant.decodeFromString(it)
+                } ?: emptyList(),
                 enableSuggestion = preferences[ENABLE_SUGGESTION] != false,
                 suggestionModelId = preferences[SUGGESTION_MODEL]?.let { Uuid.parse(it) },
                 imageGenerationModelId = preferences[IMAGE_GENERATION_MODEL]?.let { Uuid.parse(it) } ?: Uuid.random(),
@@ -538,9 +549,16 @@ data class Settings(
     val chatModelId: Uuid = Uuid.random(),
     val fastModelId: Uuid = Uuid.random(),
     val titleModelId: Uuid? = null,
+    /**
+     * 标题生成失败后依次尝试的备用模型，按列表顺序生效。
+     * 只接受与主模型同属一个供应商的对话模型；留空表示不切换。
+     */
+    val titleFallbackModelIds: List<Uuid> = emptyList(),
     val imageGenerationModelId: Uuid = Uuid.random(),
     val titlePrompt: String = DEFAULT_TITLE_PROMPT,
     val translateModeId: Uuid = Uuid.random(),
+    /** 翻译失败后依次尝试的备用模型，规则同 [titleFallbackModelIds]。 */
+    val translateFallbackModelIds: List<Uuid> = emptyList(),
     val translatePrompt: String = DEFAULT_TRANSLATION_PROMPT,
     val translateThinkingBudget: Int = 0,
     val enableSuggestion: Boolean = true,

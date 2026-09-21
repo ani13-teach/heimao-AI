@@ -30,8 +30,8 @@ class S3Sync(
         Log.i(TAG, "testS3: Connection successful")
     }
 
-    suspend fun backupToS3(config: S3Config, password: CharArray) = withContext(Dispatchers.IO) {
-        val file = prepareBackupFile(config, password)
+    suspend fun backupToS3(config: S3Config) = withContext(Dispatchers.IO) {
+        val file = prepareBackupFile(config)
         var failure: Throwable? = null
         try {
             getS3Client(config).putObject(
@@ -114,12 +114,10 @@ class S3Sync(
 
     suspend fun prepareBackupFile(
         config: S3Config,
-        password: CharArray,
     ): File = withContext(Dispatchers.IO) {
         archiveService.createBackupFile(
             includeDatabase = S3Config.BackupItem.DATABASE in config.items,
             includeFiles = S3Config.BackupItem.FILES in config.items,
-            password = password,
         )
     }
 }

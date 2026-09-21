@@ -4,6 +4,8 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import kotlinx.coroutines.runBlocking
 import me.rerere.rikkahub.data.db.AppDatabase
+import me.rerere.rikkahub.data.datastore.Settings
+import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.db.fts.ensureCurrentMessageFtsSchema
 import me.rerere.rikkahub.utils.JsonInstant
 import org.junit.Assert.assertEquals
@@ -22,7 +24,6 @@ class WorkspaceArchiveBackupSnapshotTest {
         val database = koin.get<AppDatabase>()
         val service = koin.get<WorkspaceArchiveService>()
         val databaseHandle = database.openHelper.writableDatabase
-        val password = "legacy-fts-backup-password".toCharArray()
         var generated: File? = null
         try {
             databaseHandle.execSQL("DROP TABLE message_fts")
@@ -48,29 +49,28 @@ class WorkspaceArchiveBackupSnapshotTest {
             generated = service.createBackupFile(
                 includeDatabase = true,
                 includeFiles = false,
-                password = password,
             )
             assertTrue(generated.isFile)
-            assertTrue(WorkspaceArchiveEncryption.inspect(generated).isEncrypted)
+            assertTrue(WorkspaceArchiveEncryption.inspect(generated).isLegacy)
         } finally {
             ensureCurrentMessageFtsSchema(databaseHandle)
-            password.fill('\u0000')
             generated?.delete()
         }
     }
 
     @Test
-    fun fullBackupUsesSanitizedCopyAndKeepsOnlineSnapshotRows() = runBlocking {
+    fun fullBackupKeepsStoredCredentialsAndOnlineSnapshotRows() = runBlocking {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val koin = GlobalContext.get()
         val database = koin.get<AppDatabase>()
         val service = koin.get<WorkspaceArchiveService>()
+        val settingsStore = koin.get<SettingsStore>()
         val databaseHandle = database.openHelper.writableDatabase
         val snapshotId = "backup-copy-test-${System.nanoTime()}"
-        val password = "archive-test-password".toCharArray()
-        val backup = File(context.cacheDir, ".backup-copy-test-${System.nanoTime()}.zip.enc")
-        val decrypted = File(context.cacheDir, ".backup-copy-test-${System.nanoTime()}.zip")
+        val backup = File(context.cacheDir, ".backup-copy-test-${System.nanoTime()}.zip")
         val stagedDatabase = File(context.cacheDir, ".backup-copy-test-${System.nanoTime()}.db")
+        val sentinelSecret = "sentinel-secret-${System.nanoTime()}"
+        val originalSettings = settingsStore.readPersistedSettingsFailFast()
         try {
             databaseHandle.execSQL(
                 "INSERT INTO workspace_snapshots " +
@@ -89,17 +89,25 @@ class WorkspaceArchiveBackupSnapshotTest {
             )
             assertEquals(1, snapshotCount(databaseHandle, snapshotId))
 
+            // A backup is the only copy of these credentials after a reinstall, so they have to be
+            // packaged verbatim. Write a known secret first, then look for it inside the archive.
+            settingsStore.transformLatest { settings ->
+                settings.copy(
+                    webDavConfig = settings.webDavConfig.copy(password = sentinelSecret),
+                    s3Config = settings.s3Config.copy(secretAccessKey = sentinelSecret),
+                )
+            }
+
             val generated = service.createBackupFile(
                 includeDatabase = true,
                 includeFiles = false,
-                password = password,
             )
             generated.copyTo(backup, overwrite = true)
             generated.delete()
-            WorkspaceArchiveEncryption.decrypt(backup, decrypted, password)
 
             var manifest: WorkspaceArchiveManifest? = null
-            ZipInputStream(decrypted.inputStream().buffered()).use { zip ->
+            var archivedSettings: String? = null
+            ZipInputStream(backup.inputStream().buffered()).use { zip ->
                 while (true) {
                     val entry = zip.nextEntry ?: break
                     when (entry.name) {
@@ -107,6 +115,9 @@ class WorkspaceArchiveBackupSnapshotTest {
                             manifest = JsonInstant.decodeFromString<WorkspaceArchiveManifest>(
                                 zip.readBytes().toString(Charsets.UTF_8),
                             )
+                        }
+                        WorkspaceArchiveManifest.SETTINGS_PATH -> {
+                            archivedSettings = zip.readBytes().toString(Charsets.UTF_8)
                         }
                         "database/rikka_hub.db" -> {
                             stagedDatabase.outputStream().use { zip.copyTo(it) }
@@ -116,6 +127,14 @@ class WorkspaceArchiveBackupSnapshotTest {
                 }
             }
             assertTrue(manifest?.snapshotsExcluded == true)
+            val settingsJson = archivedSettings ?: error("Backup has no settings entry")
+            assertTrue(
+                "Archived settings dropped the stored secret",
+                settingsJson.contains(sentinelSecret),
+            )
+            val settings = JsonInstant.decodeFromString<Settings>(settingsJson)
+            assertEquals(sentinelSecret, settings.webDavConfig.password)
+            assertEquals(sentinelSecret, settings.s3Config.secretAccessKey)
             assertTrue(stagedDatabase.isFile)
             assertEquals(0, snapshotCountInFile(stagedDatabase, snapshotId))
             assertEquals(1, snapshotCount(databaseHandle, snapshotId))
@@ -124,9 +143,8 @@ class WorkspaceArchiveBackupSnapshotTest {
                 "DELETE FROM workspace_snapshots WHERE id = ?",
                 arrayOf<Any?>(snapshotId),
             )
-            password.fill('\u0000')
+            settingsStore.replaceAuthoritativelyForRestore(originalSettings)
             backup.delete()
-            decrypted.delete()
             stagedDatabase.delete()
         }
     }

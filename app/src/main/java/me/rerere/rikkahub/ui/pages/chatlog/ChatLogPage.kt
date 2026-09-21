@@ -188,6 +188,7 @@ private fun LogEntryCard(entry: ChatLogEntry, modifier: Modifier = Modifier) {
                     text = when (entry) {
                         is ChatLogEntry.RequestUsage -> stringResource(R.string.chat_log_type_usage)
                         is ChatLogEntry.ToolFailure -> stringResource(R.string.chat_log_type_tool_failure)
+                        is ChatLogEntry.MemoryFailure -> stringResource(R.string.chat_log_type_memory_failure)
                         is ChatLogEntry.Crash -> stringResource(R.string.chat_log_type_crash)
                     },
                     style = MaterialTheme.typography.titleSmall,
@@ -204,6 +205,7 @@ private fun LogEntryCard(entry: ChatLogEntry, modifier: Modifier = Modifier) {
             when (entry) {
                 is ChatLogEntry.RequestUsage -> RequestUsageBody(entry)
                 is ChatLogEntry.ToolFailure -> ToolFailureBody(entry)
+                is ChatLogEntry.MemoryFailure -> MemoryFailureBody(entry)
                 is ChatLogEntry.Crash -> CrashBody(entry)
             }
         }
@@ -231,6 +233,17 @@ private fun ToolFailureBody(entry: ChatLogEntry.ToolFailure) {
     }
     if (entry.upstreamCode != null) {
         DetailRow(stringResource(R.string.chat_log_upstream_code), entry.upstreamCode)
+    }
+}
+
+@Composable
+private fun MemoryFailureBody(entry: ChatLogEntry.MemoryFailure) {
+    DetailRow(stringResource(R.string.chat_log_tool_name), entry.toolName)
+    entry.action?.let { DetailRow(stringResource(R.string.chat_log_memory_action), it) }
+    entry.recordId?.let { DetailRow(stringResource(R.string.chat_log_memory_record_id), it.toString()) }
+    DetailRow(stringResource(R.string.chat_log_error_type), entry.errorType)
+    if (entry.errorMessage.isNotBlank()) {
+        DetailRow(stringResource(R.string.chat_log_reason), entry.errorMessage)
     }
 }
 

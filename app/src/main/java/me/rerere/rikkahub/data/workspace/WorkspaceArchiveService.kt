@@ -3,6 +3,7 @@ package me.rerere.rikkahub.data.workspace
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.os.Build
+import android.util.Log
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.sqlite.db.SupportSQLiteDatabase
@@ -15,11 +16,9 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
-import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.BuildConfig
-import me.rerere.rikkahub.data.ai.mcp.McpServerConfig
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.datastore.settingsDataStoreFile
@@ -56,6 +55,7 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
+import java.nio.file.FileSystemException
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.attribute.BasicFileAttributes
@@ -87,46 +87,63 @@ class WorkspaceArchiveService(
     suspend fun createBackupFile(
         includeDatabase: Boolean,
         includeFiles: Boolean,
-        password: CharArray,
     ): File = withContext(Dispatchers.IO) {
-        WorkspaceArchiveEncryption.requirePassword(password)
         workspaceRepository.withWorkspaceCatalogArchiveLock {
-            createBackupFileLocked(includeDatabase, includeFiles, password)
+            try {
+                createBackupFileLocked(includeDatabase, includeFiles)
+            } catch (error: FileSystemException) {
+                // A java.nio file error carries nothing but a path as its message, so a failed
+                // backup would otherwise be undiagnosable from the transport UI. Name the file
+                // and the reason ("Permission denied", "No such file or directory", ...).
+                throw IllegalStateException(
+                    "Cannot read workspace archive source: ${error.file} " +
+                        "(${error.reason ?: error.javaClass.simpleName})",
+                    error,
+                )
+            }
         }
     }
 
     private suspend fun createBackupFileLocked(
         includeDatabase: Boolean,
         includeFiles: Boolean,
-        password: CharArray,
     ): File = withContext(Dispatchers.IO) {
         val timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
-        val target = File(
-            context.cacheDir,
-            "backup_${timestamp}_${UUID.randomUUID()}${WorkspaceArchiveEncryption.ENCRYPTED_FILE_SUFFIX}",
-        )
-        val encryptedPartial = File(target.path + ".partial")
-        val plaintextZip = File(context.cacheDir, ".workspace-archive-plaintext-${UUID.randomUUID()}.zip")
+        val target = File(context.cacheDir, "backup_${timestamp}_${UUID.randomUUID()}.zip")
+        // The archive is written next to its final name and only renamed once every check below
+        // passed, so no transport can ever observe a half-written backup.
+        val partialZip = File(target.path + ".partial")
         val payloadDirectory = File(context.cacheDir, ".workspace-archive-${UUID.randomUUID()}")
         val budget = WorkspaceArchiveBudget()
         var finalized = false
         var failure: Throwable? = null
         try {
             budget.checkAvailableSpace(context.cacheDir, BUFFER_SIZE.toLong())
-            deleteIfPresent(encryptedPartial)
+            deleteIfPresent(partialZip)
             deleteIfPresent(target)
-            deleteIfPresent(plaintextZip)
             require(payloadDirectory.mkdirs() || payloadDirectory.isDirectory) {
                 "Unable to create archive staging directory"
             }
 
-            val settings = sanitizeWorkspaceArchiveSettings(settingsStore.readPersistedSettingsFailFast())
+            // Settings are archived exactly as the device holds them, credentials included: the
+            // backup is the only copy of them after a reinstall, so it must not strip keys, URLs,
+            // model lists, MCP tokens or transport credentials.
+            val settings = settingsStore.readPersistedSettingsFailFast()
             // Workspace payloads are the portable unit and are always included. The legacy
             // FILES switch only controls upload/skills/fonts compatibility entries.
             val workspaces = workspaceRepository.getAll()
             val sourceFingerprints = mutableMapOf<String, WorkspaceSourceFingerprint>()
             val payloads = workspaces.map { workspace ->
                 workspaceRepository.withWorkspaceArchiveLock(workspace.id) {
+                    // A PRoot placeholder left in the rootfs is unreadable, and an unreadable
+                    // directory aborts the fingerprint and TAR walks below. Repair it first so
+                    // both fingerprints and the payloads see the same directory tree.
+                    val repaired = repairProotRootfsPlaceholders(
+                        File(File(context.filesDir, "workspaces"), "${workspace.root}/linux")
+                    )
+                    if (repaired.isNotEmpty()) {
+                        Log.i(TAG, "Repaired rootfs placeholders: ${repaired.joinToString(",")}")
+                    }
                     // DocumentsProvider/open-FD users cannot be strongly frozen by this mutex.
                     // The before/after fingerprint is a change detector, not a filesystem freeze.
                     val before = fingerprintWorkspaceSource(workspace)
@@ -200,7 +217,7 @@ class WorkspaceArchiveService(
                 actualDirectoryRoots = expectedDirectoryRoots,
             )
 
-            FileOutputStream(plaintextZip).use { rawOutput ->
+            FileOutputStream(partialZip).use { rawOutput ->
                 BudgetOutputStream(rawOutput) { bytes ->
                     budget.recordZipCompressedBytes(bytes)
                     budget.recordStagingBytes(bytes, context.cacheDir)
@@ -240,9 +257,9 @@ class WorkspaceArchiveService(
                 }
             }
             verifyWorkspaceSourcesUnchanged(workspaces, sourceFingerprints)
-            budget.checkCompressedFile(plaintextZip, countBytes = false)
+            budget.checkCompressedFile(partialZip, countBytes = false)
             budget.checkStagingDirectory(payloadDirectory)
-            verifyPortableArchive(plaintextZip)
+            verifyPortableArchive(partialZip)
             verifyWorkspaceSourcesUnchanged(workspaces, sourceFingerprints)
             verifyArchiveStateUnchanged(
                 expectedWorkspaces = workspaces,
@@ -251,22 +268,8 @@ class WorkspaceArchiveService(
                 expectedDirectoryRoots = expectedDirectoryRoots,
             )
 
-            // The ZIP is never exposed to a transport. It remains in a private cache file only
-            // until GCM has emitted and authenticated the complete outer envelope.
-            WorkspaceArchiveEncryption.encrypt(
-                source = plaintextZip,
-                target = encryptedPartial,
-                password = password,
-                onOutputBytes = { bytes -> budget.recordStagingBytes(bytes, context.cacheDir) },
-            )
-            require(encryptedPartial.renameTo(target)) { "Unable to finalize encrypted workspace backup" }
-            // Delete the only plaintext archive immediately after the authenticated envelope is
-            // finalized. The finally block repeats this idempotently on every exit path.
-            deleteIfPresent(plaintextZip)
+            require(partialZip.renameTo(target)) { "Unable to finalize workspace backup" }
             deleteDirectoryIfPresent(payloadDirectory)
-            require(WorkspaceArchiveEncryption.inspect(target).isEncrypted) {
-                "Final workspace backup is not an encrypted envelope"
-            }
             verifyWorkspaceSourcesUnchanged(workspaces, sourceFingerprints)
             verifyArchiveStateUnchanged(
                 expectedWorkspaces = workspaces,
@@ -283,8 +286,7 @@ class WorkspaceArchiveService(
             val preserveFinalizedOutput = finalized && currentCoroutineContext().isActive
             withContext(NonCancellable) {
                 cleanupArchiveArtifacts(
-                    encryptedPartial = encryptedPartial,
-                    plaintextZip = plaintextZip,
+                    partialZip = partialZip,
                     payloadDirectory = payloadDirectory,
                     target = target,
                     finalized = preserveFinalizedOutput,
@@ -315,16 +317,19 @@ class WorkspaceArchiveService(
             "Backup file does not exist or is unreadable"
         }
         val inspection = WorkspaceArchiveEncryption.inspect(file)
+        // Only a plaintext archive without the portable manifest predates the current format and
+        // needs the legacy warning; a current plaintext archive is an ordinary backup.
+        val needsLegacyConfirmation = inspection.requiresLegacyConfirmation(hasPortableManifest(file))
         val encryptedBudget = WorkspaceArchiveBudget()
         if (inspection.isEncrypted) {
             encryptedBudget.checkCompressedFile(file)
             encryptedBudget.checkAvailableSpace(context.filesDir, file.length())
         }
-        if (inspection.isLegacy && !allowLegacy) {
+        if (needsLegacyConfirmation && !allowLegacy) {
             throw LegacyWorkspaceArchiveRequiresConfirmationException()
         }
         val authenticatedZip = if (inspection.isEncrypted) {
-            val suppliedPassword = password ?: error("An archive password is required")
+            val suppliedPassword = password ?: throw WorkspaceArchivePasswordRequiredException()
             val decrypted = File(
                 context.filesDir,
                 ".workspace-decrypted-${UUID.randomUUID()}.zip.partial",
@@ -372,7 +377,7 @@ class WorkspaceArchiveService(
                     )
                 }
             }
-            val markedResult = if (inspection.isLegacy) {
+            val markedResult = if (needsLegacyConfirmation) {
                 result.copy(
                     legacy = true,
                     warnings = (result.warnings + LEGACY_RESTORE_WARNING).distinct(),
@@ -931,8 +936,11 @@ class WorkspaceArchiveService(
     ) {
         val inspection = inspectBackupFile(file)
         if (inspection.isLegacy) {
-            require(allowLegacy) { "Legacy archive verification requires explicit confirmation" }
-            if (hasPortableManifest(file)) {
+            val portable = hasPortableManifest(file)
+            require(!inspection.requiresLegacyConfirmation(portable) || allowLegacy) {
+                "Legacy archive verification requires explicit confirmation"
+            }
+            if (portable) {
                 verifyPortableArchive(file)
             } else {
                 verifyLegacyArchive(file)
@@ -940,7 +948,7 @@ class WorkspaceArchiveService(
             return
         }
 
-        val suppliedPassword = password ?: error("An archive password is required")
+        val suppliedPassword = password ?: throw WorkspaceArchivePasswordRequiredException()
         val encryptedBudget = WorkspaceArchiveBudget()
         encryptedBudget.checkCompressedFile(file)
         encryptedBudget.checkAvailableSpace(context.cacheDir, file.length())
@@ -2691,7 +2699,7 @@ class WorkspaceArchiveService(
 
     private fun decodeArchiveSettings(raw: String): Settings {
         val migrated = SettingsJsonMigrator.migrate(raw)
-        return sanitizeWorkspaceArchiveSettings(json.decodeFromString<Settings>(migrated))
+        return json.decodeFromString<Settings>(migrated)
     }
 
     private fun validateManifestSettingsReferences(
@@ -2709,70 +2717,6 @@ class WorkspaceArchiveService(
         require(actual == expected) {
             "Portable manifest assistant workspace references do not match settings"
         }
-    }
-
-    private fun mergeLocalCredentials(current: Settings, restored: Settings): Settings {
-        val currentProviders = current.providers.associateBy { it.id }
-        val providers = restored.providers.map { provider ->
-            val old = currentProviders[provider.id]
-            when {
-                old is ProviderSetting.OpenAI && provider is ProviderSetting.OpenAI ->
-                    provider.copy(apiKey = old.apiKey)
-
-                old is ProviderSetting.Google && provider is ProviderSetting.Google ->
-                    provider.copy(
-                        apiKey = old.apiKey,
-                        privateKey = old.privateKey,
-                        serviceAccountEmail = old.serviceAccountEmail,
-                        projectId = old.projectId,
-                    )
-
-                old is ProviderSetting.Claude && provider is ProviderSetting.Claude ->
-                    provider.copy(apiKey = old.apiKey)
-
-                else -> provider
-            }
-        }
-        val oldAssistants = current.assistants.associateBy { it.id }
-        val assistants = restored.assistants.map { assistant ->
-            val old = oldAssistants[assistant.id]
-            if (old == null) assistant else assistant.copy(
-                customHeaders = old.customHeaders,
-                customBodies = old.customBodies,
-            )
-        }
-        val oldMcp = current.mcpServers.associateBy { it.id }
-        val mcpServers = restored.mcpServers.map { server ->
-            val old = oldMcp[server.id]
-            if (old == null) server else when (server) {
-                is McpServerConfig.SseTransportServer -> server.copy(
-                    commonOptions = server.commonOptions.copy(
-                        headers = old.commonOptions.headers,
-                        oauth = old.commonOptions.oauth,
-                    )
-                )
-
-                is McpServerConfig.StreamableHTTPServer -> server.copy(
-                    commonOptions = server.commonOptions.copy(
-                        headers = old.commonOptions.headers,
-                        oauth = old.commonOptions.oauth,
-                    )
-                )
-            }
-        }
-        return restored.copy(
-            providers = providers,
-            assistants = assistants,
-            mcpServers = mcpServers,
-            webDavConfig = restored.webDavConfig.copy(
-                username = current.webDavConfig.username,
-                password = current.webDavConfig.password,
-            ),
-            s3Config = restored.s3Config.copy(
-                accessKeyId = current.s3Config.accessKeyId,
-                secretAccessKey = current.s3Config.secretAccessKey,
-            ),
-        )
     }
 
     private fun currentAbis(): List<String> = runCatching {
@@ -3039,8 +2983,22 @@ class WorkspaceArchiveService(
                 "Staged database Room identity is malformed"
             }
             val schema = readRoomSchemaSnapshot(staged, userVersion, identity)
-            require(roomSchema30IsExact(schema)) {
-                "Staged database schema is not exactly Room schema ${AppDatabase.CURRENT_VERSION}"
+            if (!roomSchema30IsExact(schema)) {
+                // The message reaches the backup UI, so name the drifting objects there instead of
+                // only stating that the schema is not Room schema 30. A release build refuses
+                // run-as, so the same structure also goes to a file this device can hand over.
+                val difference = describeRoomSchema30Difference(schema)
+                val report = writeSchemaDriftReport(schema, difference)
+                Log.e(
+                    TAG,
+                    "Staged database is not Room schema ${AppDatabase.CURRENT_VERSION}: " +
+                        "$difference (report=${report?.absolutePath ?: "unavailable"})",
+                )
+                error(
+                    "Staged database schema is not exactly Room schema ${AppDatabase.CURRENT_VERSION}: " +
+                        "$difference" +
+                        (report?.let { " (report: ${it.name})" } ?: ""),
+                )
             }
 
             expectedReferences?.let { expected ->
@@ -3091,6 +3049,29 @@ class WorkspaceArchiveService(
         } finally {
             validationHelper.close()
         }
+    }
+
+    /**
+     * Drop the rejected database's structure next to the app's external files.
+     *
+     * The device that hits a schema rejection is usually the only one holding the offending
+     * database, and a release build cannot be read over adb. The report is DDL only, so it carries
+     * no conversation data, and it is bounded so a hostile archive cannot fill the shared storage.
+     */
+    private fun writeSchemaDriftReport(snapshot: RoomSchemaSnapshot, difference: String): File? {
+        val directory = context.getExternalFilesDir(null) ?: return null
+        val report = File(directory, "schema-drift-${System.currentTimeMillis()}.txt")
+        val text = roomSchemaDriftReport(
+            snapshot = snapshot,
+            difference = difference,
+            appVersion = BuildConfig.VERSION_NAME,
+            appVersionCode = BuildConfig.VERSION_CODE,
+        )
+        return runCatching {
+            report.writeText(text)
+            report
+        }.onFailure { error -> Log.w(TAG, "Unable to write the schema drift report", error) }
+            .getOrNull()
     }
 
     private fun openStagedDatabaseForValidation(file: File): SupportSQLiteOpenHelper {
@@ -3358,8 +3339,7 @@ class WorkspaceArchiveService(
     }
 
     private fun cleanupArchiveArtifacts(
-        encryptedPartial: File,
-        plaintextZip: File,
+        partialZip: File,
         payloadDirectory: File,
         target: File,
         finalized: Boolean,
@@ -3373,8 +3353,7 @@ class WorkspaceArchiveService(
                 cleanupErrors += cleanupError
             }
         }
-        cleanup { deleteIfPresent(encryptedPartial) }
-        cleanup { deleteIfPresent(plaintextZip) }
+        cleanup { deleteIfPresent(partialZip) }
         cleanup { deleteDirectoryIfPresent(payloadDirectory) }
         if (!finalized) cleanup { deleteIfPresent(target) }
         if (failure != null) {
@@ -3546,6 +3525,7 @@ class WorkspaceArchiveService(
     }
 
     companion object {
+        private const val TAG = "WorkspaceArchiveService"
         private const val BUFFER_SIZE = 64 * 1024
         private const val MAX_MANIFEST_BYTES = 2L * 1024 * 1024
         private const val MAX_SETTINGS_BYTES = 16L * 1024 * 1024

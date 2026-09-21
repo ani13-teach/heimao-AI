@@ -74,6 +74,47 @@ class WorkspaceArchiveSecurityTest {
     }
 
     @Test
+    fun `tar round trip keeps a usrmerge rootfs layout`() {
+        // The Ubuntu base that installs a portable workspace links through its own directories:
+        // bin -> usr/bin, lib -> usr/lib, and entries that point back through them. Re-creating
+        // those links relative to a fresh staging root is what the export path has to accept.
+        val source = temporaryFolder.newFolder("rootfs")
+        File(source, "usr/bin").mkdirs()
+        File(source, "usr/lib/systemd/system").mkdirs()
+        File(source, "etc/alternatives").mkdirs()
+        File(source, "etc/systemd/system/timers.target.wants").mkdirs()
+        File(source, "usr/bin/more").writeText("more\n")
+        File(source, "usr/lib/systemd/system/apt-daily.timer").writeText("[Timer]\n")
+        val linksAvailable = runCatching {
+            Files.createSymbolicLink(File(source, "bin").toPath(), java.nio.file.Paths.get("usr/bin"))
+            Files.createSymbolicLink(File(source, "lib").toPath(), java.nio.file.Paths.get("usr/lib"))
+            Files.createSymbolicLink(
+                File(source, "etc/alternatives/pager").toPath(),
+                java.nio.file.Paths.get("../../bin/more"),
+            )
+            Files.createSymbolicLink(
+                File(source, "etc/systemd/system/timers.target.wants/apt-daily.timer").toPath(),
+                java.nio.file.Paths.get("../../../../lib/systemd/system/apt-daily.timer"),
+            )
+        }.isSuccess
+        assumeTrue("filesystem does not allow links", linksAvailable)
+
+        val payload = temporaryFolder.newFile("rootfs.tar")
+        WorkspaceArchiveTar.create(source, payload)
+        val restored = temporaryFolder.newFolder("restored")
+        WorkspaceArchiveTar.extract(payload, restored)
+
+        assertTrue(Files.isSymbolicLink(File(restored, "bin").toPath()))
+        assertTrue(
+            File(restored, "etc/alternatives/pager").canonicalFile.endsWith(File("usr/bin/more")),
+        )
+        assertTrue(
+            File(restored, "etc/systemd/system/timers.target.wants/apt-daily.timer").canonicalFile
+                .endsWith(File("usr/lib/systemd/system/apt-daily.timer")),
+        )
+    }
+
+    @Test
     fun `tampering changes the streaming payload digest`() {
         val source = temporaryFolder.newFolder("source")
         File(source, "data.txt").writeText("payload")

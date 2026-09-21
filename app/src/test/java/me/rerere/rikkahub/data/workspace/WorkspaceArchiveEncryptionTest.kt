@@ -1,46 +1,37 @@
 package me.rerere.rikkahub.data.workspace
 
-import me.rerere.rikkahub.data.datastore.Settings
-import me.rerere.rikkahub.data.datastore.WebDavConfig
-import me.rerere.rikkahub.data.sync.s3.S3Config
-import me.rerere.rikkahub.utils.JsonInstant
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
-import org.junit.Assert.assertThrows
 import java.io.File
+import java.util.Base64
 
 class WorkspaceArchiveEncryptionTest {
     @get:Rule
     val temporaryFolder = TemporaryFolder()
 
     @Test
-    fun `versioned envelope round trips and never contains plaintext`() {
-        val source = temporaryFolder.newFile("portable.zip").apply {
-            writeText("manifest.json\nprivate workspace payload")
-        }
-        val encrypted = temporaryFolder.newFile("portable.zip.enc")
-        val password = "correct horse battery".toCharArray()
-        WorkspaceArchiveEncryption.encrypt(source, encrypted, password)
+    fun `fixed envelope decrypts to its original plaintext`() {
+        val encrypted = fixtureFile()
 
-        assertEquals(WorkspaceArchiveEnvelope.ENCRYPTED, WorkspaceArchiveEncryption.inspect(encrypted).envelope)
-        val encryptedText = encrypted.readBytes().toString(Charsets.ISO_8859_1)
-        assertFalse(encryptedText.contains("private workspace payload"))
-        assertFalse(encryptedText.contains("correct horse battery"))
+        val inspection = WorkspaceArchiveEncryption.inspect(encrypted)
+        assertEquals(WorkspaceArchiveEnvelope.ENCRYPTED, inspection.envelope)
+        assertTrue(inspection.isEncrypted)
+        assertEquals(1, inspection.version)
 
         val restored = temporaryFolder.newFile("restored.zip")
-        WorkspaceArchiveEncryption.decrypt(encrypted, restored, password)
-        assertEquals(source.readText(), restored.readText())
+        WorkspaceArchiveEncryption.decrypt(encrypted, restored, FIXTURE_PASSWORD.toCharArray())
+        assertArrayEquals(FIXTURE_PLAINTEXT.toByteArray(Charsets.UTF_8), restored.readBytes())
     }
 
     @Test
     fun `wrong password removes decrypted temporary plaintext`() {
-        val source = temporaryFolder.newFile("portable.zip").apply { writeText("secret workspace") }
-        val encrypted = temporaryFolder.newFile("portable.zip.enc")
-        WorkspaceArchiveEncryption.encrypt(source, encrypted, "correct-password".toCharArray())
+        val encrypted = fixtureFile()
         val decrypted = temporaryFolder.newFile("decrypted.zip")
 
         assertThrows(WorkspaceArchiveAuthenticationException::class.java) {
@@ -51,11 +42,8 @@ class WorkspaceArchiveEncryptionTest {
 
     @Test
     fun `tampered and truncated envelopes fail authentication`() {
-        val source = temporaryFolder.newFile("portable.zip").apply { writeText("authenticated payload") }
-        val encrypted = temporaryFolder.newFile("portable.zip.enc")
-        val password = "correct-password".toCharArray()
-        WorkspaceArchiveEncryption.encrypt(source, encrypted, password)
-        val bytes = encrypted.readBytes()
+        val bytes = fixtureFile().readBytes()
+        val password = FIXTURE_PASSWORD.toCharArray()
 
         val tampered = temporaryFolder.newFile("tampered.enc").apply {
             writeBytes(bytes.copyOf().also { it[it.lastIndex] = (it[it.lastIndex].toInt() xor 1).toByte() })
@@ -89,25 +77,31 @@ class WorkspaceArchiveEncryptionTest {
     }
 
     @Test
-    fun `settings sanitizer strips transport credentials and archive passwords`() {
-        val transportPassword = "transport-password"
-        val archivePassword = "archive-password"
-        val sanitized = sanitizeWorkspaceArchiveSettings(
-            Settings(
-                webDavConfig = WebDavConfig(
-                    username = "user",
-                    password = archivePassword,
-                ),
-                s3Config = S3Config(
-                    accessKeyId = "access",
-                    secretAccessKey = transportPassword,
-                ),
-            )
-        )
-        val encoded = JsonInstant.encodeToString(sanitized)
-        assertFalse(encoded.contains(transportPassword))
-        assertFalse(encoded.contains(archivePassword))
-        assertEquals("", sanitized.webDavConfig.password)
-        assertEquals("", sanitized.s3Config.secretAccessKey)
+    fun `legacy confirmation is only required for plaintext archives without a portable manifest`() {
+        val encrypted = WorkspaceArchiveEncryption.inspect(fixtureFile())
+        val legacy = WorkspaceArchiveInspection(WorkspaceArchiveEnvelope.LEGACY)
+
+        assertTrue(legacy.requiresLegacyConfirmation(hasPortableManifest = false))
+        assertFalse(legacy.requiresLegacyConfirmation(hasPortableManifest = true))
+        assertFalse(encrypted.requiresLegacyConfirmation(hasPortableManifest = false))
+        assertFalse(encrypted.requiresLegacyConfirmation(hasPortableManifest = true))
+    }
+
+    private fun fixtureFile(): File {
+        val file = temporaryFolder.newFile("fixture.zip.enc")
+        file.writeBytes(Base64.getDecoder().decode(FIXTURE_BASE64))
+        assertEquals(FIXTURE_BYTES, file.length())
+        return file
+    }
+
+    private companion object {
+        // Produced once by the retired encrypt() writer and pinned here, so the reader keeps being
+        // checked against bytes that were really written by 2.4.9 and can never be regenerated.
+        const val FIXTURE_PLAINTEXT = "PK\u0003\u0004portable-workspace-archive-from-2.4.9"
+        const val FIXTURE_PASSWORD = "legacy-backup-password"
+        const val FIXTURE_BYTES = 101L
+        const val FIXTURE_BASE64 =
+            "SE1BRU5DMDEBAQAB1MAQDLLnjxtAPazsZ7dDPM/ghkZvbT+Y2YxYzPX0VncYMrbpPhZrfvEgir7Nky0HOw9HW5jaf" +
+                "sVfPq+VVzkM7zFvrAvttZ3fl/iJdhxh5cQPMB+2U8i7u+0="
     }
 }

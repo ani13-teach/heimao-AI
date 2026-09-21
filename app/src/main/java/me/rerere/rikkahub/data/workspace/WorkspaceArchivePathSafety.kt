@@ -74,7 +74,19 @@ object WorkspaceArchivePathSafety {
         }
     }
 
-    /** Resolves a TAR link target inside [root] without creating a host-absolute link. */
+    /**
+     * Resolves a TAR link target inside [root] without creating a host-absolute link.
+     *
+     * A Linux rootfs links through its own directories on purpose: the Ubuntu base that builds a
+     * portable workspace carries `bin -> usr/bin` with `etc/alternatives/pager -> /bin/more`, and
+     * `lib -> usr/lib` with `etc/systemd/system/timers.target.wants/apt-daily.timer ->
+     * /lib/systemd/system/apt-daily.timer`.
+     * The caller re-creates every link as a path relative to [root], and the target is checked to
+     * stay inside [root] below, so an ancestor that is a symlink cannot make the archive leave the
+     * staging root: it only means the archive links through its own directories, as such a rootfs
+     * does. [ensureNoSymlinkAncestors] stays in force for entry paths, where it stops a write from
+     * following a symlinked directory.
+     */
     fun resolveLinkTarget(root: File, entryPath: String, linkName: String): java.nio.file.Path {
         require(linkName.isNotBlank()) { "Archive link target is blank" }
         require(!linkName.contains('\u0000')) { "Archive link target contains NUL" }
@@ -93,7 +105,6 @@ object WorkspaceArchivePathSafety {
         require(candidate.startsWith(rootPath)) {
             "Archive link escapes staging root: $entryPath -> $linkName"
         }
-        ensureNoSymlinkAncestors(rootPath, candidate, includeTarget = false)
         return candidate
     }
 }

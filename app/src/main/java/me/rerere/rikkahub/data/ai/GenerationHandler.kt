@@ -12,6 +12,7 @@ import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -22,6 +23,7 @@ import me.rerere.ai.provider.ClaudeMemoryCacheBlock
 import me.rerere.ai.provider.CustomBody
 import me.rerere.ai.provider.LogicalPrompt
 import me.rerere.ai.provider.Model
+import me.rerere.ai.provider.ModelType
 import me.rerere.ai.provider.Provider
 import me.rerere.ai.provider.ProviderManager
 import me.rerere.ai.provider.ProviderSetting
@@ -40,8 +42,10 @@ import me.rerere.rikkahub.data.ai.transformers.OutputMessageTransformer
 import me.rerere.rikkahub.data.ai.transformers.onGenerationFinish
 import me.rerere.rikkahub.data.ai.transformers.transforms
 import me.rerere.rikkahub.data.ai.transformers.visualTransforms
+import me.rerere.rikkahub.data.ai.tools.MEMORY_TOOL_NAMES
 import me.rerere.rikkahub.data.ai.tools.buildLayeredMemoryTools
 import me.rerere.rikkahub.data.ai.tools.buildMemoryTools
+import me.rerere.rikkahub.data.ai.tools.parseMemoryToolCallTarget
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.datastore.findProvider
@@ -53,6 +57,7 @@ import me.rerere.rikkahub.data.repository.MemoryRepository
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
 import me.rerere.rikkahub.data.workspace.AssistantWorkspaceAccessGate
 import me.rerere.rikkahub.utils.applyPlaceholders
+import me.rerere.rikkahub.utils.repairUnescapedQuotes
 import java.util.Locale
 import java.util.LinkedHashMap
 import kotlin.time.Clock
@@ -260,6 +265,26 @@ class GenerationHandler(
     private val workspaceAccessGate: AssistantWorkspaceAccessGate,
     private val chatLogStore: ChatLogStore,
 ) {
+    /**
+     * 解析工具入参。记忆内容是自由文本，模型偶尔会把里面的英文引号原样写进 JSON，
+     * 这时按「引号属于内容」补一次转义再解析；补完还是不行就报原来那个错。
+     */
+    private fun parseToolArguments(tool: UIMessagePart.Tool): JsonElement {
+        val input = tool.input.ifBlank { "{}" }
+        val strict = runCatching { json.parseToJsonElement(input) }
+        strict.getOrNull()?.let { return it }
+
+        val originalError = strict.exceptionOrNull()!!
+        if (tool.toolName !in MEMORY_TOOL_NAMES) throw originalError
+        val repaired = repairUnescapedQuotes(input)
+        if (repaired == input) throw originalError
+
+        val repairedArgs = runCatching { json.parseToJsonElement(repaired) }.getOrNull()
+            ?: throw originalError
+        Log.i(TAG, "parseToolArguments: repaired unescaped quotes in ${tool.toolName} arguments")
+        return repairedArgs
+    }
+
     private val memorySnapshots = object : LinkedHashMap<String, MemorySnapshotState>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, MemorySnapshotState>): Boolean =
             size > MAX_MEMORY_SNAPSHOT_ENTRIES
@@ -567,9 +592,7 @@ class GenerationHandler(
                         runCatching {
                             val toolDef = toolsInternal.find { toolDef -> toolDef.name == tool.toolName }
                                 ?: error("Tool ${tool.toolName} not found")
-                            val args = runCatching {
-                                json.parseToJsonElement(tool.input.ifBlank { "{}" })
-                            }.getOrElse {
+                            val args = runCatching { parseToolArguments(tool) }.getOrElse {
                                 error("Invalid tool arguments JSON for ${tool.toolName}: ${it.message}")
                             }
                             Log.i(TAG, "generateText: executing tool ${toolDef.name} with args: $args")
@@ -585,11 +608,22 @@ class GenerationHandler(
                                     conversationId = workspaceConversationId,
                                 )
                             )
-                        }.onFailure {
+                        }.onFailure { error ->
                             // 取消必须向上传播，否则停止生成会被误报为工具执行错误
-                            if (it is CancellationException) throw it
-                            it.printStackTrace()
-                            chatLogStore.recordToolFailure(toolName = tool.toolName, error = it)
+                            if (error is CancellationException) throw error
+                            error.printStackTrace()
+                            if (tool.toolName in MEMORY_TOOL_NAMES) {
+                                // 记忆失败单独记一条，带上动作和记录 id，方便在日志页直接定位
+                                val target = parseMemoryToolCallTarget(tool.inputAsJson())
+                                chatLogStore.recordMemoryFailure(
+                                    toolName = tool.toolName,
+                                    action = target.action,
+                                    recordId = target.recordId,
+                                    error = error,
+                                )
+                            } else {
+                                chatLogStore.recordToolFailure(toolName = tool.toolName, error = error)
+                            }
                             executedTools += tool.copy(
                                 output = listOf(
                                     UIMessagePart.Text(
@@ -598,8 +632,8 @@ class GenerationHandler(
                                                 put(
                                                     "error",
                                                     JsonPrimitive(buildString {
-                                                        append("[${it.javaClass.name}] ${it.message}")
-                                                        append("\n${it.stackTraceToString()}")
+                                                        append("[${error.javaClass.name}] ${error.message}")
+                                                        append("\n${error.stackTraceToString()}")
                                                     })
                                                 )
                                             }
@@ -783,7 +817,8 @@ class GenerationHandler(
             responseMessages = messages,
             retryPolicy = settings.toRetryPolicy(),
             onRetryStatus = { status ->
-                // 只在自己写过提示时才清掉，避免盖掉其他流程的状态文案
+                // 只在自己写过提示时才清掉，避免盖掉其他流程的状态文案。
+                // Stopped（重试用尽/取消）也要清：留着它，下一次生成会把旧提示重新显出来
                 processingStatus.value = when (status) {
                     is RetryStatus.Waiting -> context.getString(
                         R.string.chat_generation_retrying,
@@ -791,7 +826,7 @@ class GenerationHandler(
                         status.nextAttempt,
                     )
 
-                    RetryStatus.Recovered -> null
+                    RetryStatus.Recovered, RetryStatus.Stopped -> null
                 }
             },
             onUpdateMessages = onUpdateMessages,
@@ -854,66 +889,90 @@ class GenerationHandler(
         targetLanguage: Locale,
         onStreamUpdate: ((String) -> Unit)? = null
     ): Flow<String> = flow {
-        val model = settings.providers.findModelById(settings.translateModeId)
+        val primaryModel = settings.providers.findModelById(settings.translateModeId)
             ?: error("Translation model not found")
-        val provider = model.findProvider(settings.providers)
-            ?: error("Translation provider not found")
+        val candidates = fallbackCandidates(
+            providers = settings.providers,
+            primaryModel = primaryModel,
+            fallbackModelIds = settings.translateFallbackModelIds,
+            accept = { it.type == ModelType.CHAT },
+        )
+        val retryPolicy = settings.toRetryPolicy()
 
-        val providerHandler = providerManager.getProviderByType(provider)
+        // 界面上已有的译文要能被下一个候选替掉，所以记着当前推出去的是哪一段
+        var streamedText = ""
+        fun clearStreamedText() {
+            if (streamedText.isEmpty()) return
+            streamedText = ""
+            onStreamUpdate?.invoke("")
+        }
 
-        if (!ModelRegistry.QWEN_MT.match(model.modelId)) {
-            // Use regular translation with prompt
-            val prompt = settings.translatePrompt.applyPlaceholders(
-                "source_text" to sourceText,
-                "target_lang" to targetLanguage.toString(),
-            )
+        val translatedText = runWithModelFallback(
+            candidates = candidates,
+            onCandidateFailed = { failed, error ->
+                Log.w(TAG, "translateText: ${failed.modelId} failed", error)
+            },
+        ) { model ->
+            val provider = model.findProvider(settings.providers)
+                ?: return@runWithModelFallback null
+            val providerHandler = providerManager.getProviderByType(provider)
+            // 换候选前先清掉上一个留下的半截译文，不让新旧内容接在一起
+            clearStreamedText()
 
-            val messages = listOf(UIMessage.user(prompt))
-            providerHandler.generateTextWithModelTransport(
-                providerSetting = provider,
-                messages = messages,
-                params = TextGenerationParams(
-                    model = model,
-                    reasoningLevel = ReasoningLevel.fromBudgetTokens(settings.translateThinkingBudget),
-                ),
-                onUpdateMessages = { updatedMessages ->
-                    val translatedText = updatedMessages.lastOrNull()?.toText().orEmpty()
-                    if (translatedText.isNotBlank()) {
-                        onStreamUpdate?.invoke(translatedText)
-                        emit(translatedText)
-                    }
-                },
-            )
-        } else {
-            // Use Qwen MT model with special translation options
-            val messages = listOf(UIMessage.user(sourceText))
-            val resultMessages = providerHandler.generateTextWithModelTransport(
-                providerSetting = provider,
-                messages = messages,
-                params = TextGenerationParams(
-                    model = model,
-                    temperature = 0.3f,
-                    topP = 0.95f,
-                    customBody = listOf(
-                        CustomBody(
-                            key = "translation_options",
-                            value = buildJsonObject {
-                                put("source_lang", JsonPrimitive("auto"))
-                                put(
-                                    "target_lang",
-                                    JsonPrimitive(targetLanguage.getDisplayLanguage(Locale.ENGLISH))
-                                )
-                            }
+            if (!ModelRegistry.QWEN_MT.match(model.modelId)) {
+                // Use regular translation with prompt
+                val prompt = settings.translatePrompt.applyPlaceholders(
+                    "source_text" to sourceText,
+                    "target_lang" to targetLanguage.toString(),
+                )
+
+                val resultMessages = providerHandler.generateTextWithModelTransport(
+                    providerSetting = provider,
+                    messages = listOf(UIMessage.user(prompt)),
+                    params = TextGenerationParams(
+                        model = model,
+                        reasoningLevel = ReasoningLevel.fromBudgetTokens(settings.translateThinkingBudget),
+                    ),
+                    // 以空助手消息为基准：空回复时末条就是它，不会被当成译文
+                    responseMessages = listOf(UIMessage.assistant("")),
+                    retryPolicy = retryPolicy,
+                    onUpdateMessages = { updatedMessages ->
+                        val text = updatedMessages.lastOrNull()?.toText().orEmpty()
+                        streamedText = text
+                        onStreamUpdate?.invoke(text)
+                    },
+                )
+                resultMessages.lastOrNull()?.toText()?.takeIf { it.isNotBlank() }
+            } else {
+                // Use Qwen MT model with special translation options
+                val resultMessages = providerHandler.generateTextWithModelTransport(
+                    providerSetting = provider,
+                    messages = listOf(UIMessage.user(sourceText)),
+                    params = TextGenerationParams(
+                        model = model,
+                        temperature = 0.3f,
+                        topP = 0.95f,
+                        customBody = listOf(
+                            CustomBody(
+                                key = "translation_options",
+                                value = buildJsonObject {
+                                    put("source_lang", JsonPrimitive("auto"))
+                                    put(
+                                        "target_lang",
+                                        JsonPrimitive(targetLanguage.getDisplayLanguage(Locale.ENGLISH))
+                                    )
+                                }
+                            )
                         )
-                    )
-                ),
-            )
-            val translatedText = resultMessages.last().toText()
-
-            if (translatedText.isNotBlank()) {
-                onStreamUpdate?.invoke(translatedText)
-                emit(translatedText)
+                    ),
+                    responseMessages = listOf(UIMessage.assistant("")),
+                    retryPolicy = retryPolicy,
+                )
+                resultMessages.lastOrNull()?.toText()?.takeIf { it.isNotBlank() }
             }
         }
+
+        onStreamUpdate?.invoke(translatedText)
+        emit(translatedText)
     }.flowOn(Dispatchers.IO)
 }

@@ -1,16 +1,22 @@
 package me.rerere.rikkahub.ui.pages.setting
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.BottomAppBar
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LargeFlexibleTopAppBar
@@ -19,10 +25,14 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.nestedscroll.nestedScroll
@@ -135,6 +145,16 @@ private fun ModelSettingsPage(settings: Settings, vm: SettingVM, contentPadding:
             )
         }
         item {
+            FallbackModelSettingItem(
+                title = stringResource(R.string.setting_model_page_title_fallback),
+                description = stringResource(R.string.setting_model_page_fallback_desc),
+                primaryModelId = settings.titleModelId ?: settings.fastModelId,
+                fallbackModelIds = settings.titleFallbackModelIds,
+                providers = settings.providers,
+                onChange = { vm.updateSettings(settings.copy(titleFallbackModelIds = it)) },
+            )
+        }
+        item {
             SuggestionModelSettingItem(
                 settings = settings,
                 vm = vm,
@@ -147,6 +167,16 @@ private fun ModelSettingsPage(settings: Settings, vm: SettingVM, contentPadding:
                 modelId = settings.translateModeId,
                 providers = settings.providers,
                 onSelect = { vm.updateSettings(settings.copy(translateModeId = it.id)) },
+            )
+        }
+        item {
+            FallbackModelSettingItem(
+                title = stringResource(R.string.setting_model_page_translate_fallback),
+                description = stringResource(R.string.setting_model_page_fallback_desc),
+                primaryModelId = settings.translateModeId,
+                fallbackModelIds = settings.translateFallbackModelIds,
+                providers = settings.providers,
+                onChange = { vm.updateSettings(settings.copy(translateFallbackModelIds = it)) },
             )
         }
         item {
@@ -240,6 +270,133 @@ private fun SuggestionModelSettingItem(
     }
 
     ModelListSheet(state = state, onSelect = { vm.updateSettings(settings.copy(suggestionModelId = it.id)) })
+}
+
+@Composable
+private fun FallbackModelSettingItem(
+    title: String,
+    description: String,
+    primaryModelId: Uuid?,
+    fallbackModelIds: List<Uuid>,
+    providers: List<ProviderSetting>,
+    onChange: (List<Uuid>) -> Unit,
+) {
+    // 备用只从主模型所属的那个供应商里选；换了主模型之后，旧备用可能已经不在同一家
+    val candidates = remember(providers, primaryModelId) {
+        val owner = primaryModelId?.let { id ->
+            providers.firstOrNull { provider -> provider.models.any { it.id == id } }
+        }
+        owner?.models.orEmpty().filter { it.id != primaryModelId && it.type == ModelType.CHAT }
+    }
+    val effective = fallbackModelIds.filter { id -> candidates.any { it.id == id } }
+    var visible by remember { mutableStateOf(false) }
+
+    Column {
+        CardGroup(title = { Text(title) }) {
+            item(
+                onClick = { visible = true },
+                headlineContent = { Text(title) },
+                trailingContent = {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text(
+                            text = effective.joinToString(" → ") { id ->
+                                candidates.first { it.id == id }.let { it.displayName.ifBlank { it.modelId } }
+                            }.ifEmpty { stringResource(R.string.setting_model_page_fallback_empty) },
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Icon(
+                            HugeIcons.ArrowRight01,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
+                },
+            )
+        }
+        Text(
+            text = description,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
+        )
+    }
+
+    if (!visible) return
+
+    // 点一下加进队列，再点一下移出；顺序就是尝试顺序
+    AlertDialog(
+        onDismissRequest = { visible = false },
+        title = { Text(title) },
+        text = {
+            if (candidates.isEmpty()) {
+                Text(stringResource(R.string.setting_model_page_fallback_no_candidate))
+            } else {
+                LazyColumn(
+                    // 对话框内容必须给上界，否则惰性列表量不到高度
+                    modifier = Modifier.heightIn(max = 360.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    items(candidates, key = { it.id }) { model ->
+                        val order = effective.indexOf(model.id)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    onChange(
+                                        if (order >= 0) {
+                                            effective.filterNot { it == model.id }
+                                        } else {
+                                            effective + model.id
+                                        }
+                                    )
+                                },
+                        ) {
+                            Checkbox(checked = order >= 0, onCheckedChange = null)
+                            Column(modifier = Modifier.padding(start = 4.dp)) {
+                                Text(
+                                    text = model.displayName.ifBlank { model.modelId },
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                if (order >= 0) {
+                                    Text(
+                                        text = stringResource(
+                                            R.string.setting_model_page_fallback_order,
+                                            order + 1,
+                                        ),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { visible = false }) {
+                Text(stringResource(android.R.string.ok))
+            }
+        },
+        dismissButton = if (effective.isNotEmpty()) {
+            {
+                TextButton(onClick = { onChange(emptyList()) }) {
+                    Text(stringResource(R.string.setting_model_page_fallback_clear))
+                }
+            }
+        } else {
+            null
+        },
+    )
 }
 
 @Composable

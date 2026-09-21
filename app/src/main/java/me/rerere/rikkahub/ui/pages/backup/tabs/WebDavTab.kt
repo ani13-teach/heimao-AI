@@ -58,6 +58,7 @@ import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.datastore.WebDavConfig
 import me.rerere.rikkahub.data.workspace.BackupPasswordSlot
 import me.rerere.rikkahub.data.workspace.LegacyWorkspaceArchiveRequiresConfirmationException
+import me.rerere.rikkahub.data.workspace.WorkspaceArchivePasswordRequiredException
 import me.rerere.rikkahub.data.sync.webdav.WebDavBackupItem
 import me.rerere.rikkahub.ui.components.ui.CardGroup
 import me.rerere.rikkahub.ui.context.LocalToaster
@@ -95,12 +96,11 @@ fun WebDavTab(vm: BackupVM) {
         passwordAction = action
     }
 
-    fun startBackup(password: CharArray, rememberPassword: Boolean) {
+    fun startBackup() {
         scope.launch {
             isBackingUp = true
             try {
-                vm.backup(password)
-                if (rememberPassword) vm.rememberBackupPassword(BackupPasswordSlot.WEBDAV, password)
+                vm.backup()
                 vm.loadBackupFileItems()
                 toaster.show(
                     context.getString(R.string.backup_page_backup_success),
@@ -113,7 +113,6 @@ fun WebDavTab(vm: BackupVM) {
                     type = ToastType.Error,
                 )
             } finally {
-                password.fill('\u0000')
                 isBackingUp = false
             }
         }
@@ -121,16 +120,19 @@ fun WebDavTab(vm: BackupVM) {
 
     fun startRestore(
         item: WebDavBackupItem,
-        password: CharArray,
+        password: CharArray?,
         rememberPassword: Boolean,
         allowLegacy: Boolean,
     ) {
         scope.launch {
             restoringItemId = item.displayName
             var waitingForLegacyConfirmation = false
+            var waitingForPassword = false
             try {
                 vm.restore(item, password, allowLegacy)
-                if (rememberPassword) vm.rememberBackupPassword(BackupPasswordSlot.WEBDAV, password)
+                if (rememberPassword) {
+                    password?.let { vm.rememberBackupPassword(BackupPasswordSlot.WEBDAV, it) }
+                }
                 vm.restoreWarnings.value.takeIf { it.isNotEmpty() }?.let { warnings ->
                     toaster.show(warnings.joinToString("; "), type = ToastType.Warning)
                 }
@@ -139,6 +141,9 @@ fun WebDavTab(vm: BackupVM) {
                     type = ToastType.Success,
                 )
                 showBackupFiles = false
+            } catch (passwordRequired: WorkspaceArchivePasswordRequiredException) {
+                waitingForPassword = true
+                requestPassword(WebDavPasswordAction.Restore(item))
             } catch (legacy: LegacyWorkspaceArchiveRequiresConfirmationException) {
                 if (allowLegacy) throw legacy
                 waitingForLegacyConfirmation = true
@@ -151,7 +156,7 @@ fun WebDavTab(vm: BackupVM) {
                     type = ToastType.Error,
                 )
             } finally {
-                if (!waitingForLegacyConfirmation) password.fill('\u0000')
+                if (!waitingForLegacyConfirmation && !waitingForPassword) password?.fill('\u0000')
                 restoringItemId = null
             }
         }
@@ -190,7 +195,6 @@ fun WebDavTab(vm: BackupVM) {
                 passwordInitial = ""
                 if (!rememberPassword) vm.forgetBackupPassword(BackupPasswordSlot.WEBDAV)
                 when (action) {
-                    WebDavPasswordAction.Backup -> startBackup(password.toCharArray(), rememberPassword)
                     is WebDavPasswordAction.Restore -> startRestore(
                         item = action.item,
                         password = password.toCharArray(),
@@ -384,7 +388,7 @@ fun WebDavTab(vm: BackupVM) {
                 Text(stringResource(R.string.backup_page_restore))
             }
             Button(
-                onClick = { requestPassword(WebDavPasswordAction.Backup) },
+                onClick = { startBackup() },
 
                 enabled = !isBackingUp
             ) {
@@ -458,7 +462,12 @@ fun WebDavTab(vm: BackupVM) {
                                     }
                                 },
                                 onRestore = { restoreItem ->
-                                    requestPassword(WebDavPasswordAction.Restore(restoreItem))
+                                    startRestore(
+                                        item = restoreItem,
+                                        password = null,
+                                        rememberPassword = false,
+                                        allowLegacy = false,
+                                    )
                                 },
                             )
                         }
@@ -487,13 +496,12 @@ fun WebDavTab(vm: BackupVM) {
 }
 
 private sealed interface WebDavPasswordAction {
-    data object Backup : WebDavPasswordAction
     data class Restore(val item: WebDavBackupItem) : WebDavPasswordAction
 }
 
 private data class PendingWebDavLegacyRestore(
     val item: WebDavBackupItem,
-    val password: CharArray,
+    val password: CharArray?,
     val rememberPassword: Boolean,
 )
 
@@ -542,11 +550,7 @@ private fun WebDavBackupItemCard(
         item(
             headlineContent = {
                 Text(
-                    text = if (item.displayName.endsWith(".zip") && !item.displayName.endsWith(".zip.enc")) {
-                        stringResource(R.string.backup_page_legacy_label, item.displayName)
-                    } else {
-                        item.displayName
-                    },
+                    text = item.displayName,
                     style = MaterialTheme.typography.titleMedium
                 )
             },

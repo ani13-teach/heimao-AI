@@ -27,7 +27,7 @@ sealed interface ChatLogEntry {
     val timestamp: Long
 
     /** 错误类日志在「只记错误」等级下也会被记录。 */
-    val isError: Boolean get() = this is ToolFailure || this is Crash
+    val isError: Boolean get() = this is ToolFailure || this is MemoryFailure || this is Crash
 
     /**
      * 一次模型请求的 token 明细。缓存命中率不落盘，由 [cacheHitRate] 从下面的计数算出来，
@@ -61,6 +61,20 @@ sealed interface ChatLogEntry {
         val errorMessage: String,
         /** 上游返回的报错码，拿不到时为 null。 */
         val upstreamCode: String? = null,
+    ) : ChatLogEntry
+
+    /** 一次记忆工具（memory_tool / memory_read / memory_write / memory_consolidate）调用失败。 */
+    @Serializable
+    @SerialName("memory_failure")
+    data class MemoryFailure(
+        override val timestamp: Long,
+        val toolName: String,
+        /** 模型请求的动作（create/edit/replace/delete/archive…），拿不到时为 null。 */
+        val action: String? = null,
+        /** 涉及的记忆记录 id，拿不到时为 null。 */
+        val recordId: Int? = null,
+        val errorType: String,
+        val errorMessage: String,
     ) : ChatLogEntry
 
     /** 崩溃。由 CrashHandler 在崩溃线程上同步写入。 */
