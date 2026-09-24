@@ -33,6 +33,7 @@ import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import me.rerere.ai.provider.ModelType
@@ -152,16 +153,17 @@ internal fun AssistantBasicContent(
                     Text(stringResource(R.string.assistant_page_name))
                 },
                 modifier = Modifier.padding(8.dp),
-
-                ) {
+            ) {
+                // Keep the IME selection locally; persisted settings may echo an older name while typing.
+                var nameInput by remember(assistant.id) { mutableStateOf(TextFieldValue(assistant.name)) }
                 OutlinedTextField(
-                    value = assistant.name,
-                    onValueChange = {
-                        onUpdate(
-                            assistant.copy(
-                                name = it
-                            )
-                        )
+                    value = nameInput,
+                    onValueChange = { value ->
+                        val textChanged = value.text != nameInput.text
+                        nameInput = value
+                        if (textChanged) {
+                            onUpdate(assistant.copy(name = value.text))
+                        }
                     },
                     modifier = Modifier.fillMaxWidth()
                 )
