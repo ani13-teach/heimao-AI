@@ -12,6 +12,7 @@ import me.rerere.rikkahub.data.repository.FilesRepository
 import me.rerere.rikkahub.data.repository.GenMediaRepository
 import me.rerere.rikkahub.data.repository.MemoryRepository
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.rikkahub.data.workspace.WorkspaceAptExecutor
 import me.rerere.rikkahub.data.workspace.WorkspaceRuntimeCoordinator
 import me.rerere.rikkahub.data.workspace.RootfsPatchOptionsProvider
 import me.rerere.workspace.ProotShellRunner
@@ -77,8 +78,12 @@ val repositoryModule = module {
     }
 
     single {
-        WorkspaceRepository(get(), get(), get(), get(), get(), get(), get(), get())
+        WorkspaceRepository(get(), get(), get(), get(), get(), get(), get(), get(), get())
     }
+
+    // The plan service only needs the environment-side half of a plan; binding the interface keeps
+    // its constructor free of the whole repository and lets tests supply a fake executor.
+    single<WorkspaceAptExecutor> { get<WorkspaceRepository>() }
 
     single {
         FilesManager(get(), get(), get())

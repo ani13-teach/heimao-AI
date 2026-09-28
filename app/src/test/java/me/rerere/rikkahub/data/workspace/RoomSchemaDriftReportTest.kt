@@ -24,6 +24,28 @@ class RoomSchemaDriftReportTest {
     }
 
     @Test
+    fun `report renders the expectation the gate compared against`() {
+        val snapshot = roomSchema31ExpectedSnapshotForTest()
+        val report = roomSchemaDriftReport(
+            snapshot = snapshot,
+            difference = "workspace_apt_plans missing columns=[state]",
+            appVersion = "2.4.9",
+            appVersionCode = "176",
+            expectation = ROOM_SCHEMA_31_EXPECTATION,
+        )
+
+        assertTrue(report, report.contains("user_version=31 expected=31"))
+        assertTrue(
+            report,
+            report.contains(
+                "identity_hash=${ROOM_SCHEMA_31_IDENTITY_HASH} expected=${ROOM_SCHEMA_31_IDENTITY_HASH}",
+            ),
+        )
+        assertTrue(report, report.contains("table workspace_apt_plans"))
+        assertTrue(report, report.contains("index_workspace_apt_plans_conversation_id"))
+    }
+
+    @Test
     fun `report is truncated instead of unbounded`() {
         val snapshot = roomSchema30ExpectedSnapshotForTest()
         val report = roomSchemaDriftReport(

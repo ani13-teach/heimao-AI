@@ -3,7 +3,7 @@ package me.rerere.rikkahub.data.workspace
 import java.util.Locale
 
 /**
- * Acceptance rules for the database after Room has finished upgrading it to schema 30.
+ * The exported-schema contract a staged database has to match before it may be restored.
  *
  * Room's exported JSON describes entities and declared indexes, but it is not a dump of the
  * database that SQLite exposes at runtime. In particular, Room writes [room_master_table],
@@ -11,15 +11,52 @@ import java.util.Locale
  * table's shadow tables. The restore gate therefore validates the Room contract and the observed
  * SQLite-owned objects separately instead of comparing one synthetic sqlite_master set byte for
  * byte.
+ *
+ * [specification] is the accepted fixture for exactly one database version. The version and the
+ * identity hash are checked separately so a database that Room migrated to another version cannot
+ * pass the gate by carrying the right object set.
  */
+internal data class RoomSchemaExpectation(
+    val version: Int,
+    val identityHash: String,
+    val specification: RoomSchemaSnapshot,
+)
+
+/** The FTS5 declaration is unchanged since Room schema 29, so schema 30 and 31 share it. */
 internal fun roomSchema30MessageFtsSqlIsExact(sql: String?): Boolean =
     roomSchema29MessageFtsSqlIsExact(sql)
 
-internal fun roomSchema30IsExact(snapshot: RoomSchemaSnapshot): Boolean {
-    if (snapshot.userVersion != ROOM_SCHEMA_30_VERSION) return false
-    if (snapshot.identityHash.lowercase(Locale.ROOT) != ROOM_SCHEMA_30_IDENTITY_HASH) return false
+/** Exact acceptance gate for the database after Room has finished upgrading it to schema 30. */
+internal fun roomSchema30IsExact(snapshot: RoomSchemaSnapshot): Boolean =
+    roomSchemaIsExact(snapshot, ROOM_SCHEMA_30_EXPECTATION)
 
-    val specification = ROOM_SCHEMA_30_SPECIFICATION
+/**
+ * Name the concrete objects that make the gate reject [snapshot].
+ *
+ * A restored or upgraded device can hold objects that Room itself never inspects: an index an
+ * older release forgot to drop, a column a stale migration never removed, an FTS table rebuilt by
+ * another SQLite build. Rejecting such a database with only "is not exactly the expected Room
+ * schema" makes the failure undiagnosable on a device, so the gate reports what actually differs
+ * instead.
+ */
+internal fun describeRoomSchema30Difference(snapshot: RoomSchemaSnapshot): String =
+    describeRoomSchemaDifference(snapshot, ROOM_SCHEMA_30_EXPECTATION)
+
+/**
+ * Exact acceptance gate shared by every exported schema version, parameterised by the expected
+ * snapshot so that a new Room version only contributes its own specification instead of a second
+ * copy of these rules. The strictness is intentionally unchanged across versions: any missing or
+ * extra table, column, index, foreign key, schema object, or a non-exact FTS5 declaration is
+ * rejected.
+ */
+internal fun roomSchemaIsExact(
+    snapshot: RoomSchemaSnapshot,
+    expectation: RoomSchemaExpectation,
+): Boolean {
+    if (snapshot.userVersion != expectation.version) return false
+    if (snapshot.identityHash.lowercase(Locale.ROOT) != expectation.identityHash) return false
+
+    val specification = expectation.specification
     val expectedTables = specification.tables.associateBy { it.name }
     val actualTables = snapshot.tables.associateBy { it.name }
     if (actualTables.size != snapshot.tables.size || actualTables.keys != expectedTables.keys) return false
@@ -27,41 +64,37 @@ internal fun roomSchema30IsExact(snapshot: RoomSchemaSnapshot): Boolean {
     expectedTables.forEach { (name, expected) ->
         val actual = actualTables[name] ?: return false
         if (actual.columns.map { it.name }.toSet().size != actual.columns.size) return false
-        if (actual.columns.normalizedRoomSchema30Columns() != expected.columns.normalizedRoomSchema30Columns()) return false
+        if (actual.columns.normalizedRoomSchemaColumns() != expected.columns.normalizedRoomSchemaColumns()) return false
         if (
-            actual.foreignKeys.sortedWith(ROOM_SCHEMA_30_FOREIGN_KEY_ORDER) !=
-            expected.foreignKeys.sortedWith(ROOM_SCHEMA_30_FOREIGN_KEY_ORDER)
+            actual.foreignKeys.sortedWith(ROOM_SCHEMA_FOREIGN_KEY_ORDER) !=
+            expected.foreignKeys.sortedWith(ROOM_SCHEMA_FOREIGN_KEY_ORDER)
         ) {
             return false
         }
     }
 
-    val messageFtsSql = snapshot.sqliteMasterSql[ROOM_SCHEMA_30_FTS_TABLE]
+    val messageFtsSql = snapshot.sqliteMasterSql[ROOM_SCHEMA_FTS_TABLE]
     if (!roomSchema30MessageFtsSqlIsExact(messageFtsSql)) return false
-    if (!roomSchema30FtsShadowSqlIsExact(snapshot.sqliteMasterSql)) return false
-    if (!roomSchema30IndicesAreExact(snapshot.indices, specification.indices)) return false
-    return roomSchema30ObjectsAreSafe(snapshot, expectedTables.keys)
+    if (!roomSchemaFtsShadowSqlIsExact(snapshot.sqliteMasterSql)) return false
+    if (!roomSchemaIndicesAreExact(snapshot.indices, specification.indices)) return false
+    return roomSchemaObjectsAreSafe(snapshot, expectedTables.keys)
 }
 
-/**
- * Name the concrete objects that make [roomSchema30IsExact] reject [snapshot].
- *
- * A restored or upgraded device can hold objects that Room itself never inspects: an index an
- * older release forgot to drop, a column a stale migration never removed, an FTS table rebuilt by
- * another SQLite build. Rejecting such a database with only "is not exactly Room schema 30" makes
- * the failure undiagnosable on a device, so the gate reports what actually differs instead.
- */
-internal fun describeRoomSchema30Difference(snapshot: RoomSchemaSnapshot): String {
+/** Same rules as [roomSchemaIsExact], rendered as a human-readable difference list. */
+internal fun describeRoomSchemaDifference(
+    snapshot: RoomSchemaSnapshot,
+    expectation: RoomSchemaExpectation,
+): String {
     val differences = mutableListOf<String>()
-    if (snapshot.userVersion != ROOM_SCHEMA_30_VERSION) {
-        differences += "user_version=${snapshot.userVersion} (expected $ROOM_SCHEMA_30_VERSION)"
+    if (snapshot.userVersion != expectation.version) {
+        differences += "user_version=${snapshot.userVersion} (expected ${expectation.version})"
     }
     val identityHash = snapshot.identityHash.lowercase(Locale.ROOT)
-    if (identityHash != ROOM_SCHEMA_30_IDENTITY_HASH) {
-        differences += "room identity_hash=$identityHash (expected $ROOM_SCHEMA_30_IDENTITY_HASH)"
+    if (identityHash != expectation.identityHash) {
+        differences += "room identity_hash=$identityHash (expected ${expectation.identityHash})"
     }
 
-    val specification = ROOM_SCHEMA_30_SPECIFICATION
+    val specification = expectation.specification
     val expectedTables = specification.tables.associateBy { it.name }
     val actualTables = snapshot.tables.associateBy { it.name }
     if (actualTables.size != snapshot.tables.size) {
@@ -88,27 +121,27 @@ internal fun describeRoomSchema30Difference(snapshot: RoomSchemaSnapshot): Strin
         }
         expectedColumns.keys.intersect(actualColumns.keys)
             .filter {
-                expectedColumns.getValue(it).normalizedRoomSchema30Column() !=
-                    actualColumns.getValue(it).normalizedRoomSchema30Column()
+                expectedColumns.getValue(it).normalizedRoomSchemaColumn() !=
+                    actualColumns.getValue(it).normalizedRoomSchemaColumn()
             }
             .sorted()
             .map { "$it expected=${expectedColumns.getValue(it)} actual=${actualColumns.getValue(it)}" }
             .bounded()
             .let { if (it.isNotEmpty()) differences += "$name changed columns=$it" }
-        val expectedForeignKeys = expected.foreignKeys.sortedWith(ROOM_SCHEMA_30_FOREIGN_KEY_ORDER)
-        val actualForeignKeys = actual.foreignKeys.sortedWith(ROOM_SCHEMA_30_FOREIGN_KEY_ORDER)
+        val expectedForeignKeys = expected.foreignKeys.sortedWith(ROOM_SCHEMA_FOREIGN_KEY_ORDER)
+        val actualForeignKeys = actual.foreignKeys.sortedWith(ROOM_SCHEMA_FOREIGN_KEY_ORDER)
         if (expectedForeignKeys != actualForeignKeys) {
             differences += "$name foreign keys expected=$expectedForeignKeys actual=$actualForeignKeys"
         }
     }
 
-    val messageFtsSql = snapshot.sqliteMasterSql[ROOM_SCHEMA_30_FTS_TABLE]
+    val messageFtsSql = snapshot.sqliteMasterSql[ROOM_SCHEMA_FTS_TABLE]
     if (!roomSchema30MessageFtsSqlIsExact(messageFtsSql)) {
         differences += "message_fts SQL=${messageFtsSql?.replace(Regex("\\s+"), " ") ?: "missing"}"
     }
-    ROOM_SCHEMA_30_FTS_SHADOW_SQL.forEach { (name, expectedSql) ->
+    ROOM_SCHEMA_FTS_SHADOW_SQL.forEach { (name, expectedSql) ->
         val actualSql = snapshot.sqliteMasterSql[name]
-        if (normalizeRoomSchema30Sql(actualSql) != normalizeRoomSchema30Sql(expectedSql)) {
+        if (normalizeRoomSchemaSql(actualSql) != normalizeRoomSchemaSql(expectedSql)) {
             differences += "$name SQL=${actualSql?.replace(Regex("\\s+"), " ") ?: "missing"}"
         }
     }
@@ -121,7 +154,7 @@ internal fun describeRoomSchema30Difference(snapshot: RoomSchemaSnapshot): Strin
     snapshot.indices.forEach { actual ->
         if (actual.partial) unexpectedIndices += "${actual.name}(partial)"
         val match = specification.indices.indices.firstOrNull { index ->
-            !usedExpectedIndices[index] && roomSchema30IndexMatches(actual, specification.indices[index])
+            !usedExpectedIndices[index] && roomSchemaIndexMatches(actual, specification.indices[index])
         }
         if (match == null) {
             unexpectedIndices += "${actual.name} table=${actual.table} columns=${actual.columns}"
@@ -181,25 +214,30 @@ private fun List<*>.bounded(limit: Int = 6): List<String> =
 internal fun roomSchema30ExpectedSnapshotForTest(): RoomSchemaSnapshot {
     val specification = roomSchema29ExpectedSnapshotForTest()
     return specification.copy(
-        sqliteMasterSql = specification.sqliteMasterSql + ROOM_SCHEMA_30_FTS_SHADOW_SQL,
+        sqliteMasterSql = specification.sqliteMasterSql + ROOM_SCHEMA_FTS_SHADOW_SQL,
     )
 }
 
 internal const val ROOM_SCHEMA_30_VERSION = 30
 internal const val ROOM_SCHEMA_30_IDENTITY_HASH = "3979b81ecdae08bd3d51457e69ba2b2b"
-private const val ROOM_SCHEMA_30_FTS_TABLE = "message_fts"
 
-private val ROOM_SCHEMA_30_SPECIFICATION: RoomSchemaSnapshot by lazy {
-    roomSchema29ExpectedSnapshotForTest()
+internal val ROOM_SCHEMA_30_EXPECTATION: RoomSchemaExpectation by lazy {
+    RoomSchemaExpectation(
+        version = ROOM_SCHEMA_30_VERSION,
+        identityHash = ROOM_SCHEMA_30_IDENTITY_HASH,
+        specification = roomSchema30ExpectedSnapshotForTest(),
+    )
 }
 
-private val ROOM_SCHEMA_30_FOREIGN_KEY_ORDER = compareBy<RoomSchemaForeignKeySnapshot>(
+private const val ROOM_SCHEMA_FTS_TABLE = "message_fts"
+
+private val ROOM_SCHEMA_FOREIGN_KEY_ORDER = compareBy<RoomSchemaForeignKeySnapshot>(
     { it.table },
     { it.columns.joinToString("\u0000") },
     { it.referencedColumns.joinToString("\u0000") },
 )
 
-private val ROOM_SCHEMA_30_FTS_SHADOW_SQL = mapOf(
+private val ROOM_SCHEMA_FTS_SHADOW_SQL = mapOf(
     "message_fts_config" to "CREATE TABLE 'message_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID",
     "message_fts_content" to "CREATE TABLE 'message_fts_content'(id INTEGER PRIMARY KEY, c0, c1, c2, c3, c4, c5)",
     "message_fts_data" to "CREATE TABLE 'message_fts_data'(id INTEGER PRIMARY KEY, block BLOB)",
@@ -207,12 +245,12 @@ private val ROOM_SCHEMA_30_FTS_SHADOW_SQL = mapOf(
     "message_fts_idx" to "CREATE TABLE 'message_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID",
 )
 
-private fun roomSchema30FtsShadowSqlIsExact(sqlByName: Map<String, String?>): Boolean =
-    ROOM_SCHEMA_30_FTS_SHADOW_SQL.all { (name, expectedSql) ->
-        normalizeRoomSchema30Sql(sqlByName[name]) == normalizeRoomSchema30Sql(expectedSql)
+private fun roomSchemaFtsShadowSqlIsExact(sqlByName: Map<String, String?>): Boolean =
+    ROOM_SCHEMA_FTS_SHADOW_SQL.all { (name, expectedSql) ->
+        normalizeRoomSchemaSql(sqlByName[name]) == normalizeRoomSchemaSql(expectedSql)
     }
 
-private fun normalizeRoomSchema30Sql(sql: String?): String? =
+private fun normalizeRoomSchemaSql(sql: String?): String? =
     sql
         ?.lowercase(Locale.ROOT)
         ?.replace(Regex("[\\s`\"'\\[\\]]"), "")
@@ -227,13 +265,13 @@ private fun normalizeRoomSchema30Sql(sql: String?): String? =
  * that upgrade keeps the word NULL while a freshly created one reports no default. The two behave
  * identically and Room's runtime validation accepts both, so the gate must not reject one of them.
  */
-private fun RoomSchemaColumnSnapshot.normalizedRoomSchema30Column(): RoomSchemaColumnSnapshot =
+private fun RoomSchemaColumnSnapshot.normalizedRoomSchemaColumn(): RoomSchemaColumnSnapshot =
     copy(defaultValue = defaultValue?.takeIf { !it.equals("NULL", ignoreCase = true) })
 
-private fun List<RoomSchemaColumnSnapshot>.normalizedRoomSchema30Columns(): List<RoomSchemaColumnSnapshot> =
-    map { it.normalizedRoomSchema30Column() }.sortedBy { it.name }
+private fun List<RoomSchemaColumnSnapshot>.normalizedRoomSchemaColumns(): List<RoomSchemaColumnSnapshot> =
+    map { it.normalizedRoomSchemaColumn() }.sortedBy { it.name }
 
-private fun roomSchema30IndicesAreExact(
+private fun roomSchemaIndicesAreExact(
     actual: List<RoomSchemaIndexSnapshot>,
     expected: List<RoomSchemaIndexSnapshot>,
 ): Boolean {
@@ -244,14 +282,14 @@ private fun roomSchema30IndicesAreExact(
     actual.forEach { actualIndex ->
         val match = expected.indices.firstOrNull { expectedIndex ->
             !usedExpected[expectedIndex] &&
-                roomSchema30IndexMatches(actualIndex, expected[expectedIndex])
+                roomSchemaIndexMatches(actualIndex, expected[expectedIndex])
         } ?: return false
         usedExpected[match] = true
     }
     return usedExpected.all { it }
 }
 
-private fun roomSchema30IndexMatches(
+private fun roomSchemaIndexMatches(
     actual: RoomSchemaIndexSnapshot,
     expected: RoomSchemaIndexSnapshot,
 ): Boolean {
@@ -275,7 +313,7 @@ private fun roomSchema30IndexMatches(
     return actual.origin.isEmpty() || actual.origin == expected.origin
 }
 
-private fun roomSchema30ObjectsAreSafe(
+private fun roomSchemaObjectsAreSafe(
     snapshot: RoomSchemaSnapshot,
     expectedTableNames: Set<String>,
 ): Boolean {

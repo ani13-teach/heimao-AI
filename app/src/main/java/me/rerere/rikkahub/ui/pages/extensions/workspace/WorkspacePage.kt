@@ -59,6 +59,7 @@ import org.koin.androidx.compose.koinViewModel
 fun WorkspacePage(vm: WorkspaceVM = koinViewModel()) {
     val navController = LocalNavController.current
     val workspaces by vm.workspaces.collectAsStateWithLifecycle()
+    val deleteFailure by vm.deleteFailure.collectAsStateWithLifecycle()
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
     var showAddDialog by rememberSaveable { mutableStateOf(false) }
     var editTarget by remember { mutableStateOf<WorkspaceEntity?>(null) }
@@ -125,6 +126,24 @@ fun WorkspacePage(vm: WorkspaceVM = koinViewModel()) {
             onConfirm = { name ->
                 vm.rename(workspace, name)
                 editTarget = null
+            },
+        )
+    }
+
+    deleteFailure?.let { failure ->
+        AlertDialog(
+            onDismissRequest = vm::dismissDeleteFailure,
+            title = { Text(stringResource(R.string.workspace_page_delete_failed)) },
+            text = {
+                Text(stringResource(
+                    if (failure == WorkspaceDeleteFailure.BUSY) R.string.workspace_page_delete_busy
+                    else R.string.workspace_page_delete_error
+                ))
+            },
+            confirmButton = {
+                TextButton(onClick = vm::dismissDeleteFailure) {
+                    Text(stringResource(R.string.common_confirm))
+                }
             },
         )
     }

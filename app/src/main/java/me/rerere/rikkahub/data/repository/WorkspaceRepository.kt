@@ -17,8 +17,11 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import me.rerere.rikkahub.data.db.dao.WorkspaceAuditDAO
+import me.rerere.rikkahub.data.db.dao.WorkspaceAptPlanDAO
 import me.rerere.rikkahub.data.db.dao.WorkspaceDAO
 import me.rerere.rikkahub.data.db.entity.WorkspaceAuditEvent
+import me.rerere.rikkahub.data.db.entity.WorkspaceAptPlanState
+import me.rerere.rikkahub.data.db.entity.WorkspaceAptPlanEntity
 import me.rerere.rikkahub.data.db.entity.WorkspaceEntity
 import me.rerere.rikkahub.data.model.redactWorkspaceUrl
 import me.rerere.rikkahub.data.model.toWorkspaceRuntimeMetadata
@@ -31,6 +34,17 @@ import me.rerere.rikkahub.data.workspace.WorkspaceEnvironmentLayout
 import me.rerere.rikkahub.data.workspace.WorkspaceEnvironmentProjection
 import me.rerere.rikkahub.data.workspace.WorkspaceEnvironmentRecovery
 import me.rerere.rikkahub.data.workspace.WorkspaceEnvironmentSelection
+import me.rerere.rikkahub.data.workspace.WorkspaceAptExecutionReport
+import me.rerere.rikkahub.data.workspace.WorkspaceAptExecutor
+import me.rerere.rikkahub.data.workspace.WorkspaceAptRequest
+import me.rerere.rikkahub.data.workspace.WorkspaceAptSimulation
+import me.rerere.rikkahub.data.workspace.WorkspaceAptSimulationResult
+import me.rerere.rikkahub.data.workspace.APT_GET_GUEST_PATH
+import me.rerere.rikkahub.data.workspace.parseSimulation
+import me.rerere.rikkahub.data.workspace.requireExecutionArgv
+import me.rerere.rikkahub.data.workspace.fingerprint
+import me.rerere.rikkahub.data.workspace.sharedAptFingerprint
+import me.rerere.rikkahub.data.workspace.terminalPlanState
 import me.rerere.rikkahub.data.workspace.RootfsPatchOptionsProvider
 import me.rerere.rikkahub.data.workspace.WorkspaceMaintenanceLease
 import me.rerere.rikkahub.data.workspace.WorkspaceRuntimeCoordinator
@@ -64,12 +78,13 @@ class WorkspaceRepository(
     private val rootfsInstaller: RootfsInstaller,
     private val assistantWorkspaceBindingCoordinator: AssistantWorkspaceBindingCoordinator,
     private val auditDao: WorkspaceAuditDAO,
+    private val workspaceAptPlanDao: WorkspaceAptPlanDAO,
     private val workspaceCatalogMutationLock: WorkspaceCatalogMutationLock,
     private val workspaceRuntimeCoordinator: WorkspaceRuntimeCoordinator = WorkspaceRuntimeCoordinator(),
     private val rootfsPatchOptionsProvider: RootfsPatchOptionsProvider = RootfsPatchOptionsProvider {
         me.rerere.workspace.RootfsPatchOptions()
     },
-) {
+) : WorkspaceAptExecutor {
     private val rootfsOperationLocks = ConcurrentHashMap<String, Mutex>()
 
     /**
@@ -89,6 +104,19 @@ class WorkspaceRepository(
 
     /** Set when startup recovery failed even if the journal itself cannot be read. */
     private val sharedEnvironmentRecoveryFailed = AtomicBoolean(false)
+
+    /**
+     * Set while an unfinished public apt plan keeps the shared environment fail-closed. Derived from
+     * the plan table at startup and after every execution, never from "the process is probably
+     * gone".
+     */
+    private val sharedAptSessionsBlocked = AtomicBoolean(false)
+
+    /**
+     * Set while a public apt process may still be alive (`EXECUTING` / `UNKNOWN`). Even the recovery
+     * restore has to wait, because a live process still holds the rootfs files it opened.
+     */
+    private val sharedAptProcessMayBeAlive = AtomicBoolean(false)
 
     /** Workspace root hosting the open public maintenance terminal, if any. */
     private val maintenanceAnchorRoot = AtomicReference<String?>(null)
@@ -382,6 +410,7 @@ class WorkspaceRepository(
                 url = url,
                 onProgress = onProgress,
                 expectedSha256 = expectedSha256,
+                requireSafeToInstall = ::requireSharedAptSessionsAllowed,
             )
         }
         sharedEnvironmentRecoveryFailed.set(false)
@@ -596,8 +625,8 @@ class WorkspaceRepository(
     )
 
     /**
-     * Unified AI workspace shell. PRoot's root is the current workspace's private Linux Rootfs;
-     * it is not Android host-root access and has no external app mounts.
+     * AI shell: private workspaces get their development Rootfs; shared workspaces get only
+     * the files-area sandbox. Never execute arbitrary AI commands against the shared Rootfs.
      */
     suspend fun executeAiPackageCommand(
         id: String,
@@ -654,7 +683,8 @@ class WorkspaceRepository(
     suspend fun switchToShared(id: String): Boolean = withWorkspaceCatalogArchiveLock {
         val workspace = dao.getById(id) ?: return@withWorkspaceCatalogArchiveLock false
         if (isSharedWorkspace(workspace)) return@withWorkspaceCatalogArchiveLock true
-        acquireWorkspaceLease(id, exclusive = true, environmentAware = true).use {
+        workspaceRuntimeCoordinator.acquireExclusiveLease(id, WorkspaceRuntimeGates.SHARED_ENVIRONMENT).use {
+            requireSharedAptSessionsAllowed()
             rootfsOperationLock(id).withLock {
                 withContext(Dispatchers.IO) { manager.environments.selectShared(workspace.root) }
                 environmentChanged()
@@ -702,11 +732,17 @@ class WorkspaceRepository(
 
     /** Rebuilds the shared rootfs from the retained recovery snapshot. */
     suspend fun restoreSharedRecovery(): Boolean = withWorkspaceCatalogArchiveLock {
+        requireSharedAptRecoveryAllowed()
         workspaceRuntimeCoordinator
             .acquireEnvironmentExclusiveLease(WorkspaceRuntimeGates.SHARED_ENVIRONMENT)
             .use {
+                requireSharedAptRecoveryAllowed()
                 withContext(Dispatchers.IO) { environmentMaintenance.restoreRecovery() }.also { restored ->
-                    if (restored) sharedEnvironmentRecoveryFailed.set(false)
+                    if (restored) {
+                        sharedEnvironmentRecoveryFailed.set(false)
+                        workspaceAptPlanDao.markRecoveryRestored()
+                        refreshSharedAptGate()
+                    }
                     environmentChanged()
                 }
             }
@@ -778,6 +814,222 @@ class WorkspaceRepository(
         }
 
     /**
+     * Re-derives the shared-environment apt gate from the persisted plans.
+     *
+     * Called at startup before any session can start and after every execution attempt. A plan table
+     * that cannot be read is not proof the environment is safe, so an unreadable table fails closed
+     * as well. The gate is only ever cleared by what is actually persisted, never by assuming a
+     * process has already gone away.
+     *
+     * @return true when the shared environment is fail-closed.
+     */
+    suspend fun refreshSharedAptGate(): Boolean {
+        val blocking = try {
+            workspaceAptPlanDao.getBlockingPlans()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            Log.e(TAG, "Unable to read unfinished public apt plans; failing closed", error)
+            sharedAptSessionsBlocked.set(true)
+            sharedAptProcessMayBeAlive.set(true)
+            return true
+        }
+        sharedAptSessionsBlocked.set(blocking.isNotEmpty())
+        sharedAptProcessMayBeAlive.set(blocking.any { indicatesLiveAptProcess(it.state) })
+        return sharedAptSessionsBlocked.get()
+    }
+
+    /** Unfinished apt plans are visible even when the environment is blocked. */
+    suspend fun blockingSharedAptPlans(): List<WorkspaceAptPlanEntity> = workspaceAptPlanDao.getBlockingPlans()
+
+    /** Only a human operator may attest that an unconfirmed apt process is no longer running. */
+    suspend fun acknowledgeAptProcessStopped(planId: String, operationId: String) {
+        require(planId.isNotBlank() && operationId.isNotBlank()) { "An apt operation is required" }
+        workspaceRuntimeCoordinator.acquireEnvironmentExclusiveLease(
+            WorkspaceRuntimeGates.SHARED_ENVIRONMENT,
+            maintenance = true,
+        ).use {
+            check(workspaceAptPlanDao.markProcessStopped(planId, operationId) == 1) {
+                "This public apt operation is no longer awaiting process verification"
+            }
+            refreshSharedAptGate()
+        }
+    }
+
+    /** True while an unfinished public apt plan keeps the shared environment fail-closed. */
+    val isSharedAptBlocked: Boolean get() = sharedAptSessionsBlocked.get()
+
+    private fun requireSharedAptSessionsAllowed() {
+        check(!sharedAptSessionsBlocked.get()) {
+            "Shared Linux environment is blocked by an unfinished public apt plan; recover it first"
+        }
+    }
+
+    private fun requireSharedAptRecoveryAllowed() {
+        check(!sharedAptProcessMayBeAlive.get()) {
+            "A public apt process may still be running; confirm it stopped before restoring the environment"
+        }
+    }
+
+    private fun indicatesLiveAptProcess(state: String): Boolean =
+        state == WorkspaceAptPlanState.EXECUTING || state == WorkspaceAptPlanState.UNKNOWN
+
+    /**
+     * Simulate a strictly structured apt request against the shared rootfs. The exclusive lease
+     * makes both the input fingerprint and the resolver output a consistent read. No model-supplied
+     * shell text reaches the runner, and a process with unconfirmed exit retains its lease.
+     */
+    override suspend fun simulateSharedApt(
+        workspaceId: String,
+        request: WorkspaceAptRequest,
+    ): Pair<String, WorkspaceAptSimulation> {
+        return rootfsOperationLock(workspaceId).withLock {
+            val workspace = dao.getById(workspaceId) ?: error("Workspace not found: $workspaceId")
+            require(isSharedWorkspace(workspace)) { "A public apt plan requires a shared workspace" }
+            val lease = workspaceRuntimeCoordinator.acquireEnvironmentExclusiveLease(
+                WorkspaceRuntimeGates.SHARED_ENVIRONMENT,
+            )
+            val ownership = WorkspaceCommandLeaseOwnership(
+                release = lease::close,
+                retain = { reason -> retainProcessLease(workspaceId, lease, reason) },
+            )
+            try {
+                requireSharedEnvironmentRunnable()
+                val rootfs = environmentMaintenance.sharedLinuxDir
+                val before = withContext(Dispatchers.IO) { sharedAptFingerprint(rootfs) }
+                val argv = listOf(APT_GET_GUEST_PATH) + request.command().drop(1)
+                val result = runObservedWorkspaceCommand(Dispatchers.IO, ownership) {
+                    manager.executeApt(
+                        sharedAptContext(workspace.root, SHARED_APT_SIMULATION_TIMEOUT_MILLIS),
+                        argv,
+                    )
+                }
+                check(!result.terminationPending) { "The apt simulation process has not exited" }
+                val after = withContext(Dispatchers.IO) { sharedAptFingerprint(rootfs) }
+                check(before == after) { "Public environment changed while planning; retry" }
+                before to request.parseSimulation(result.toAptSimulationResult())
+            } finally {
+                ownership.closeIfOwned()
+            }
+        }
+    }
+
+    /**
+     * Re-validates a confirmed public apt plan and runs it under one exclusive shared-environment
+     * lease (see [WorkspaceAptExecutor.executeSharedAptPlan]).
+     *
+     * The simulation argv and the execution argv are both built from the validated request, never
+     * from model text. A fingerprint that no longer matches the confirmed plan refuses the run
+     * before `EXECUTING` is persisted, so the fixed argv only ever runs when it still describes
+     * exactly what the user confirmed.
+     */
+    override suspend fun executeSharedAptPlan(
+        workspaceId: String,
+        request: WorkspaceAptRequest,
+        expectedBaseFingerprint: String,
+        expectedPlanFingerprint: String,
+        operationId: String,
+        persistExecuting: suspend (operationId: String) -> Boolean,
+        persistTerminal: suspend (state: String) -> Unit,
+    ): WorkspaceAptExecutionReport = rootfsOperationLock(workspaceId).withLock {
+        val workspace = dao.getById(workspaceId) ?: error("Workspace not found: $workspaceId")
+        require(isSharedWorkspace(workspace)) { "A public apt plan requires a shared workspace" }
+        val executionArgv = request.executionCommand().also(::requireExecutionArgv)
+        val lease = workspaceRuntimeCoordinator.acquireEnvironmentExclusiveLease(
+            WorkspaceRuntimeGates.SHARED_ENVIRONMENT,
+        )
+        val ownership = WorkspaceCommandLeaseOwnership(
+            release = lease::close,
+            retain = { reason -> retainProcessLease(workspaceId, lease, reason) },
+        )
+        try {
+            requireSharedEnvironmentRunnable()
+            val rootfs = environmentMaintenance.sharedLinuxDir
+            val before = withContext(Dispatchers.IO) { sharedAptFingerprint(rootfs) }
+            require(before == expectedBaseFingerprint) {
+                "The public environment changed since the plan was made; create a new plan"
+            }
+            val simulation = runObservedWorkspaceCommand(Dispatchers.IO, ownership) {
+                manager.executeApt(
+                    sharedAptContext(workspace.root, SHARED_APT_SIMULATION_TIMEOUT_MILLIS),
+                    listOf(APT_GET_GUEST_PATH) + request.command().drop(1),
+                )
+            }
+            if (simulation.terminationPending) {
+                // The simulation process is not confirmed gone. Never continue into a real change;
+                // ownership already retained the lease for this result, so it stays occupied.
+                return@withLock WorkspaceAptExecutionReport.Rejected(
+                    "The apt simulation process has not exited",
+                )
+            }
+            val after = withContext(Dispatchers.IO) { sharedAptFingerprint(rootfs) }
+            require(before == after) { "The public environment changed while revalidating; retry" }
+            val remaining = request.parseSimulation(simulation.toAptSimulationResult())
+            require(remaining.fingerprint(before) == expectedPlanFingerprint) {
+                "The apt plan changed since it was confirmed; create a new plan"
+            }
+            check(withContext(Dispatchers.IO) { environmentMaintenance.snapshotRecovery() }) {
+                "Cannot execute apt without a fresh public environment recovery point"
+            }
+            if (!persistExecuting(operationId)) {
+                return@withLock WorkspaceAptExecutionReport.Rejected(
+                    "The apt plan is no longer ready to execute",
+                )
+            }
+            // A terminal-state write failure must never reopen the shared environment.
+            sharedAptSessionsBlocked.set(true)
+            sharedAptProcessMayBeAlive.set(true)
+            val result = try {
+                runObservedWorkspaceCommand(Dispatchers.IO, ownership) {
+                    manager.executeApt(
+                        sharedAptContext(workspace.root, SHARED_APT_EXECUTION_TIMEOUT_MILLIS),
+                        executionArgv,
+                    )
+                }
+            } catch (error: Throwable) {
+                // A runner failure is only "unknown" when the timed-out process could not be
+                // confirmed dead. Otherwise apt definitely ran and its failure needs the retained
+                // recovery snapshot. Either way the state is persisted before the error escapes.
+                val state = aptFailureState(ownership, error)
+                withContext(NonCancellable) {
+                    persistTerminal(state)
+                    refreshSharedAptGate()
+                }
+                throw error
+            }
+            val report = if (result.terminationPending) {
+                WorkspaceAptExecutionReport.ExitUnknown
+            } else if (result.timedOut) {
+                WorkspaceAptExecutionReport.Exited(-1)
+            } else {
+                WorkspaceAptExecutionReport.Exited(result.exitCode)
+            }
+            withContext(NonCancellable) {
+                persistTerminal(report.terminalPlanState())
+                refreshSharedAptGate()
+            }
+            report
+        } finally {
+            ownership.closeIfOwned()
+        }
+    }
+
+    /** The package-mode context apt runs in: the shared rootfs, never patched, workspace-local HOME. */
+    private fun sharedAptContext(anchor: String, timeoutMillis: Long): WorkspaceShellContext =
+        maintenanceShellContext(anchor).copy(
+            accessMode = WorkspaceShellAccessMode.WORKSPACE_PACKAGE,
+            timeoutMillis = timeoutMillis,
+        )
+
+    private fun WorkspaceCommandResult.toAptSimulationResult() = WorkspaceAptSimulationResult(
+        exitCode = exitCode,
+        timedOut = timedOut,
+        truncated = truncated,
+        stdout = stdout,
+        stderr = stderr,
+    )
+
+    /**
      * Opens the public-environment maintenance terminal for [id].
      *
      * The order is deliberate: the exclusive environment lease is taken first, then the recovery
@@ -789,6 +1041,7 @@ class WorkspaceRepository(
      * is idempotent, so a composition cleanup may call it safely.
      */
     suspend fun acquireMaintenanceTerminal(id: String): WorkspaceMaintenanceLease {
+        requireSharedAptRecoveryAllowed()
         val acquiredLease = AtomicReference<WorkspaceRuntimeLease?>(null)
         try {
             val session = withContext(Dispatchers.IO) {
@@ -802,6 +1055,7 @@ class WorkspaceRepository(
                         maintenance = true,
                     )
                     acquiredLease.set(lease)
+                    requireSharedAptSessionsAllowed()
                     environmentMaintenance.snapshotRecovery()
                     manager.ensureWorkspaceFiles(workspace.root)
                     WorkspaceMaintenanceLease(
@@ -891,7 +1145,10 @@ class WorkspaceRepository(
     suspend fun <T> withEnvironmentArchiveLease(
         waitForIdleMillis: Long = 0L,
         block: suspend () -> T,
-    ): T = workspaceRuntimeCoordinator.withEnvironmentArchiveLease(waitForIdleMillis, block)
+    ): T = workspaceRuntimeCoordinator.withEnvironmentArchiveLease(waitForIdleMillis) {
+        requireSharedAptSessionsAllowed()
+        block()
+    }
 
     private fun environmentSelectionOf(workspace: WorkspaceEntity): WorkspaceEnvironmentSelection {
         val shared = isSharedWorkspace(workspace)
@@ -977,7 +1234,11 @@ class WorkspaceRepository(
                         cwd = cwd,
                         timeoutMillis = timeoutMillis,
                         stdin = stdin,
-                        accessMode = accessMode,
+                        accessMode = if (accessMode == WorkspaceShellAccessMode.WORKSPACE_PACKAGE) {
+                            manager.aiShellAccessMode(workspace.root)
+                        } else {
+                            accessMode
+                        },
                     )
                 }
             }
@@ -1039,6 +1300,8 @@ class WorkspaceRepository(
         }
         if (requireRunnableSharedEnvironment && environmentKey != null) {
             requireSharedEnvironmentRunnable()
+        } else if (environmentKey != null) {
+            requireSharedAptSessionsAllowed()
         }
         return if (exclusive) {
             workspaceRuntimeCoordinator.acquireExclusiveLease(id, environmentKey)
@@ -1048,6 +1311,7 @@ class WorkspaceRepository(
     }
 
     private fun requireSharedEnvironmentRunnable() {
+        requireSharedAptSessionsAllowed()
         check(!sharedEnvironmentRecoveryFailed.get()) {
             "Shared Linux environment recovery failed; retry recovery before starting a session"
         }
@@ -1144,6 +1408,12 @@ class WorkspaceRepository(
         private const val MAX_PREVIEW_BYTES = 512L * 1024
         private const val DEFAULT_AUDIT_LIMIT = 50
         private const val MAX_AUDIT_LIMIT = 200
+
+        /** The simulated resolver read is bounded; it never changes the rootfs. */
+        private const val SHARED_APT_SIMULATION_TIMEOUT_MILLIS = 120_000L
+
+        /** A real package change can legitimately take much longer than a simulation. */
+        private const val SHARED_APT_EXECUTION_TIMEOUT_MILLIS = 15 * 60 * 1_000L
     }
 }
 
@@ -1203,15 +1473,20 @@ internal class WorkspaceCommandLeaseOwnership(
     private val retain: (String) -> Unit,
 ) {
     private val retained = AtomicBoolean(false)
+    private val unconfirmedExit = AtomicBoolean(false)
+
+    val exitUnconfirmed: Boolean get() = unconfirmedExit.get()
 
     fun observeResult(result: WorkspaceCommandResult) {
         if (result.terminationPending) {
+            unconfirmedExit.set(true)
             retainOnce("the timed-out process could not be confirmed gone")
         }
     }
 
     fun observeFailure(error: Throwable) {
         if (isUnconfirmedProcessExit(error)) {
+            unconfirmedExit.set(true)
             retainOnce(error.message.orEmpty())
         }
     }
@@ -1224,6 +1499,13 @@ internal class WorkspaceCommandLeaseOwnership(
         if (retained.compareAndSet(false, true)) retain(reason)
     }
 }
+
+internal fun aptFailureState(ownership: WorkspaceCommandLeaseOwnership, error: Throwable): String =
+    if (ownership.exitUnconfirmed || isUnconfirmedProcessExit(error)) {
+        WorkspaceAptPlanState.UNKNOWN
+    } else {
+        WorkspaceAptPlanState.RECOVERY_REQUIRED
+    }
 
 /**
  * True when a shell failure means a timed-out process could not be confirmed dead.

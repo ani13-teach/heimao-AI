@@ -249,6 +249,12 @@
   <string name="chat_message_add_favorite">Add Favorite</string>
   <string name="chat_message_remove_favorite">Remove Favorite</string>
   <string name="chat_message_tool_approve">Approve</string>
+  <string name="workspace_apt_confirm_title">Confirm public package changes</string>
+  <string name="workspace_apt_confirm_warning">These package changes affect every workspace using the public Linux environment. A recovery point will be created before execution.</string>
+  <string name="workspace_apt_plan_unavailable">Plan unavailable or expired. Request a new simulation.</string>
+  <string name="workspace_apt_blocked">Public packages need attention. A running or interrupted apt operation blocks this environment; do not restore while a process may still be running.</string>
+  <string name="workspace_apt_process_stopped">I verified apt has stopped</string>
+  <string name="workspace_apt_process_stopped_confirm">Only confirm after independently verifying that the apt/PRoot process for operation %1$s is no longer running. This does not restore packages. The environment stays blocked until you restore its recovery point.</string>
   <string name="chat_message_tool_ask_questions">Ask %d questions</string>
   <string name="chat_message_tool_call_generic">Called tool %1$s</string>
   <string name="chat_message_tool_call_label">Called tool %1$s</string>
@@ -1038,6 +1044,9 @@
   <string name="workspace_page_rename">Rename Workspace</string>
   <string name="workspace_page_delete">Delete Workspace</string>
   <string name="workspace_page_delete_confirm">This will delete workspace metadata and local files, and clear all Assistant bindings referencing it.</string>
+  <string name="workspace_page_delete_failed">Could not delete workspace</string>
+  <string name="workspace_page_delete_busy">This workspace is in use. Stop its running sessions and try again.</string>
+  <string name="workspace_page_delete_error">Deletion failed. Check whether the workspace is still listed before trying again.</string>
   <string name="workspace_page_empty">No workspaces yet</string>
   <string name="workspace_page_empty_desc">Create one to use file tools and sandbox environments</string>
   <string name="workspace_page_name">Name</string>

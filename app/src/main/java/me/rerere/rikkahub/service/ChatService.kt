@@ -32,6 +32,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.core.Tool
@@ -97,6 +99,7 @@ import me.rerere.rikkahub.data.repository.MemoryRepository
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
 import me.rerere.rikkahub.data.workspace.AssistantWorkspaceAccessGate
 import me.rerere.rikkahub.data.workspace.AssistantWorkspaceSessionInvalidator
+import me.rerere.rikkahub.data.workspace.WorkspaceAptPlanService
 import me.rerere.rikkahub.data.summary.buildConversationSummarySource
 import me.rerere.rikkahub.data.summary.splitConversationSummarySource
 import me.rerere.rikkahub.data.summary.toSummarySource
@@ -242,6 +245,7 @@ class ChatService(
     private val filesManager: FilesManager,
     private val skillManager: SkillManager,
     private val workspaceRepository: WorkspaceRepository,
+    private val workspaceAptPlanService: WorkspaceAptPlanService,
     private val folderRepository: FolderRepository,
     private val workspaceAccessGate: AssistantWorkspaceAccessGate,
     private val workspaceSessionInvalidator: AssistantWorkspaceSessionInvalidator,
@@ -695,6 +699,28 @@ class ChatService(
         ) {
             try {
                 val conversation = session.state.value
+                val matching = conversation.messageNodes.flatMap { it.currentMessage.parts }
+                    .filterIsInstance<UIMessagePart.Tool>()
+                    .singleOrNull { it.toolCallId == toolCallId && it.isPending }
+                    ?: error("No pending tool call matches this approval")
+                if (matching.toolName == "workspace_apt_execute" && approved) {
+                    require(answer == null) { "Apt execution requires an explicit approval" }
+                    val params = matching.inputAsJson().jsonObject
+                    val planId = params["planId"]?.jsonPrimitive?.contentOrNull
+                        ?: error("Missing apt plan id")
+                    val fingerprint = params["planFingerprint"]?.jsonPrimitive?.contentOrNull
+                        ?: error("Missing apt plan fingerprint")
+                    val assistant = settingsStore.settingsFlow.first().getAssistantById(conversation.assistantId)
+                        ?: error("Assistant for apt plan approval not found")
+                    val workspaceId = assistant.workspaceId?.toString()
+                        ?: error("This assistant has no workspace")
+                    workspaceAccessGate.withWorkspaceAccess(assistant.id.toString(), conversationId.toString(), workspaceId) {
+                        workspaceAptPlanService.confirm(
+                            planId, workspaceId, assistant.id.toString(), conversationId.toString(),
+                            toolCallId, fingerprint,
+                        )
+                    }
+                }
                 val newApprovalState = when {
                     answer != null -> ToolApprovalState.Answered(answer)
                     approved -> ToolApprovalState.Approved

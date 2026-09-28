@@ -1,6 +1,10 @@
 package me.rerere.rikkahub.data.ai.tools
 
 import kotlinx.serialization.json.JsonNull
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.buildJsonObject
@@ -16,6 +20,8 @@ import me.rerere.ai.ui.toMetadata
 import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
 import me.rerere.rikkahub.data.workspace.AssistantWorkspaceAccessGate
+import me.rerere.rikkahub.data.workspace.WorkspaceAptPlanService
+import me.rerere.rikkahub.data.workspace.WorkspaceAptRequest
 import me.rerere.rikkahub.data.workspace.MAX_WORKSPACE_SHELL_COMMAND_CHARS
 import me.rerere.rikkahub.data.workspace.WorkspaceAuditInvocation
 import me.rerere.rikkahub.data.workspace.WorkspaceAuditSuccess
@@ -63,6 +69,8 @@ suspend fun createWorkspaceTools(
             conversationId = conversationId,
             accessGate = accessGate,
         ),
+        createAptPlanTool(workspaceId, assistantId, conversationId, accessGate),
+        createAptExecuteTool(workspaceId, assistantId, conversationId, accessGate),
     )
 }
 
@@ -294,12 +302,13 @@ private fun createEditFileTool(
 )
 
 internal fun workspaceShellDescription(defaultCwd: String = ""): String = buildString {
-    append("Run a shell command in the current workspace's selected Linux environment. ")
-    append("The working directory is always /workspace or one of its subdirectories, and user files are confined to /workspace. ")
-    append("Package mode provides the workspace's full Linux Rootfs, so installed tools such as python3, pip, npm, Go, and Cargo can be used when present. ")
-    append("Sandbox mode is intentionally minimal and only provides basic shell/toybox commands; python3, pip, bash, and other full Linux tools are unavailable there. ")
-    append("The Linux environment may be shared with other workspaces. Use the public environment maintenance UI for system-wide package installation, upgrades, and removal. ")
-    append("For project-specific Python dependencies use python3 -m venv /workspace/.venv and /workspace/.venv/bin/python -m pip; use --system-site-packages only when the project should inherit public libraries. ")
+    append("Run a shell command in the current workspace. ")
+    append("The working directory is always /workspace or one of its subdirectories. ")
+    append("A private Linux environment provides a full development shell with installed tools such as Python, npm, Go and Cargo. ")
+    append("A shared Linux environment uses a files-only sandbox: its public Rootfs and system packages cannot be modified by this tool; Python, pip and bash are unavailable there. ")
+    append("Use the public environment maintenance UI for system-wide package installation, upgrades and removal. ")
+    append("Use workspace_apt_plan to simulate public package changes, then workspace_apt_execute with its planId and planFingerprint for user approval. ")
+    append("For project-specific Python dependencies in a private environment use python3 -m venv /workspace/.venv and /workspace/.venv/bin/python -m pip. ")
     append("The workspace does not mount or expose /skills, /upload, /tool_outputs, /proc, /sys, or external app directories. ")
     append("The PRoot guest root is not Android host root. ")
     if (defaultCwd.isNotBlank()) {
@@ -415,6 +424,93 @@ private fun createShellTool(
                 }.toString(),
             )
         }
+        }
+    },
+)
+
+private fun createAptPlanTool(
+    workspaceId: String,
+    assistantId: String,
+    conversationId: String,
+    accessGate: AssistantWorkspaceAccessGate,
+) = Tool(
+    name = "workspace_apt_plan",
+    description = "Simulate a public Linux apt package change for review. No packages are changed. Requires a shared workspace. Use workspace_apt_execute with its planId and planFingerprint to request explicit user approval for the exact plan.",
+    parameters = {
+        InputSchema.Obj(
+            properties = buildJsonObject {
+                put("action", buildJsonObject {
+                    put("type", "string")
+                    put("enum", buildJsonArray { listOf("install", "remove", "upgrade").forEach { add(JsonPrimitive(it)) } })
+                })
+                put("packages", buildJsonObject {
+                    put("type", "array")
+                    put("items", buildJsonObject { put("type", "string") })
+                })
+                put("purge", buildJsonObject { put("type", "boolean") })
+            },
+            required = listOf("action", "packages"),
+        )
+    },
+    needsApproval = { false },
+    execute = { input ->
+        accessGate.withWorkspaceAccess(assistantId, conversationId, workspaceId) {
+            val params = input.jsonObject
+            val action = requireNotNull(params.string("action")) { "action is required" }
+            val packages = params["packages"]?.jsonArray?.map { it.jsonPrimitive.content }
+                ?: error("packages are required")
+            val request = WorkspaceAptRequest.fromWireName(action, packages, params.boolean("purge", false))
+            val plan = getKoin().get<WorkspaceAptPlanService>()
+                .createPlan(workspaceId, assistantId, conversationId, request)
+            listOf(UIMessagePart.Text(buildJsonObject {
+                put("planId", plan.planId)
+                put("action", plan.action)
+                put("summary", plan.summaryJson)
+                put("planFingerprint", plan.planFingerprint)
+                put("expiresAt", plan.expiresAt)
+                put("status", "simulation_only")
+            }.toString()))
+        }
+    },
+)
+
+private fun createAptExecuteTool(
+    workspaceId: String,
+    assistantId: String,
+    conversationId: String,
+    accessGate: AssistantWorkspaceAccessGate,
+) = Tool(
+    name = "workspace_apt_execute",
+    description = "Request user approval to execute a previously simulated public apt plan. Pass only its planId and planFingerprint. Approval is bound to this specific plan and tool call; stale plans are rejected.",
+    parameters = {
+        InputSchema.Obj(
+            properties = buildJsonObject {
+                put("planId", buildJsonObject { put("type", "string") })
+                put("planFingerprint", buildJsonObject { put("type", "string") })
+            },
+            required = listOf("planId", "planFingerprint"),
+        )
+    },
+    needsApproval = { true },
+    execute = { input ->
+        accessGate.withWorkspaceAccess(assistantId, conversationId, workspaceId) {
+            val planId = input.jsonObject.string("planId") ?: error("planId is required")
+            val fingerprint = input.jsonObject.string("planFingerprint") ?: error("planFingerprint is required")
+            val toolCallId = currentCoroutineContext()[WorkspaceAptToolCall]?.id
+                ?: error("Public apt execution requires a bound tool call")
+            val service = getKoin().get<WorkspaceAptPlanService>()
+            // Confirmation is persisted by ChatService before the tool resumes; never trust the
+            // model's fingerprint as the final permission check.
+            val result = service.execute(
+                planId, workspaceId, assistantId, conversationId, toolCallId,
+                planFingerprint = fingerprint,
+            )
+            listOf(UIMessagePart.Text(buildJsonObject {
+                put("planId", planId)
+                put("operationId", result.operationId)
+                put("state", result.state)
+                result.exitCode?.let { put("exitCode", it) }
+            }.toString()))
         }
     },
 )

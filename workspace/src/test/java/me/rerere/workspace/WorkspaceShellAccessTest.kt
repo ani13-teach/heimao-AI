@@ -98,7 +98,7 @@ class WorkspaceShellAccessTest {
 
         assertEquals(127, result.exitCode)
         assertTrue(result.stderr.contains("Command 'python3' is not available in sandbox mode"))
-        assertTrue(result.stderr.contains("Switch to package mode"))
+        assertTrue(result.stderr.contains("Use a private Linux environment"))
     }
 
     @Test

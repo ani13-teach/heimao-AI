@@ -29,6 +29,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -51,6 +52,8 @@ import me.rerere.hugeicons.stroke.Cancel01
 import me.rerere.hugeicons.stroke.Tick01
 import me.rerere.hugeicons.stroke.Tools
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.db.entity.WorkspaceAptPlanEntity
+import me.rerere.rikkahub.data.workspace.WorkspaceAptPlanService
 import me.rerere.rikkahub.ui.components.message.tools.ToolUIContext
 import me.rerere.rikkahub.ui.components.message.tools.ToolUIRegistry
 import me.rerere.rikkahub.ui.components.richtext.ZoomableAsyncImage
@@ -58,6 +61,7 @@ import me.rerere.rikkahub.ui.components.ui.ChainOfThoughtScope
 import me.rerere.rikkahub.ui.components.ui.DotLoading
 import me.rerere.rikkahub.ui.modifier.shimmer
 import me.rerere.rikkahub.utils.JsonInstant
+import org.koin.java.KoinJavaComponent.getKoin
 
 private const val ASK_USER_TOOL_NAME = "ask_user"
 
@@ -122,6 +126,23 @@ fun ChainOfThoughtScope.ChatMessageToolStep(
     }
 
     var showResult by remember { mutableStateOf(false) }
+    var showAptConfirmation by remember { mutableStateOf(false) }
+    val isAptExecution = tool.toolName == "workspace_apt_execute"
+    val aptPlan by produceState<WorkspaceAptPlanEntity?>(null, tool.input, tool.approvalState) {
+        if (isAptExecution && tool.isPending) {
+            value = runCatching {
+                val params = tool.inputAsJson().jsonObject
+                val id = params["planId"]?.jsonPrimitive?.contentOrNull ?: return@runCatching null
+                val hash = params["planFingerprint"]?.jsonPrimitive?.contentOrNull ?: return@runCatching null
+                getKoin().get<WorkspaceAptPlanService>().pendingPlan(id, hash)
+            }.getOrNull()
+        }
+    }
+    val aptDetails = remember(aptPlan) {
+        runCatching {
+            aptPlan?.summaryJson?.let { JsonInstant.parseToJsonElement(it).jsonArray.map { row -> row.jsonPrimitive.content } }
+        }.getOrNull().orEmpty()
+    }
     var showDenyDialog by remember { mutableStateOf(false) }
     var expanded by remember { mutableStateOf(true) }
     val isPending = tool.approvalState is ToolApprovalState.Pending
@@ -129,7 +150,7 @@ fun ChainOfThoughtScope.ChatMessageToolStep(
     val images = tool.output.filterIsInstance<UIMessagePart.Image>()
 
     // 摘要由注册的渲染器决定; 图片输出与拒绝原因为所有工具通用
-    val hasExtraContent = renderer.hasSummary(context) || isDenied || images.isNotEmpty()
+    val hasExtraContent = renderer.hasSummary(context) || isDenied || images.isNotEmpty() || (isPending && isAptExecution)
 
     ControlledChainOfThoughtStep(
         expanded = expanded,
@@ -174,7 +195,11 @@ fun ChainOfThoughtScope.ChatMessageToolStep(
                         )
                     }
                     FilledTonalIconButton(
-                        onClick = { onToolApproval(tool.toolCallId, true, "") },
+                        onClick = {
+                            if (isAptExecution) showAptConfirmation = true
+                            else onToolApproval(tool.toolCallId, true, "")
+                        },
+                        enabled = !isAptExecution || (aptPlan != null && aptDetails.isNotEmpty()),
                         modifier = Modifier.size(28.dp),
                     ) {
                         Icon(
@@ -197,6 +222,13 @@ fun ChainOfThoughtScope.ChatMessageToolStep(
             {
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     renderer.Summary(context)
+                    if (isPending && isAptExecution) {
+                        Text(
+                            text = aptDetails.takeIf { it.isNotEmpty() }?.joinToString("\n")
+                                ?: stringResource(R.string.workspace_apt_plan_unavailable),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
                     if (images.isNotEmpty()) {
                         LazyRow(
                             horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -228,6 +260,30 @@ fun ChainOfThoughtScope.ChatMessageToolStep(
             null
         },
     )
+
+    if (showAptConfirmation && aptPlan != null && aptDetails.isNotEmpty() && onToolApproval != null) {
+        AlertDialog(
+            onDismissRequest = { showAptConfirmation = false },
+            title = { Text(stringResource(R.string.workspace_apt_confirm_title)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(stringResource(R.string.workspace_apt_confirm_warning))
+                    Text(aptDetails.joinToString("\n"), style = MaterialTheme.typography.bodySmall)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showAptConfirmation = false
+                    onToolApproval(tool.toolCallId, true, "")
+                }) { Text(stringResource(R.string.chat_message_tool_approve)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAptConfirmation = false }) {
+                    Text(stringResource(R.string.common_cancel))
+                }
+            },
+        )
+    }
 
     if (showDenyDialog && onToolApproval != null) {
         ToolDenyReasonDialog(

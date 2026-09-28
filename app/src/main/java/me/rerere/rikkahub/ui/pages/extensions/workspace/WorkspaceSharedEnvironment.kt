@@ -22,6 +22,8 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.db.entity.WorkspaceAptPlanEntity
+import me.rerere.rikkahub.data.db.entity.WorkspaceAptPlanState
 import me.rerere.rikkahub.data.db.entity.WorkspaceEntity
 import me.rerere.rikkahub.data.repository.WorkspaceSharedEnvironmentInfo
 import me.rerere.rikkahub.ui.components.ui.RikkaConfirmDialog
@@ -79,6 +81,8 @@ internal fun WorkspaceSharedEnvironmentInfo.toUiState(workspaceId: String): Shar
 @Composable
 internal fun WorkspaceSharedEnvironmentCard(
     state: SharedEnvironmentUiState,
+    blocked: Boolean,
+    blockingAptPlans: List<WorkspaceAptPlanEntity>,
     loading: Boolean,
     busy: Boolean,
     referencingWorkspaces: List<WorkspaceEntity>,
@@ -88,6 +92,7 @@ internal fun WorkspaceSharedEnvironmentCard(
     onSwitchToShared: () -> Unit,
     onSwitchToPrivate: () -> Unit,
     onRestoreRecovery: () -> Unit,
+    onAcknowledgeAptStopped: (WorkspaceAptPlanEntity) -> Unit,
     onOpenMaintenance: () -> Unit,
     onCheckTools: () -> Unit,
 ) {
@@ -95,6 +100,7 @@ internal fun WorkspaceSharedEnvironmentCard(
     var confirmSwitchPrivate by remember { mutableStateOf(false) }
     var confirmRestore by remember { mutableStateOf(false) }
     var confirmMaintenance by remember { mutableStateOf(false) }
+    var stoppedPlan by remember { mutableStateOf<WorkspaceAptPlanEntity?>(null) }
 
     val referencingLabel = if (referencingWorkspaces.isEmpty()) {
         stringResource(R.string.workspace_shared_references_none)
@@ -168,11 +174,31 @@ internal fun WorkspaceSharedEnvironmentCard(
                 value = recoveryLabel,
                 maxLines = 2,
             )
+            if (blocked) {
+                Text(
+                    stringResource(R.string.workspace_apt_blocked),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+            blockingAptPlans.forEach { plan ->
+                Text(
+                    "${plan.action}: ${plan.state} (${plan.operationId ?: plan.planId})",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                if (plan.state in setOf(WorkspaceAptPlanState.EXECUTING, WorkspaceAptPlanState.UNKNOWN) &&
+                    plan.operationId != null
+                ) {
+                    OutlinedButton(onClick = { stoppedPlan = plan }, enabled = !busy) {
+                        Text(stringResource(R.string.workspace_apt_process_stopped))
+                    }
+                }
+            }
 
             if (!state.isShared) {
                 Button(
                     onClick = { confirmSwitchShared = true },
-                    enabled = !busy,
+                    enabled = !busy && !blocked,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text(stringResource(R.string.workspace_shared_switch_to_shared))
@@ -180,7 +206,7 @@ internal fun WorkspaceSharedEnvironmentCard(
             } else {
                 Button(
                     onClick = { confirmSwitchPrivate = true },
-                    enabled = !busy,
+                    enabled = !busy && !blocked,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text(stringResource(R.string.workspace_shared_switch_to_private))
@@ -189,7 +215,10 @@ internal fun WorkspaceSharedEnvironmentCard(
 
             OutlinedButton(
                 onClick = { confirmRestore = true },
-                enabled = !busy && state.recoveryAvailable,
+                enabled = !busy && state.recoveryAvailable &&
+                    (!blocked || (blockingAptPlans.isNotEmpty() && blockingAptPlans.all {
+                        it.state == WorkspaceAptPlanState.RECOVERY_REQUIRED
+                    })),
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(stringResource(R.string.workspace_shared_restore_recovery))
@@ -199,7 +228,7 @@ internal fun WorkspaceSharedEnvironmentCard(
                 onClick = { confirmMaintenance = true },
                 // Maintenance is exclusive to the public environment: it needs a public
                 // environment that is installed and no other session running on it.
-                enabled = !busy && state.isShared && rootfsReady,
+                enabled = !busy && !blocked && state.isShared && rootfsReady,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(stringResource(R.string.workspace_shared_maintenance))
@@ -217,7 +246,7 @@ internal fun WorkspaceSharedEnvironmentCard(
                 )
                 TextButton(
                     onClick = onCheckTools,
-                    enabled = !toolCheckRunning && rootfsReady,
+                    enabled = !toolCheckRunning && rootfsReady && !blocked,
                 ) {
                     Text(stringResource(R.string.workspace_shared_check_tools))
                 }
@@ -278,6 +307,22 @@ internal fun WorkspaceSharedEnvironmentCard(
         onDismiss = { confirmRestore = false },
     ) {
         Text(stringResource(R.string.workspace_shared_restore_recovery_confirm))
+    }
+
+    stoppedPlan?.let { plan ->
+        RikkaConfirmDialog(
+            show = true,
+            title = stringResource(R.string.workspace_apt_process_stopped),
+            confirmText = stringResource(R.string.common_confirm),
+            dismissText = stringResource(R.string.common_cancel),
+            onConfirm = {
+                stoppedPlan = null
+                onAcknowledgeAptStopped(plan)
+            },
+            onDismiss = { stoppedPlan = null },
+        ) {
+            Text(stringResource(R.string.workspace_apt_process_stopped_confirm, plan.operationId ?: plan.planId))
+        }
     }
 
     RikkaConfirmDialog(

@@ -7,6 +7,24 @@ import java.util.concurrent.TimeUnit
 
 interface WorkspaceShellRunner {
     fun execute(context: WorkspaceShellContext): WorkspaceCommandResult
+
+    /**
+     * Executes a structured apt argv inside [context], without any shell.
+     *
+     * `args` is an argv list whose first element must be the guest `apt-get` path; [context] must
+     * already describe the package environment (package access mode, a shared rootfs that is never
+     * patched, no external mounts). `context.command` is deliberately ignored: this channel must
+     * never be reachable from an app-side shell string. The default rejects the request, so a
+     * runner without a full Linux rootfs cannot accidentally honour it.
+     */
+    fun executeApt(
+        context: WorkspaceShellContext,
+        args: List<String>,
+    ): WorkspaceCommandResult = WorkspaceCommandResult(
+        exitCode = 127,
+        stdout = "",
+        stderr = "This shell runner cannot execute apt commands.\n",
+    )
 }
 
 data class WorkspaceShellContext(

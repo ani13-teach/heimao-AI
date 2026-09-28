@@ -37,6 +37,7 @@ import me.rerere.rikkahub.data.db.migrations.Migration_26_27
 import me.rerere.rikkahub.data.db.migrations.Migration_27_28
 import me.rerere.rikkahub.data.db.migrations.Migration_28_29
 import me.rerere.rikkahub.data.db.migrations.Migration_29_30
+import me.rerere.rikkahub.data.db.migrations.Migration_30_31
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
 import me.rerere.rikkahub.data.files.FileFolders
 import me.rerere.rikkahub.data.model.WorkspaceRuntimeMetadata
@@ -1322,6 +1323,11 @@ class WorkspaceArchiveService(
             // This mutation is still confined to the combined copy. Migration_29_30 creates the
             // table for old databases before this statement is reached.
             staged.execSQL("DELETE FROM workspace_snapshots")
+            // Restoring a database never restores permission to execute a prior apt approval.
+            staged.execSQL(
+                "UPDATE workspace_apt_plans SET state = 'EXPIRED', confirmed_tool_call_id = NULL " +
+                    "WHERE state IN ('PLANNED', 'CONFIRMED')",
+            )
             rebuildMessageFts(staged)
             checkpointSupportDatabase(staged)
         } finally {
@@ -1455,7 +1461,7 @@ class WorkspaceArchiveService(
                 error("message_fts is not an FTS5 virtual table")
             }
 
-            roomSchema30MessageFtsSqlIsExact(main.sql) -> {
+            roomSchema31MessageFtsSqlIsExact(main.sql) -> {
                 require(completeShadowLayout) {
                     "message_fts has an incomplete FTS5 shadow layout"
                 }
@@ -2420,7 +2426,7 @@ class WorkspaceArchiveService(
                 try {
                 // Validate and prepare all legacy folders/settings before Room is closed. Legacy
                 // archives have no workspace catalog, so only their historical folder strategy is
-                // applied here; database compatibility is enforced by the isolated Room 30 upgrade above.
+                // applied here; database compatibility is enforced by the isolated Room upgrade above.
                 val stagedMainDatabase = stagedDatabase["database/rikka_hub.db"]
                 if (databaseRestoreRequested) {
                     require(stagedMainDatabase != null) {
@@ -3125,11 +3131,12 @@ class WorkspaceArchiveService(
                 "Staged database Room identity is malformed"
             }
             val schema = readRoomSchemaSnapshot(staged, userVersion, identity)
-            if (!roomSchema30IsExact(schema)) {
+            if (!roomSchema31IsExact(schema)) {
                 // The message reaches the backup UI, so name the drifting objects there instead of
-                // only stating that the schema is not Room schema 30. A release build refuses
-                // run-as, so the same structure also goes to a file this device can hand over.
-                val difference = describeRoomSchema30Difference(schema)
+                // only stating that the schema is not the current Room schema. A release build
+                // refuses run-as, so the same structure also goes to a file this device can hand
+                // over.
+                val difference = describeRoomSchema31Difference(schema)
                 val report = writeSchemaDriftReport(schema, difference)
                 Log.e(
                     TAG,
@@ -3208,6 +3215,7 @@ class WorkspaceArchiveService(
             difference = difference,
             appVersion = BuildConfig.VERSION_NAME,
             appVersionCode = BuildConfig.VERSION_CODE,
+            expectation = ROOM_SCHEMA_31_EXPECTATION,
         )
         return runCatching {
             report.writeText(text)
@@ -3691,6 +3699,7 @@ class WorkspaceArchiveService(
             Migration_27_28,
             Migration_28_29,
             Migration_29_30,
+            Migration_30_31,
         )
         private const val MESSAGE_FTS_TABLE = "message_fts"
         private val FTS_SHADOW_NAMES = setOf(
@@ -3768,6 +3777,19 @@ internal fun sanitizeWorkspaceDatabaseCopy(
         database.beginTransaction()
         try {
             if (removeSnapshots) database.execSQL("DELETE FROM workspace_snapshots")
+            // An archive is not an executable approval. Invalidate confirmations in the isolated
+            // copy (both export and restore), leaving the source database untouched.
+            database.rawQuery(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workspace_apt_plans'",
+                null,
+            ).use { cursor ->
+                if (cursor.moveToFirst()) {
+                    database.execSQL(
+                        "UPDATE workspace_apt_plans SET state = 'EXPIRED', confirmed_tool_call_id = NULL " +
+                            "WHERE state IN ('PLANNED', 'CONFIRMED')",
+                    )
+                }
+            }
             workspaceProjection.forEach { row ->
                 database.execSQL(
                     "UPDATE workspaces SET shell_status = ?, runtime_metadata = ? WHERE id = ?",

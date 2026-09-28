@@ -214,6 +214,8 @@ fun WorkspaceDetailPage(id: String) {
                     snapshotLimitExceeded = state.snapshotLimitExceeded,
                     installProgress = installProgress,
                     sharedEnvironment = state.sharedEnvironment,
+                    sharedAptBlocked = state.sharedAptBlocked,
+                    blockingAptPlans = state.blockingAptPlans,
                     sharedLoading = state.sharedLoading,
                     sharedBusy = state.sharedBusy,
                     referencingWorkspaces = state.referencingWorkspaces,
@@ -226,6 +228,7 @@ fun WorkspaceDetailPage(id: String) {
                     onSwitchToShared = vm::switchToSharedEnvironment,
                     onSwitchToPrivate = vm::switchToPrivateEnvironment,
                     onRestoreSharedRecovery = vm::restoreSharedRecovery,
+                    onAcknowledgeAptStopped = vm::acknowledgeAptProcessStopped,
                     onOpenMaintenance = { showMaintenanceTerminal = true },
                     onCheckTools = vm::checkSharedEnvironmentTools,
                 )
@@ -440,6 +443,8 @@ private fun WorkspaceBasicPage(
     snapshotLimitExceeded: WorkspaceSnapshotLimitUiState?,
     installProgress: RootfsInstallProgress?,
     sharedEnvironment: SharedEnvironmentUiState,
+    sharedAptBlocked: Boolean,
+    blockingAptPlans: List<me.rerere.rikkahub.data.db.entity.WorkspaceAptPlanEntity>,
     sharedLoading: Boolean,
     sharedBusy: Boolean,
     referencingWorkspaces: List<WorkspaceEntity>,
@@ -452,6 +457,7 @@ private fun WorkspaceBasicPage(
     onSwitchToShared: () -> Unit,
     onSwitchToPrivate: () -> Unit,
     onRestoreSharedRecovery: () -> Unit,
+    onAcknowledgeAptStopped: (me.rerere.rikkahub.data.db.entity.WorkspaceAptPlanEntity) -> Unit,
     onOpenMaintenance: () -> Unit,
     onCheckTools: () -> Unit,
 ) {
@@ -497,6 +503,8 @@ private fun WorkspaceBasicPage(
         item {
             WorkspaceSharedEnvironmentCard(
                 state = sharedEnvironment,
+                blocked = sharedAptBlocked,
+                blockingAptPlans = blockingAptPlans,
                 loading = sharedLoading,
                 busy = sharedBusy,
                 referencingWorkspaces = referencingWorkspaces,
@@ -506,6 +514,7 @@ private fun WorkspaceBasicPage(
                 onSwitchToShared = onSwitchToShared,
                 onSwitchToPrivate = onSwitchToPrivate,
                 onRestoreRecovery = onRestoreSharedRecovery,
+                onAcknowledgeAptStopped = onAcknowledgeAptStopped,
                 onOpenMaintenance = onOpenMaintenance,
                 onCheckTools = onCheckTools,
             )

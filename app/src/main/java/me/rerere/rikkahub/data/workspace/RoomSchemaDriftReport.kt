@@ -8,6 +8,10 @@ package me.rerere.rikkahub.data.workspace
  * therefore written next to the app's external files, where the developer can read it without
  * root. It contains DDL only — table, column, index and sqlite_master definitions — never row
  * data, so it is safe to keep outside the app's private directory.
+ *
+ * [expectation] names the contract the database was compared against; the restore gate passes its
+ * own version so a rejected database reports the version it was expected to match. It defaults to
+ * the schema 30 contract to keep the report callable without a gate in hand.
  */
 internal fun roomSchemaDriftReport(
     snapshot: RoomSchemaSnapshot,
@@ -15,11 +19,12 @@ internal fun roomSchemaDriftReport(
     appVersion: String,
     appVersionCode: String,
     maxChars: Int = 256 * 1024,
+    expectation: RoomSchemaExpectation = ROOM_SCHEMA_30_EXPECTATION,
 ): String {
     val report = buildString {
         appendLine("app=$appVersion ($appVersionCode)")
-        appendLine("user_version=${snapshot.userVersion} expected=$ROOM_SCHEMA_30_VERSION")
-        appendLine("identity_hash=${snapshot.identityHash} expected=$ROOM_SCHEMA_30_IDENTITY_HASH")
+        appendLine("user_version=${snapshot.userVersion} expected=${expectation.version}")
+        appendLine("identity_hash=${snapshot.identityHash} expected=${expectation.identityHash}")
         appendLine("difference=$difference")
         appendLine()
         appendLine("== tables (PRAGMA table_info) ==")

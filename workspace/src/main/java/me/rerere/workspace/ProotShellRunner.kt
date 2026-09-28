@@ -21,7 +21,7 @@ class ProotShellRunner(
                 return WorkspaceCommandResult(
                     exitCode = 127,
                     stdout = "",
-                    stderr = "Command '$command' is not available in sandbox mode. Switch to package mode for a full Linux Rootfs.\n",
+                    stderr = "Command '$command' is not available in sandbox mode. Use a private Linux environment for a full development shell.\n",
                 )
             }
         }
@@ -74,29 +74,118 @@ class ProotShellRunner(
                 patcher.patch(context.linuxDir, context.rootfsPatchOptions)
             }
         }
-        val process = ProcessBuilder(buildCommand(context, proot))
-            .directory(context.filesDir)
-            .redirectErrorStream(false)
-            .apply {
-                environment()["PROOT_LOADER"] = loader.absolutePath
-                environment()["PROOT_TMP_DIR"] = context.tempDir.absolutePath
-                environment()["TMPDIR"] = context.tempDir.absolutePath
-                if (context.accessMode == WorkspaceShellAccessMode.WORKSPACE_ONLY ||
-                    context.accessMode == WorkspaceShellAccessMode.WORKSPACE_PACKAGE ||
-                    // A shared rootfs belongs to every workspace, so an ordinary execution must
-                    // not let PRoot write its link2symlink placeholders into the tree either.
-                    !context.patchRootfs
-                ) {
-                    environment()["PROOT_DONT_POLLUTE_ROOTFS"] = "1"
-                } else {
-                    // Do not let an inherited setting change the manual FULL_ROOTFS terminal.
-                    environment().remove("PROOT_DONT_POLLUTE_ROOTFS")
-                }
-            }
-            .start()
+        val process = startProotProcess(context, buildCommand(context, proot), loader)
 
         return process.readResult(context.timeoutMillis, context.stdin)
     }
+
+    /**
+     * Dedicated apt channel: runs a caller-built argv in the package environment instead of
+     * evaluating a shell string.
+     *
+     * This is the only way an internal caller can reach `apt-get`, and it stays deliberately
+     * narrower than [execute]: only [WorkspaceShellAccessMode.WORKSPACE_PACKAGE] with a rootfs that
+     * is never patched is accepted, [WorkspaceShellContext.command] is not read at all, the guest
+     * argv is fixed by [buildAptCommand], stdin stays closed and the usual timeout/exit semantics
+     * of [readResult] apply.
+     */
+    override fun executeApt(
+        context: WorkspaceShellContext,
+        args: List<String>,
+    ): WorkspaceCommandResult {
+        require(context.accessMode == WorkspaceShellAccessMode.WORKSPACE_PACKAGE) {
+            "apt execution requires WORKSPACE_PACKAGE"
+        }
+        require(!context.patchRootfs) {
+            "apt execution requires a shared rootfs which is never patched"
+        }
+        val missing = context.linuxDir.missingFullRootfsPaths()
+        if (missing.isNotEmpty()) {
+            return WorkspaceCommandResult(
+                exitCode = 127,
+                stdout = "",
+                stderr = fullRootfsIncompleteMessage(missing),
+            )
+        }
+
+        val proot = File(nativeLibraryDir, PROOT_EXEC)
+        val loader = File(nativeLibraryDir, PROOT_LOADER)
+        if (!proot.isFile) {
+            return WorkspaceCommandResult(
+                exitCode = 127,
+                stdout = "",
+                stderr = "proot executable not found: ${proot.absolutePath}",
+            )
+        }
+        if (!loader.isFile) {
+            return WorkspaceCommandResult(
+                exitCode = 127,
+                stdout = "",
+                stderr = "proot loader not found: ${loader.absolutePath}",
+            )
+        }
+
+        context.tempDir.mkdirs()
+        ensureGuestDirectories(context)
+        val process = startProotProcess(context, buildAptCommand(context, proot, args), loader)
+        // stdin is deliberately absent: the caller only learns the outcome through the exit status.
+        return process.readResult(context.timeoutMillis, stdin = null)
+    }
+
+    /**
+     * Builds the dedicated apt command line: the same WORKSPACE_PACKAGE prefix as [buildCommand]
+     * (shared directory mask, no external mounts, no kernel filesystems) followed by a fixed
+     * `env -i` block and the caller-provided argv.
+     *
+     * The argv is never handed to a shell. Its first element has to be exactly
+     * [APT_GET_GUEST_PATH] and no control characters may appear, so an app-side string cannot become
+     * a command, a `-c` evaluation or a second program.
+     */
+    internal fun buildAptCommand(
+        context: WorkspaceShellContext,
+        proot: File,
+        args: List<String>,
+    ): List<String> {
+        require(context.accessMode == WorkspaceShellAccessMode.WORKSPACE_PACKAGE) {
+            "apt execution requires WORKSPACE_PACKAGE"
+        }
+        require(!context.patchRootfs) {
+            "apt execution requires a shared rootfs which is never patched"
+        }
+        require(args.isNotEmpty()) { "apt execution requires an argv" }
+        require(args.first() == APT_GET_GUEST_PATH) {
+            "apt execution argv must start with $APT_GET_GUEST_PATH"
+        }
+        require(args.none { argument -> argument.any { it.code < 0x20 || it.code == 0x7F } }) {
+            "apt execution argv must not contain control characters"
+        }
+        return buildRootfsCommandPrefix(context, proot) + aptEnvironmentPrefix() + args
+    }
+
+    /** Guest environment for apt: HOME and temp areas are the workspace-local binds. */
+    private fun aptEnvironmentPrefix(): List<String> = listOf(
+        "/usr/bin/env",
+        "-i",
+        "HOME=$GUEST_HOME_DIR",
+        "TMPDIR=$GUEST_TMP_DIR",
+        "PATH=$GUEST_PATH",
+        "DEBIAN_FRONTEND=noninteractive",
+    )
+
+    private fun startProotProcess(
+        context: WorkspaceShellContext,
+        command: List<String>,
+        loader: File,
+    ): Process =
+        ProcessBuilder(command)
+            .directory(context.filesDir)
+            .redirectErrorStream(false)
+            .apply {
+                // Do not let an inherited setting change the manual FULL_ROOTFS terminal.
+                environment().remove("PROOT_DONT_POLLUTE_ROOTFS")
+                environment().putAll(prootEnvironmentOverrides(context, loader))
+            }
+            .start()
 
     /**
      * Builds the same FULL_ROOTFS prefix used by [buildCommand] for the interactive terminal.
@@ -449,5 +538,32 @@ class ProotShellRunner(
         private const val GUEST_HOME_DIR = "/root"
         private const val GUEST_TMP_DIR = "/tmp"
         private const val GUEST_VAR_TMP_DIR = "/var/tmp"
+        private const val GUEST_PATH =
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+        /** The only program the dedicated apt channel may run in the guest. */
+        private const val APT_GET_GUEST_PATH = "/usr/bin/apt-get"
+    }
+}
+
+/**
+ * PRoot environment overrides shared by every execution path, including the dedicated apt channel.
+ *
+ * A shared rootfs (`patchRootfs == false`) and both AI channels never let PRoot write its
+ * link2symlink placeholders into the tree. The manual FULL_ROOTFS terminal is the only path without
+ * the flag, and an inherited value is removed for it so the terminal keeps its legacy behavior.
+ */
+internal fun prootEnvironmentOverrides(
+    context: WorkspaceShellContext,
+    loader: File,
+): Map<String, String> = buildMap {
+    put("PROOT_LOADER", loader.absolutePath)
+    put("PROOT_TMP_DIR", context.tempDir.absolutePath)
+    put("TMPDIR", context.tempDir.absolutePath)
+    if (context.accessMode == WorkspaceShellAccessMode.WORKSPACE_ONLY ||
+        context.accessMode == WorkspaceShellAccessMode.WORKSPACE_PACKAGE ||
+        !context.patchRootfs
+    ) {
+        put("PROOT_DONT_POLLUTE_ROOTFS", "1")
     }
 }

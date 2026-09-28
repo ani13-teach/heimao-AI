@@ -267,11 +267,32 @@ class SharedEnvironmentTest {
     }
 
     @Test
+    fun `AI uses the files-only sandbox on a shared rootfs and cannot request package mode`() {
+        val runner = CapturingShellRunner()
+        val manager = WorkspaceManager(baseDir = baseDir(), shellRunner = runner)
+        manager.environments.initializeShared("pool")
+        manager.ensureWorkspace("pool")
+
+        assertEquals(WorkspaceShellAccessMode.WORKSPACE_ONLY, manager.aiShellAccessMode("pool"))
+        manager.executeCommand("pool", "pwd", accessMode = manager.aiShellAccessMode("pool"))
+        assertEquals(WorkspaceShellAccessMode.WORKSPACE_ONLY, runner.context.accessMode)
+        val command = ProotShellRunner(tempFolder.newFolder("native-shared-ai"))
+            .buildCommand(runner.context, File("/native/proot"))
+        assertEquals(runner.context.filesDir.absolutePath, command[command.indexOf("-r") + 1])
+        assertFalse(command.contains("--root-id"))
+        assertThrows(IllegalArgumentException::class.java) {
+            manager.createShellContext("pool", "apt-get purge example", accessMode = WorkspaceShellAccessMode.WORKSPACE_PACKAGE)
+        }
+        assertEquals(WorkspaceShellAccessMode.WORKSPACE_ONLY, manager.aiShellAccessMode("pool"))
+    }
+
+    @Test
     fun `a private workspace keeps the legacy context`() {
         val runner = CapturingShellRunner()
         val manager = WorkspaceManager(baseDir = baseDir(), shellRunner = runner)
         manager.ensureWorkspace("solo")
 
+        assertEquals(WorkspaceShellAccessMode.WORKSPACE_PACKAGE, manager.aiShellAccessMode("solo"))
         manager.executeCommand("solo", "true")
 
         assertEquals(manager.privateLinuxDir("solo"), runner.context.linuxDir)

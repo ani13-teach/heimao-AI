@@ -68,6 +68,7 @@ val appModule = module {
             filesManager = get(),
             skillManager = get(),
             workspaceRepository = get(),
+            workspaceAptPlanService = get(),
             folderRepository = get(),
             workspaceAccessGate = get(),
             workspaceSessionInvalidator = get(),

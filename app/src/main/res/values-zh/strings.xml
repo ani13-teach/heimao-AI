@@ -247,6 +247,12 @@
   <string name="chat_message_add_favorite">添加收藏</string>
   <string name="chat_message_remove_favorite">取消收藏</string>
   <string name="chat_message_tool_approve">批准</string>
+  <string name="workspace_apt_confirm_title">确认公共包变更</string>
+  <string name="workspace_apt_confirm_warning">这些包变更会影响所有使用公共 Linux 环境的工作区。执行前会创建恢复点。</string>
+  <string name="workspace_apt_plan_unavailable">计划不可用或已过期，请重新模拟。</string>
+  <string name="workspace_apt_blocked">公共包操作需要处理。正在运行或中断的 apt 操作会阻断公共环境；进程可能仍在运行时请勿恢复。</string>
+  <string name="workspace_apt_process_stopped">我已确认 apt 进程退出</string>
+  <string name="workspace_apt_process_stopped_confirm">仅在独立确认操作 %1$s 的 apt/PRoot 进程已经退出后继续。此操作不会恢复软件包；公共环境仍将阻断，直到你使用恢复点恢复。</string>
   <string name="chat_message_tool_ask_questions">询问 %d 个问题</string>
   <string name="chat_message_tool_call_generic">调用工具 %1$s</string>
   <string name="chat_message_tool_call_label">调用工具 %1$s</string>
@@ -1028,6 +1034,9 @@
   <string name="workspace_page_rename">重命名工作区</string>
   <string name="workspace_page_delete">删除工作区</string>
   <string name="workspace_page_delete_confirm">这将删除工作区元数据和本地文件，并清除所有引用它的助手绑定。</string>
+  <string name="workspace_page_delete_failed">无法删除工作区</string>
+  <string name="workspace_page_delete_busy">工作区正在使用中。请关闭相关会话后重试。</string>
+  <string name="workspace_page_delete_error">删除失败。重试前请先确认工作区是否仍在列表中。</string>
   <string name="workspace_page_empty">暂无工作区</string>
   <string name="workspace_page_empty_desc">创建一个以使用文件工具和沙箱环境</string>
   <string name="workspace_page_name">名称</string>

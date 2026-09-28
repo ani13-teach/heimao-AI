@@ -4,9 +4,11 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
+import me.rerere.rikkahub.data.db.entity.WorkspaceAptPlanState
 import me.rerere.workspace.WorkspaceCommandResult
 import me.rerere.workspace.WorkspaceProcessTerminationException
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.CountDownLatch
@@ -60,6 +62,7 @@ class WorkspaceRepositoryLeaseOwnershipTest {
 
             assertTrue(retained.get())
             assertFalse(released.get())
+            assertEquals(WorkspaceAptPlanState.UNKNOWN, aptFailureState(ownership, CancellationException("dispatcher handoff")))
         } finally {
             dispatcher.close()
         }

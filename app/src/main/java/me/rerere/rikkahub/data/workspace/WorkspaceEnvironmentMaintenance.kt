@@ -111,10 +111,12 @@ internal class WorkspaceEnvironmentMaintenance(
         url: String,
         onProgress: (RootfsInstallProgress) -> Unit,
         expectedSha256: String?,
+        requireSafeToInstall: () -> Unit = {},
     ): RootfsInstallResult = coordinator.acquireEnvironmentExclusiveLease(
         WorkspaceRuntimeGates.SHARED_ENVIRONMENT,
         maintenance = true,
     ).use {
+        requireSafeToInstall()
         transactions.recover()
         transactions.clearStaging()
         require(transactions.stagingDir.mkdirs() || transactions.stagingDir.isDirectory) {

@@ -185,6 +185,14 @@ class RikkaHubApp : Application() {
             }.onFailure {
                 Log.e(TAG, "recoverSharedEnvironmentTransaction failed", it)
             }
+            // A plan left in EXECUTING/UNKNOWN/RECOVERY_REQUIRED keeps the shared environment
+            // fail-closed: the apt process must not be assumed dead, so no session may start in it
+            // until the plan is resolved explicitly. An unreadable plan table fails closed too.
+            runCatching {
+                repository.refreshSharedAptGate()
+            }.onFailure {
+                Log.e(TAG, "refreshSharedAptGate failed", it)
+            }
             val private = runCatching {
                 repository.checkIntegrity()
             }.onFailure {

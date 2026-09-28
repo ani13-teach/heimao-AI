@@ -13,6 +13,7 @@ import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
 import me.rerere.rikkahub.data.db.entity.WorkspaceAuditEvent
+import me.rerere.rikkahub.data.db.entity.WorkspaceAptPlanEntity
 import me.rerere.rikkahub.data.db.entity.WorkspaceEntity
 import me.rerere.rikkahub.data.db.entity.WorkspaceSnapshotEntity
 import me.rerere.rikkahub.data.model.redactWorkspaceText
@@ -244,12 +245,15 @@ class WorkspaceDetailVM(
             _state.update { it.copy(sharedLoading = true) }
             runCatching { repository.sharedEnvironmentInfo() }
                 .onSuccess { info ->
+                    val blockingPlans = runCatching { repository.blockingSharedAptPlans() }.getOrDefault(emptyList())
                     val byId = runCatching { repository.getAll().associateBy { it.id } }
                         .getOrDefault(emptyMap())
                     val referencing = info.referencedWorkspaceIds.mapNotNull { byId[it] }
                     _state.update {
                         it.copy(
                             sharedEnvironment = info.toUiState(id),
+                            sharedAptBlocked = repository.isSharedAptBlocked,
+                            blockingAptPlans = blockingPlans,
                             referencingWorkspaces = referencing,
                             sharedLoading = false,
                         )
@@ -274,6 +278,12 @@ class WorkspaceDetailVM(
 
     fun restoreSharedRecovery() =
         runSharedEnvironmentAction("恢复公共环境失败") { repository.restoreSharedRecovery() }
+
+    fun acknowledgeAptProcessStopped(plan: WorkspaceAptPlanEntity) =
+        runSharedEnvironmentAction("确认进程退出失败") {
+            repository.acknowledgeAptProcessStopped(plan.planId, requireNotNull(plan.operationId))
+            true
+        }
 
     /**
      * 公共环境操作是全局的, 同一时刻只允许一个, 失败信息原样展示 (例如切回私有但私有 rootfs 不完整).
@@ -492,6 +502,8 @@ data class WorkspaceDetailState(
     val error: String? = null,
     // 公共 (shared) Linux 环境: 本工作区是否使用、占用空间、引用者、恢复点与工具探测结果.
     val sharedEnvironment: SharedEnvironmentUiState = SharedEnvironmentUiState(),
+    val sharedAptBlocked: Boolean = false,
+    val blockingAptPlans: List<WorkspaceAptPlanEntity> = emptyList(),
     val sharedLoading: Boolean = true,
     val sharedBusy: Boolean = false,
     val sharedError: String? = null,

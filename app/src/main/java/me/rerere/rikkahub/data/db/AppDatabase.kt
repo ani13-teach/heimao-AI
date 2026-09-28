@@ -13,6 +13,7 @@ import me.rerere.rikkahub.data.db.dao.GenMediaDAO
 import me.rerere.rikkahub.data.db.dao.ManagedFileDAO
 import me.rerere.rikkahub.data.db.dao.MemoryDAO
 import me.rerere.rikkahub.data.db.dao.MessageNodeDAO
+import me.rerere.rikkahub.data.db.dao.WorkspaceAptPlanDAO
 import me.rerere.rikkahub.data.db.dao.WorkspaceAuditDAO
 import me.rerere.rikkahub.data.db.dao.WorkspaceDAO
 import me.rerere.rikkahub.data.db.dao.WorkspaceSnapshotDAO
@@ -24,6 +25,7 @@ import me.rerere.rikkahub.data.db.entity.GenMediaEntity
 import me.rerere.rikkahub.data.db.entity.ManagedFileEntity
 import me.rerere.rikkahub.data.db.entity.MemoryEntity
 import me.rerere.rikkahub.data.db.entity.MessageNodeEntity
+import me.rerere.rikkahub.data.db.entity.WorkspaceAptPlanEntity
 import me.rerere.rikkahub.data.db.entity.WorkspaceAuditEvent
 import me.rerere.rikkahub.data.db.entity.WorkspaceEntity
 import me.rerere.rikkahub.data.db.entity.WorkspaceSnapshotEntity
@@ -32,7 +34,7 @@ import me.rerere.rikkahub.data.db.migrations.Migration_22_23
 import me.rerere.rikkahub.data.db.migrations.Migration_8_9
 import me.rerere.rikkahub.utils.JsonInstant
 
-const val APP_DATABASE_VERSION = 30
+const val APP_DATABASE_VERSION = 31
 
 @Database(
     entities = [
@@ -46,6 +48,7 @@ const val APP_DATABASE_VERSION = 30
         WorkspaceEntity::class,
         WorkspaceAuditEvent::class,
         WorkspaceSnapshotEntity::class,
+        WorkspaceAptPlanEntity::class,
         FolderEntity::class,
     ],
     version = APP_DATABASE_VERSION,
@@ -93,6 +96,8 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun workspaceAuditDao(): WorkspaceAuditDAO
 
     abstract fun workspaceSnapshotDao(): WorkspaceSnapshotDAO
+
+    abstract fun workspaceAptPlanDao(): WorkspaceAptPlanDAO
 
     abstract fun folderDao(): FolderDAO
 }

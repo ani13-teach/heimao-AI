@@ -235,6 +235,21 @@ class WorkspaceManager(
         )
     }
 
+    /** AI gets a full development shell only when it is backed by a private rootfs. */
+    fun aiShellAccessMode(root: String): WorkspaceShellAccessMode =
+        if (environments.isShared(root)) WorkspaceShellAccessMode.WORKSPACE_ONLY
+        else WorkspaceShellAccessMode.WORKSPACE_PACKAGE
+
+    /**
+     * Runs a structured apt argv in an already prepared [context]. The caller owns the context
+     * (package environment, shared rootfs, no external mounts) and the argv; the manager only
+     * forwards it to the one [shellRunner] so no call site can pick a different runner.
+     */
+    fun executeApt(
+        context: WorkspaceShellContext,
+        args: List<String>,
+    ): WorkspaceCommandResult = shellRunner.executeApt(context, args)
+
     /**
      * Builds the exact context [executeCommand] would pass to the shell runner, so the interactive
      * terminal can reuse it (same mounts, HOME, temp areas and patch decision) without executing a
@@ -248,6 +263,9 @@ class WorkspaceManager(
         stdin: ByteArray? = null,
         accessMode: WorkspaceShellAccessMode = WorkspaceShellAccessMode.FULL_ROOTFS,
     ): WorkspaceShellContext {
+        require(accessMode != WorkspaceShellAccessMode.WORKSPACE_PACKAGE || !environments.isShared(root)) {
+            "AI package shell cannot run on the shared Linux rootfs"
+        }
         val workingDir = fileSystem.resolve(filesDir(root), cwd)
         require(workingDir.exists()) { "Working directory does not exist: $cwd" }
         require(workingDir.isDirectory) { "Working path is not a directory: $cwd" }

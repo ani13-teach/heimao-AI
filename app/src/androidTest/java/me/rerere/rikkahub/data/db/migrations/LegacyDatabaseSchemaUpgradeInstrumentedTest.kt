@@ -42,9 +42,9 @@ class LegacyDatabaseSchemaUpgradeInstrumentedTest {
     )
 
     @Test
-    fun printsRealRoom30SchemaAfterLegacyUpgrade() {
+    fun printsRealRoom31SchemaAfterLegacyUpgrade() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
-        val databaseName = "legacy-schema30-dump-${System.nanoTime()}"
+        val databaseName = "legacy-schema31-dump-${System.nanoTime()}"
         val source = context.getDatabasePath(databaseName)
         try {
             helper.createDatabase(databaseName, 27).close()
@@ -63,7 +63,7 @@ class LegacyDatabaseSchemaUpgradeInstrumentedTest {
                 )
                 """.trimIndent(),
             )
-            logRoom30Schema(database)
+            logRoom31Schema(database)
             migrated.close()
         } finally {
             context.deleteDatabase(databaseName)
@@ -71,7 +71,7 @@ class LegacyDatabaseSchemaUpgradeInstrumentedTest {
     }
 
     @Test
-    fun upgradedLegacyDatabasePassesTheFinalRoom30ArchiveGate() {
+    fun upgradedLegacyDatabasePassesTheFinalRoom31ArchiveGate() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val databaseName = "legacy-final-gate-${System.nanoTime()}"
         val source = context.getDatabasePath(databaseName)
@@ -111,13 +111,13 @@ class LegacyDatabaseSchemaUpgradeInstrumentedTest {
     }
 
     @Test
-    fun schema30DatabaseWithUnknownTableIsRejectedByTheFinalArchiveGate() {
+    fun schema31DatabaseWithUnknownTableIsRejectedByTheFinalArchiveGate() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
-        val databaseName = "legacy-malformed-schema30-${System.nanoTime()}"
+        val databaseName = "legacy-malformed-schema31-${System.nanoTime()}"
         val source = context.getDatabasePath(databaseName)
-        val staging = File(context.cacheDir, "legacy-malformed-schema30-${System.nanoTime()}")
+        val staging = File(context.cacheDir, "legacy-malformed-schema31-${System.nanoTime()}")
         assertTrue(staging.mkdirs())
-        val archive = File(staging, "legacy-malformed-schema30.zip")
+        val archive = File(staging, "legacy-malformed-schema31.zip")
         try {
             helper.createDatabase(databaseName, 27).close()
             openRoomDatabase(context, source).close()
@@ -391,7 +391,7 @@ class LegacyDatabaseSchemaUpgradeInstrumentedTest {
     }
 
     @Test
-    fun schema27WalAndShmAreCheckpointedThenMigratedToSchema30() {
+    fun schema27WalAndShmAreCheckpointedThenMigratedToSchema31() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val source = context.getDatabasePath(databaseName)
         val staging = File(context.cacheDir, "legacy-schema27-${System.nanoTime()}")
@@ -454,6 +454,7 @@ class LegacyDatabaseSchemaUpgradeInstrumentedTest {
                     Migration_27_28,
                     Migration_28_29,
                     Migration_29_30,
+                    Migration_30_31,
                 )
                 .build()
             migrated.openHelper.writableDatabase
@@ -462,7 +463,7 @@ class LegacyDatabaseSchemaUpgradeInstrumentedTest {
             SQLiteDatabase.openDatabase(combined.path, null, SQLiteDatabase.OPEN_READONLY).use { database ->
                 database.rawQuery("PRAGMA user_version", null).use { cursor ->
                     assertTrue(cursor.moveToFirst())
-                    assertEquals(30, cursor.getInt(0))
+                    assertEquals(31, cursor.getInt(0))
                 }
                 database.rawQuery(
                     "SELECT runtime_metadata FROM workspaces WHERE id = 'workspace-legacy'",
@@ -501,6 +502,7 @@ class LegacyDatabaseSchemaUpgradeInstrumentedTest {
                 Migration_27_28,
                 Migration_28_29,
                 Migration_29_30,
+                Migration_30_31,
             )
             .openHelperFactory(
                 RequerySQLiteOpenHelperFactory(
@@ -519,8 +521,8 @@ class LegacyDatabaseSchemaUpgradeInstrumentedTest {
             )
             .build()
 
-    private fun logRoom30Schema(database: SupportSQLiteDatabase) {
-        val tag = "RoomSchema30Dump"
+    private fun logRoom31Schema(database: SupportSQLiteDatabase) {
+        val tag = "RoomSchema31Dump"
         fun log(message: String) = Log.i(tag, message)
         database.query("PRAGMA user_version").use { cursor ->
             check(cursor.moveToFirst())
