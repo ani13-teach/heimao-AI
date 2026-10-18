@@ -2,6 +2,8 @@
 
 ## 当前说明与协作边界
 
+- 仓库级工作约定见 [AGENT.md](AGENT.md)。用户要求打包、发布或交付安装包时，默认提供正式签名的 Release 版；默认不发布、不交付 Debug 安装包，正式签名不可用时不以 Debug 包替代。
+
 - 用户说明见 [README_ZH_CN.md](README_ZH_CN.md)，开发与维护入口见 [docs/PROJECT_GUIDE.md](docs/PROJECT_GUIDE.md)，专题索引见 [docs/README.md](docs/README.md)。
 - 当前可写源码为 `C:/Users/jch/heimaoai/project`；旁边 deliveries/history/evidence 默认只读，不将旧源码或别的 Windows 项目当作本仓库。
 - 开始和结束时检查 `git status --short`、`git branch --show-current`、`git remote -v`，保留现有未提交修改与未跟踪文件。不能根据旧父目录说明自动丢弃改动。
@@ -20,7 +22,7 @@ Built with Jetpack Compose, Kotlin, and follows Material Design 3 principles.
 
 ```bash
 git diff --check
-./gradlew :app:assembleDebug     # 完整 APK 需要 app/google-services.json
+./gradlew :app:assembleRelease   # 默认交付正式签名版；需要签名配置及 app/google-services.json
 ./gradlew :app:testDebugUnitTest -x :app:processDebugGoogleServices
 ./gradlew :workspace:testDebugUnitTest
 ./gradlew :ai:testDebugUnitTest
