@@ -1,98 +1,64 @@
-<div align="center">
-  <img src="docs/icon.png" alt="App 图标" width="100" />
-  <h1>黑猫ai</h1>
+# 黑猫ai
 
-一个原生Android LLM 聊天客户端，支持切换不同的供应商进行聊天 🤖💬
+基于 [RikkaHub](https://github.com/rikkahub/rikkahub) 的原生 Android AI 聊天客户端。本仓库是独立维护的 fork，不是上游官方发行版。
 
-[English](README.md) | [繁體中文](README_ZH_TW.md) | 简体中文
+[English](README.md) · [繁體中文](README_ZH_TW.md) · **简体中文**
 
-点击链接加入群聊 👉 [【黑猫ai】](https://qm.qq.com/q/I8MSU0FkOu)
+## 项目说明入口
 
-</div>
+- **[开发与维护指南](docs/PROJECT_GUIDE.md)**：环境、构建、架构、源码地图、数据兼容、安全边界、测试、发布和常见问题。
+- [文档目录](docs/README.md)：区分当前指南、设计方案和历史验收记录。
+- [协作约定](AGENTS.md)：修改本仓库前必读。
 
-<div align="center">
-  <img src="docs/img/chat.png" alt="Chat Interface" width="150" />
-  <img src="docs/img/desktop.png" alt="Models Picker" width="450" />
-</div>
+## 主要功能
 
+- 多供应商聊天：OpenAI、Google、Anthropic 类型，支持自定义接口、模型、请求头和请求体。
+- Jetpack Compose / Material 3 界面、深色模式、流式输出、消息分支及多模态附件。
+- Markdown、代码高亮、数学公式、表格、Mermaid 和应用内 WebView 内容预览。
+- 助手独立配置、提示词模板、Mode Injection、MCP 和联网搜索。
+- 普通记忆与分层记忆；本地 FTS 全文检索；AI 历史搜索限制在当前助手。
+- 历史对话永久编号、多选来源总结、可另选总结助手。
+- 工作区文件工具、PRoot Linux、手动终端、共享/私有 Linux 环境及公共 apt 计划审批。
+- 可携带工作区环境的备份恢复、运行日志、聊天生成后台服务与消息队列。
 
-## 🚀 下载
+**不再提供**：本地 Web 服务器/Web 多端访问、ASR/TTS、快捷消息、SillyTavern 角色卡导入、Lorebook 世界书，以及旧更新/赞助/关于入口。应用内 WebView、普通附件导入、聊天导出和 Mode Injection 仍保留。
 
-🔗 [前往官网下载](https://rikka-ai.com/download)（推荐）
-🔗 [前往 Google Play 下载](https://play.google.com/store/apps/details?id=me.rerere.rikkahub)
+自动上下文压缩在请求前总结较早的历史，不删除聊天记录。在模型设置中配置触发长度和压缩目标，默认分别为估算的 100000 和 10000 token；触发长度设为 0 可关闭。
 
-> [!WARNING]
-> RikkaHub 存在许多 fork 版本，fork 版本出现问题与 RikkaHub 无关，请谨慎使用 fork 版本，避免隐私泄露或者过度索要权限问题。
+## 下载与使用
 
-## 💖 赞助商
+从[本 fork 的 Releases](https://github.com/ani13-teach/rikkahub/releases)查看可用产物；`nightly` 是开发预发布版，不等同于稳定版。本机确认过的交付物存放在源码旁的 `../deliveries/`。本次文档核对未联网确认远程发行状态。
 
-|                                         赞助商                                         | 介绍                                                                                                                                              |
-|:-----------------------------------------------------------------------------------:|:------------------------------------------------------------------------------------------------------------------------------------------------|
-| <img src="docs/sponsors/aihubmix.png" alt="Aihubmix" width="50" /><br /><b>Aihubmix</b> | 感谢 <a href="https://aihubmix.com?aff=pG7r">aihubmix.com</a> 的资金支持。我们推荐使用 aihubmix 作为全球主流模型的一站式服务平台。（OpenAI、Claude、Google Gemini、DeepSeek、Qwen 以及数百种其他模型）。 |
-| <img src="docs/sponsors/suixiang.jpg" alt="随想AI中转" width="50" /><br /><b><a href="https://sui-xiang.com">随想AI中转</a></b> | 感谢<a href="https://sui-xiang.com">随想AI中转</a>对本项目的赞助！随想AI中转 是一家可靠高效的 API 中继服务提供商，提供 Claude、Codex、Gemini 等的中继服务。注重隐私的中转站·无数据倒卖·无模型掺水，隐私，透明，极速售后。新账户注册每日签到就送 0.5 元测试额度，充值额度 1:1，无需订阅，按量付费。多线路冗余、跨区域容灾、自动故障切换，长链路 SSE 不中断。99.9% 可用性，关键调用从不掉队。 |
-| <img src="docs/sponsors/ztest.png" alt="真测 ztest.ai" width="50" /><br /><b><a href="https://ztest.ai">真测 ztest.ai</a></b> | 感谢<a href="https://ztest.ai">真测 ztest.ai</a>对本项目的赞助！真测 ztest.ai 是一个 AI 中转站模型检测平台，检测结果数据全公开，23 项探针覆盖协议、身份、能力、内容完整性、安全性、性能六大维度，交叉印证识别伪造与降级。作为独立第三方验证平台，实时监测 AI 中转站的模型真实性、响应质量与服务可用性。 |
+上游网站、Google Play 和上游社区属于 RikkaHub，不能当成本 fork 的发布或支持入口。本 fork 保留正式包名 `me.rerere.rikkahub`，安装前须核对签名并备份；与上游签名不同时不能直接覆盖升级。
 
-## ✨ 功能特色
+1. 安装适合设备的 APK（Android 8.0/API 26 及以上；arm64-v8a 或 x86_64）。
+2. 在供应商设置中填写自己的接口地址和 API Key，添加模型并选给助手。
+3. 先测试普通聊天，再按需启用记忆、搜索、MCP 或工作区工具；工具调用需要模型支持。
+4. Linux 环境需单独安装；共享环境的 AI 普通 Shell 不提供完整 Linux/Python，完整开发工具应使用私有环境，详见维护指南。
 
-- 🎨 现代化安卓APP设计（Material You / 预测性返回）和 🌙 暗色模式
-- 📦 工作区：基于 proot 的 Linux 智能体环境
-- 🖥️ Web多端访问支持
-- 🛠️ MCP 支持
-- 🔄 多种类型的供应商支持，自定义 API / URL / 模型（目前支持 OpenAI、Google、Anthropic）
-- 🖼️ 多模态输入支持
-- 📝 Markdown 渲染（支持代码高亮、数学公式、表格、Mermaid）
-- 🔍 搜索功能（Exa、Tavily、Zhipu、LinkUp、Brave、Perplexity、..）
-- 🧩 Prompt 变量（模型名称、时间等）
-- 🤳 二维码导出和导入提供商
-- 🤖 智能体自定义
-- 🧠 类ChatGPT记忆功能
-- 📝 AI翻译
-- 🌐 自定义HTTP请求头和请求体
+## 快速构建
 
-## ✨ 贡献
+推荐本机使用 JDK 21。源码当前使用 Gradle 9.5.0、AGP 9.3.1、Kotlin 2.4.10、Android SDK 37、NDK 28.2.13676358、CMake 3.22.1。版本以构建脚本为准。
 
-本项目使用[Android Studio](https://developer.android.com/studio)开发，欢迎提交PR
+在仓库根目录配置被 Git 忽略的 `local.properties`（只填写本机 SDK 路径）；完整 APK 构建还需要自己的 `app/google-services.json`。
 
-技术栈文档:
+```bash
+# Git Bash / Linux / macOS；PowerShell 使用 .\gradlew.bat
+./gradlew --version
+./gradlew :app:assembleDebug
+```
 
-- [Kotlin](https://kotlinlang.org/) (开发语言)
-- [Koin](https://insert-koin.io/) (依赖注入)
-- [Jetpack Compose](https://developer.android.com/jetpack/compose) (UI 框架)
-- [DataStore](https://developer.android.com/topic/libraries/architecture/datastore?hl=zh-cn#preferences-datastore) (
-  偏好数据存储)
-- [Room](https://developer.android.com/training/data-storage/room) (数据库)
-- [Coil](https://coil-kt.github.io/coil/) (图片加载)
-- [Material You](https://m3.material.io/) (UI 设计)
-- [Navigation 3](https://developer.android.com/guide/navigation/navigation-3) (导航)
-- [Okhttp](https://square.github.io/okhttp/) (HTTP 客户端)
-- [kotlinx.serialization](https://github.com/Kotlin/kotlinx.serialization) (Json序列化)
+Debug APK：`app/build/outputs/apk/debug/`，Debug 包名带 `.debug`。正式版需要另配发布密钥；详细步骤与测试命令见[维护指南](docs/PROJECT_GUIDE.md)，不要把 Debug 签名当作正式签名。
 
-> [!TIP]
-> 你需要在 `app` 文件夹下添加 `google-services.json` 文件才能构建应用。
+## 隐私与安全
 
-> [!IMPORTANT]  
-> 以下PR将被拒绝：
-> 1. 添加新语言，因为添加新语言会增加后续本地化的工作量
-> 2. 添加新功能，这个项目是有态度的
-> 3. AI生成的大规模重构和更改
+- 使用模型、搜索、MCP 时，相应内容会发送到所配置的服务；这不是完全离线应用。
+- **当前新导出的备份是明文 ZIP，可能含 API Key、MCP/同步凭据、聊天和工作区数据**。仅存可信位置，不上传公共仓库或公开分享；校验哈希不等于加密。
+- AI 文件工具限制在 `/workspace`；Shell 按共享、私有和人工终端分模式。PRoot 不是抵抗恶意原生程序的内核级沙箱，也不保证断网。
+- 发布密钥、口令、`local.properties`、Google Services 私有配置和真实用户数据库不得进入 Git。
 
-## 💰 捐赠
+## 贡献与许可证
 
-* [Patreon](https://patreon.com/rikkahub)
-* [爱发电](https://afdian.com/a/reovo)
+保持小范围、可审阅的修改，补充对应测试和文档；不要顺手删除或覆盖别人尚未提交的工作。提交、推送、上游同步和正式发布需单独授权。
 
-## ⭐ Star History
-
-如果喜欢这个项目，请给个Star ⭐
-
-<a href="https://www.star-history.com/?type=date&repos=re-ovo%2Frikkahub">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=re-ovo/rikkahub&type=date&theme=dark&legend=top-left&sealed_token=qSytWeq7LkzQQViTjK0MYlvvA_qkfuwjOxOqgbRpLUZZwok5rO6LXhpVL7Mq-q3o89BfKpzE7g66BCy18H6eiqTsD8czD0J-HejLqmHy-npcvCTHu11wZw" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=re-ovo/rikkahub&type=date&legend=top-left&sealed_token=qSytWeq7LkzQQViTjK0MYlvvA_qkfuwjOxOqgbRpLUZZwok5rO6LXhpVL7Mq-q3o89BfKpzE7g66BCy18H6eiqTsD8czD0J-HejLqmHy-npcvCTHu11wZw" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=re-ovo/rikkahub&type=date&legend=top-left&sealed_token=qSytWeq7LkzQQViTjK0MYlvvA_qkfuwjOxOqgbRpLUZZwok5rO6LXhpVL7Mq-q3o89BfKpzE7g66BCy18H6eiqTsD8czD0J-HejLqmHy-npcvCTHu11wZw" />
- </picture>
-</a>
-
-## 📄 许可证
-
-本项目基于 [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0) 开源。
+基于 [GNU Affero General Public License v3.0](LICENSE)（AGPL-3.0）。分发修改版本或提供相关网络服务时，应遵守适用的源码提供义务。上游原作者与贡献者的版权及许可证仍保留在源码和 LICENSE 中。

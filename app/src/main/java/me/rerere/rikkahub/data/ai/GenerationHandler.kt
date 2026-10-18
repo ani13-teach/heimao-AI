@@ -36,7 +36,6 @@ import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.ToolApprovalState
 import me.rerere.rikkahub.data.ai.tools.WorkspaceAptToolCall
-import me.rerere.ai.ui.limitContext
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.ai.transformers.InputMessageTransformer
 import me.rerere.rikkahub.data.ai.transformers.MessageTransformer
@@ -83,7 +82,17 @@ sealed interface GenerationChunk {
     data class Messages(
         val messages: List<UIMessage>
     ) : GenerationChunk
+
 }
+
+/** 输出转换只作用于当前回复，不能重写已经参与摘要校验的历史前缀。 */
+internal suspend fun List<UIMessage>.transformLatestResponse(
+    transform: suspend (List<UIMessage>) -> List<UIMessage>,
+): List<UIMessage> = if (isEmpty()) this else dropLast(1) + transform(listOf(last()))
+
+/** 请求内合成的 USER 注入不能改变真实当前轮的边界。 */
+internal fun List<UIMessage>.latestRealUserIndex(): Int =
+    indexOfLast { it.role == MessageRole.USER && !it.isSynthetic }
 
 internal fun List<UIMessage>.withAdditionalContextMessages(
     additionalContextMessages: List<UIMessage>,
@@ -312,6 +321,8 @@ class GenerationHandler(
         workspaceAssistantId: String? = null,
         workspaceConversationId: String? = null,
         useLayeredMemory: Boolean = false,
+        // 直接等待持久化完成；不能依赖 flowOn 缓冲中的事件在请求失败后仍会送达。
+        onContextCompressed: suspend (List<UIMessage>) -> Unit = {},
     ): Flow<GenerationChunk> = flow {
         val provider = model.findProvider(settings.providers) ?: error("Provider not found")
         val providerImpl = providerManager.getProviderByType(provider)
@@ -421,23 +432,31 @@ class GenerationHandler(
                     settings = settings,
                     messages = messages,
                     additionalContextMessages = additionalContextMessages,
+                    onContextCompressed = { updated ->
+                        onContextCompressed(updated)
+                        messages = updated
+                    },
                     onUpdateMessages = {
-                        messages = it.transforms(
-                            transformers = outputTransformers,
-                            context = context,
-                            model = model,
-                            assistant = assistant,
-                            settings = settings
-                        )
+                        messages = it.transformLatestResponse { latest ->
+                            latest.transforms(
+                                transformers = outputTransformers,
+                                context = context,
+                                model = model,
+                                assistant = assistant,
+                                settings = settings
+                            )
+                        }
                         emit(
                             GenerationChunk.Messages(
-                                messages.visualTransforms(
-                                    transformers = outputTransformers,
-                                    context = context,
-                                    model = model,
-                                    assistant = assistant,
-                                    settings = settings
-                                )
+                                messages.transformLatestResponse { latest ->
+                                    latest.visualTransforms(
+                                        transformers = outputTransformers,
+                                        context = context,
+                                        model = model,
+                                        assistant = assistant,
+                                        settings = settings
+                                    )
+                                }
                             )
                         )
                     },
@@ -478,20 +497,21 @@ class GenerationHandler(
                         },
                     )
                 }
-                messages = messages.visualTransforms(
-                    transformers = outputTransformers,
-                    context = context,
-                    model = model,
-                    assistant = assistant,
-                    settings = settings
-                )
-                messages = messages.onGenerationFinish(
-                    transformers = outputTransformers,
-                    context = context,
-                    model = model,
-                    assistant = assistant,
-                    settings = settings
-                )
+                messages = messages.transformLatestResponse { latest ->
+                    latest.visualTransforms(
+                        transformers = outputTransformers,
+                        context = context,
+                        model = model,
+                        assistant = assistant,
+                        settings = settings
+                    ).onGenerationFinish(
+                        transformers = outputTransformers,
+                        context = context,
+                        model = model,
+                        assistant = assistant,
+                        settings = settings
+                    )
+                }
                 messages = messages.slice(0 until messages.lastIndex) + messages.last().copy(
                     finishedAt = Clock.System.now()
                         .toLocalDateTime(TimeZone.currentSystemDefault())
@@ -665,18 +685,82 @@ class GenerationHandler(
             messages = messages.dropLast(1) + lastMessage.copy(parts = updatedParts)
             emit(
                 GenerationChunk.Messages(
-                    messages.transforms(
-                        transformers = outputTransformers,
-                        context = context,
-                        model = model,
-                        assistant = assistant,
-                        settings = settings
-                    )
+                    messages.transformLatestResponse { latest ->
+                        latest.transforms(
+                            transformers = outputTransformers,
+                            context = context,
+                            model = model,
+                            assistant = assistant,
+                            settings = settings
+                        )
+                    }
                 )
             )
         }
 
     }.flowOn(Dispatchers.IO)
+
+    private suspend fun compactRequestContext(
+        prompt: LogicalPrompt,
+        messages: List<UIMessage>,
+        settings: Settings,
+        chatModel: Model,
+        processingStatus: MutableStateFlow<String?>,
+    ): ContextCompactionResult {
+        val threshold = settings.autoCompressionThresholdTokens
+        val target = settings.autoCompressionTargetTokens
+        val compressionPromptOverhead = estimatePromptTokens(
+            LogicalPrompt.fromMessages(listOf(UIMessage.user(settings.compressPrompt.applyPlaceholders(
+                "content" to "",
+                "target_tokens" to target.toString(),
+                "additional_context" to "",
+                "locale" to Locale.getDefault().displayName,
+            ))))
+        )
+        val status = "正在自动压缩上下文…"
+        try {
+            return compactContextIfNeeded(
+                prompt = prompt,
+                messages = messages,
+                triggerTokens = threshold,
+                targetTokens = target,
+                maxSourceTokens = (threshold - compressionPromptOverhead - 16).coerceIn(1, 16_000),
+            ) { source, summaryBudget ->
+                processingStatus.value = status
+                val compressionModel = settings.compressionModelFor(chatModel)
+                val compressionProvider = compressionModel.findProvider(settings.providers)
+                    ?: error("压缩模型的供应商不可用")
+                val handler = providerManager.getProviderByType(compressionProvider)
+                val request = UIMessage.user(settings.compressPrompt.applyPlaceholders(
+                    "content" to source,
+                    "target_tokens" to summaryBudget.toString(),
+                    "additional_context" to "",
+                    "locale" to Locale.getDefault().displayName,
+                ))
+                check(estimatePromptTokens(LogicalPrompt.fromMessages(listOf(request))) <= threshold) {
+                    "触发长度太小，无法容纳压缩提示词和来源内容，请提高自动压缩触发长度"
+                }
+                val result = handler.generateTextWithModelTransport(
+                    providerSetting = compressionProvider,
+                    messages = listOf(request),
+                    params = TextGenerationParams(
+                        model = compressionModel,
+                        maxTokens = summaryBudget,
+                        customHeaders = compressionModel.customHeaders,
+                        customBody = compressionModel.customBodies,
+                    ),
+                )
+                chatLogStore.recordTokenUsage(
+                    model = compressionModel,
+                    provider = compressionProvider,
+                    usage = result.lastOrNull()?.usage,
+                )
+                result.lastOrNull()?.toText()?.trim().orEmpty()
+            }
+        } finally {
+            if (processingStatus.value == status) processingStatus.value = null
+        }
+    }
 
     private suspend fun readOrdinaryMemories(
         memoryAssistantId: String?,
@@ -693,6 +777,7 @@ class GenerationHandler(
         settings: Settings,
         messages: List<UIMessage>,
         additionalContextMessages: List<UIMessage>,
+        onContextCompressed: suspend (List<UIMessage>) -> Unit,
         onUpdateMessages: suspend (List<UIMessage>) -> Unit,
         transformers: List<MessageTransformer>,
         model: Model,
@@ -726,7 +811,8 @@ class GenerationHandler(
                 append(tool.systemPrompt(model, messages))
             }
         }
-        val limitedMessages = messages.limitContext(assistant.contextMessageLimit)
+        // 全局 token 预算替代助手旧的消息条数裁剪。原聊天节点始终保留。
+        val contextMessages = messages.withStoredContextCompression()
         val memoryPrompt = if (assistant.enableMemory) {
             if (layeredMemoryContext != null) {
                 buildLayeredMemoryPrompt(layeredMemoryContext)
@@ -746,7 +832,7 @@ class GenerationHandler(
 
         val transformed = buildList {
             add(UIMessage.system(prompt = stableSystemPrompt).copy(isSynthetic = true))
-            addAll(limitedMessages)
+            addAll(contextMessages)
         }.transforms(
             transformers = transformers,
             context = context,
@@ -759,12 +845,12 @@ class GenerationHandler(
             workspaceCwd = workspaceCwd,
         )
         val systemMessages = transformed.filter { it.role == MessageRole.SYSTEM }
-        val stableSystem = systemMessages.firstOrNull() ?: UIMessage.system(stableSystemPrompt)
+        val stableSystems = systemMessages.ifEmpty { listOf(UIMessage.system(stableSystemPrompt)) }
         val conversationMessages = transformed.filter { it.role != MessageRole.SYSTEM }
-        val latestUserIndex = conversationMessages.indexOfLast { it.role == MessageRole.USER }
+        val latestUserIndex = conversationMessages.latestRealUserIndex()
         val logicalPrompt = LogicalPrompt(
             tools = tools,
-            system = listOf(stableSystem),
+            system = stableSystems,
             history = if (latestUserIndex >= 0) {
                 conversationMessages.take(latestUserIndex)
             } else {
@@ -794,9 +880,18 @@ class GenerationHandler(
                 emptyList()
             },
         )
-        val internalMessages = logicalPrompt.toMessages()
+        // 唯一请求入口：普通发送、重新生成和每一轮工具续跑均先检查完整请求。
+        val compaction = compactRequestContext(
+            prompt = logicalPrompt,
+            messages = messages,
+            settings = settings,
+            chatModel = model,
+            processingStatus = processingStatus,
+        )
+        if (compaction.compressed) onContextCompressed(compaction.messages)
+        val internalMessages = compaction.prompt.toMessages()
 
-        var messages: List<UIMessage> = messages
+        var messages: List<UIMessage> = compaction.messages
         val params = TextGenerationParams(
             model = model,
             temperature = assistant.temperature,
@@ -812,7 +907,7 @@ class GenerationHandler(
                 addAll(assistant.customBodies)
                 addAll(model.customBodies)
             },
-            logicalPrompt = logicalPrompt,
+            logicalPrompt = compaction.prompt,
         )
         messages = providerImpl.generateTextWithModelTransport(
             providerSetting = provider,

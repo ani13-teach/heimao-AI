@@ -14,14 +14,18 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.BottomAppBar
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LargeFlexibleTopAppBar
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -32,14 +36,17 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelType
@@ -51,6 +58,7 @@ import me.rerere.hugeicons.stroke.ArrowRight01
 import me.rerere.hugeicons.stroke.Cancel01
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.datastore.Settings
+import me.rerere.rikkahub.data.datastore.validateContextCompressionSettings
 import me.rerere.rikkahub.ui.components.ai.ModelListSheet
 import me.rerere.rikkahub.ui.components.ai.rememberModelListState
 import me.rerere.rikkahub.ui.components.nav.BackButton
@@ -196,6 +204,106 @@ private fun ModelSettingsPage(settings: Settings, vm: SettingVM, contentPadding:
                 providers = settings.providers,
                 onSelect = { vm.updateSettings(settings.copy(compressModelId = it.id)) },
             )
+        }
+        item {
+            ContextCompressionSettingItem(settings = settings, vm = vm)
+        }
+    }
+}
+
+@Composable
+private fun ContextCompressionSettingItem(settings: Settings, vm: SettingVM) {
+    var triggerInput by rememberSaveable(settings.autoCompressionThresholdTokens) {
+        mutableStateOf(settings.autoCompressionThresholdTokens.toString())
+    }
+    var targetInput by rememberSaveable(settings.autoCompressionTargetTokens) {
+        mutableStateOf(settings.autoCompressionTargetTokens.toString())
+    }
+    var notice by remember { mutableStateOf<String?>(null) }
+    var saving by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    val triggerTokens = triggerInput.toIntOrNull()
+    val targetTokens = targetInput.toIntOrNull()
+    val validationError = when {
+        triggerTokens == null -> "触发阈值不能为空，请输入 0～9999999；0 表示关闭自动压缩"
+        targetTokens == null -> "压缩目标不能为空，请输入 1～9999999"
+        else -> validateContextCompressionSettings(triggerTokens, targetTokens)
+    }
+
+    Card(colors = CustomColors.cardColorsOnSurfaceContainer) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("自动上下文压缩", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "所有助手和供应商共用。输入最多 7 位数字，两项一起保存。0 关闭自动压缩；开启时压缩后上限须小于触发长度。token 按本地统一规则估算，并非供应商的精确计数；上限包含摘要、系统提示词、工具、记忆和当前问题等全部请求内容。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedTextField(
+                value = triggerInput,
+                onValueChange = { value ->
+                    if (value.length <= 7 && value.all { it in '0'..'9' }) {
+                        triggerInput = value
+                        notice = null
+                    } else {
+                        notice = "只能输入最多 7 位 ASCII 数字（0～9）"
+                    }
+                },
+                label = { Text("自动压缩触发长度（token）") },
+                supportingText = { Text("0～9999999；0 关闭，默认 100000；不能留空") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                singleLine = true,
+                enabled = !settings.init && !saving,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = targetInput,
+                onValueChange = { value ->
+                    if (value.length <= 7 && value.all { it in '0'..'9' }) {
+                        targetInput = value
+                        notice = null
+                    } else {
+                        notice = "只能输入最多 7 位 ASCII 数字（0～9）"
+                    }
+                },
+                label = { Text("压缩后上下文上限（token）") },
+                supportingText = { Text("1～9999999，默认 10000；不能为 0 或留空") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                singleLine = true,
+                enabled = !settings.init && !saving,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            validationError?.let { error ->
+                Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            }
+            notice?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+            Button(
+                onClick = {
+                    if (validationError != null || triggerTokens == null || targetTokens == null) {
+                        notice = "未保存：$validationError"
+                    } else {
+                        saving = true
+                        scope.launch {
+                            try {
+                                vm.updateContextCompressionSettings(triggerTokens, targetTokens)
+                                notice = "已保存自动压缩设置"
+                            } catch (error: CancellationException) {
+                                throw error
+                            } catch (error: Exception) {
+                                notice = "保存失败：${error.message ?: "请重试"}"
+                            } finally {
+                                saving = false
+                            }
+                        }
+                    }
+                },
+                enabled = !settings.init && !saving,
+                modifier = Modifier.align(Alignment.End),
+            ) {
+                Text(if (saving) "保存中…" else "保存自动压缩设置")
+            }
         }
     }
 }
