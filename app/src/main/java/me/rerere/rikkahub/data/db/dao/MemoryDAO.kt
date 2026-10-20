@@ -27,6 +27,9 @@ interface MemoryDAO {
     @Query("SELECT * FROM memoryentity WHERE id = :id")
     suspend fun getMemoryById(id: Int): MemoryEntity?
 
+    @Query("SELECT * FROM memoryentity WHERE assistant_id = :assistantId AND id = :id AND status = :status")
+    suspend fun getMemoryInScope(assistantId: String, id: Int, status: String): MemoryEntity?
+
     @Query(
         """
         SELECT * FROM memoryentity
@@ -67,6 +70,32 @@ interface MemoryDAO {
         confidencePattern: String?,
         status: String,
         limit: Int,
+    ): List<MemoryEntity>
+
+    @Query(
+        """
+        SELECT * FROM memoryentity
+        WHERE assistant_id = :assistantId AND status = :status
+          AND (:category IS NULL OR category = :category)
+          AND (:confidencePattern IS NULL OR confidence_flags LIKE :confidencePattern ESCAPE '\')
+          AND (:keyword = '' OR title LIKE '%' || :keyword || '%' ESCAPE '\'
+               OR tags LIKE '%' || :keyword || '%' ESCAPE '\'
+               OR content LIKE '%' || :keyword || '%' ESCAPE '\')
+          AND (:afterUpdated IS NULL OR updated < :afterUpdated
+               OR (updated = :afterUpdated AND id < :afterId))
+        ORDER BY updated DESC, id DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun searchMemoriesPage(
+        assistantId: String,
+        keyword: String,
+        category: String?,
+        confidencePattern: String?,
+        status: String,
+        limit: Int,
+        afterUpdated: String?,
+        afterId: Int?,
     ): List<MemoryEntity>
 
     @Query(

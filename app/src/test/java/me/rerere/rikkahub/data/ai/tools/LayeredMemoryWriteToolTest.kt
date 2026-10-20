@@ -45,6 +45,18 @@ class LayeredMemoryWriteToolTest {
 
         override suspend fun getMemoryById(id: Int): MemoryEntity? = rows.firstOrNull { it.id == id }
 
+        override suspend fun getMemoryInScope(assistantId: String, id: Int, status: String): MemoryEntity? =
+            rows.firstOrNull { it.id == id && it.assistantId == assistantId && it.status == status }
+
+        override suspend fun searchMemoriesPage(
+            assistantId: String, keyword: String, category: String?, confidencePattern: String?,
+            status: String, limit: Int, afterUpdated: String?, afterId: Int?,
+        ): List<MemoryEntity> = searchMemories(assistantId, keyword, category, confidencePattern, status, Int.MAX_VALUE)
+            .filter { afterUpdated == null || it.updated < afterUpdated ||
+                (it.updated == afterUpdated && it.id < afterId!!) }
+            .sortedWith(compareByDescending<MemoryEntity> { it.updated }.thenByDescending { it.id })
+            .take(limit)
+
         override suspend fun getMemoriesForLayeredIndex(assistantId: String, limit: Int): List<MemoryEntity> =
             rows.filter { it.assistantId == assistantId && it.status == "active" }.take(limit)
 

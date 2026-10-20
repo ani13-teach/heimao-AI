@@ -283,8 +283,7 @@ class MemoryRepository(private val memoryDAO: MemoryDAO) {
         getMemoriesOfAssistantForPrompt(GLOBAL_MEMORY_ID)
 
     /**
-     * 分层记忆上下文：常驻注入的索引（≤100 条 / ≤12000 字符）+
-     * ACTIVE 正文（≤8 条 / ≤8000 字符）。
+     * 旧版分层上下文兼容接口；生成流程和按需目录不调用此方法。
      */
     suspend fun getLayeredMemoryContext(assistantId: String): LayeredMemoryContext {
         val indexEntries = memoryDAO.getMemoriesForLayeredIndex(assistantId, LAYERED_INDEX_ENTRY_LIMIT)
@@ -324,6 +323,39 @@ class MemoryRepository(private val memoryDAO: MemoryDAO) {
             confidencePattern = confidencePattern,
             status = status,
             limit = safeLimit,
+        ).map { it.toAssistantMemory() }
+    }
+
+    /** Every exact read includes ownership and status in the database predicate. */
+    suspend fun getMemoryInScope(assistantId: String, id: Int, status: String): AssistantMemory? {
+        require(status == "active" || status == "archived") { "invalid memory status" }
+        return memoryDAO.getMemoryInScope(assistantId, id, status)?.toAssistantMemory()
+    }
+
+    /** One bounded keyset page, including an optional look-ahead record. */
+    suspend fun searchMemoriesPage(
+        assistantId: String,
+        keyword: String?,
+        category: String?,
+        confidence: String?,
+        status: String,
+        limit: Int,
+        afterUpdated: String? = null,
+        afterId: Int? = null,
+    ): List<AssistantMemory> {
+        require(status == "active" || status == "archived") { "invalid memory status" }
+        require(limit in 1..51) { "page limit must be between 1 and 51" }
+        require((afterUpdated == null) == (afterId == null)) { "both cursor sort keys are required" }
+        return memoryDAO.searchMemoriesPage(
+            assistantId = assistantId,
+            keyword = escapeLike(keyword?.trim().orEmpty()),
+            category = category?.takeIf { it.isNotBlank() },
+            confidencePattern = confidence?.trim()?.takeIf { it.isNotEmpty() }
+                ?.let { "%${escapeLike(it)}%" },
+            status = status,
+            limit = limit,
+            afterUpdated = afterUpdated,
+            afterId = afterId,
         ).map { it.toAssistantMemory() }
     }
 

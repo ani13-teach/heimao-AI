@@ -89,6 +89,7 @@ import me.rerere.rikkahub.data.datastore.getCurrentChatModel
 import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.model.Assistant
+import me.rerere.rikkahub.data.model.memoryMode
 import me.rerere.rikkahub.data.model.AssistantAffectScope
 import me.rerere.rikkahub.data.model.localFileUrls
 import me.rerere.rikkahub.data.model.replaceRegexes
@@ -995,6 +996,9 @@ class ChatService(
         val useExternalWebSearch = shouldUseExternalWebSearch(assistant, model)
 
         runCatching {
+            assistant.memoryMode.requireSupportedModel(model) {
+                context.getString(R.string.assistant_page_layered_memory_tool_required)
+            }
 
             // reset suggestions
             updateConversation(conversationId, initialConversation.copy(chatSuggestions = emptyList()))
@@ -1050,14 +1054,6 @@ class ChatService(
                 workspaceCwd = assistant.workspaceId?.let { conversation.workspaceCwd },
                 workspaceAssistantId = assistant.id.toString(),
                 workspaceConversationId = conversationId.toString(),
-                memories = if (!assistant.enableMemory || assistant.useLayeredMemory) {
-                    emptyList()
-                } else if (assistant.useGlobalMemory) {
-                    memoryRepository.getGlobalMemoriesForPrompt()
-                } else {
-                    memoryRepository.getMemoriesOfAssistantForPrompt(assistant.id.toString())
-                },
-                useLayeredMemory = assistant.useLayeredMemory,
                 inputTransformers = buildList {
                     addAll(inputTransformers)
                     add(templateTransformer)

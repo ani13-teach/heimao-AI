@@ -22,7 +22,6 @@ import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.core.Tool
 import me.rerere.ai.provider.ClaudeMemoryCacheBlock
 import me.rerere.ai.provider.CustomBody
-import me.rerere.ai.provider.LogicalPrompt
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelType
 import me.rerere.ai.provider.Provider
@@ -54,7 +53,8 @@ import me.rerere.rikkahub.data.datastore.findProvider
 import me.rerere.rikkahub.data.log.ChatLogStore
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.AssistantMemory
-import me.rerere.rikkahub.data.repository.LayeredMemoryContext
+import me.rerere.rikkahub.data.model.MemoryMode
+import me.rerere.rikkahub.data.model.memoryMode
 import me.rerere.rikkahub.data.repository.MemoryRepository
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
 import me.rerere.rikkahub.data.workspace.AssistantWorkspaceAccessGate
@@ -300,7 +300,6 @@ class GenerationHandler(
         inputTransformers: List<InputMessageTransformer> = emptyList(),
         outputTransformers: List<OutputMessageTransformer> = emptyList(),
         assistant: Assistant,
-        memories: List<AssistantMemory>? = null,
         memorySnapshotKey: String? = null,
         tools: List<Tool> = emptyList(),
         maxSteps: Int = 256,
@@ -311,32 +310,32 @@ class GenerationHandler(
         workspaceCwd: String? = null,
         workspaceAssistantId: String? = null,
         workspaceConversationId: String? = null,
-        useLayeredMemory: Boolean = false,
     ): Flow<GenerationChunk> = flow {
+        val memoryMode = assistant.memoryMode
+        memoryMode.requireSupportedModel(model) {
+            context.getString(R.string.assistant_page_layered_memory_tool_required)
+        }
         val provider = model.findProvider(settings.providers) ?: error("Provider not found")
         val providerImpl = providerManager.getProviderByType(provider)
 
         var messages: List<UIMessage> = messages
+        val memoryAssistantId = if (memoryMode == MemoryMode.OFF) null else {
+            if (assistant.useGlobalMemory) MemoryRepository.GLOBAL_MEMORY_ID else assistant.id.toString()
+        }
+        // Keep report/archival continuation state across tool steps in this generation.
+        val layeredMemoryTools by lazy {
+            buildLayeredMemoryTools(json = json, scopeId = memoryAssistantId!!, repo = memoryRepo)
+        }
 
         for (stepIndex in 0 until maxSteps) {
             Log.i(TAG, "streamText: start step #$stepIndex (${model.id})")
 
-            val memoryAssistantId = if (assistant?.enableMemory == true) {
-                if (assistant.useGlobalMemory) {
-                    MemoryRepository.GLOBAL_MEMORY_ID
-                } else {
-                    assistant.id.toString()
-                }
-            } else {
-                null
-            }
-
             val currentMemories = readOrdinaryMemories(
                 memoryAssistantId = memoryAssistantId,
                 useGlobalMemory = assistant.useGlobalMemory,
-                useLayeredMemory = useLayeredMemory,
+                memoryMode = memoryMode,
             )
-            val memoryResolution = if (memoryAssistantId != null && !useLayeredMemory) {
+            val memoryResolution = if (memoryMode == MemoryMode.ORDINARY) {
                 prepareMemorySnapshot(
                     memorySnapshots = memorySnapshots,
                     key = memorySnapshotKey,
@@ -346,41 +345,14 @@ class GenerationHandler(
                 MemorySnapshotResolution(snapshot = currentMemories)
             }
 
-            // 分层记忆：每次生成前重建索引 + ACTIVE 上下文（只记统计，不打印正文）
-            val layeredMemoryContext = if (useLayeredMemory) {
-                memoryAssistantId?.let { memoryRepo.getLayeredMemoryContext(it) }
-            } else {
-                null
-            }
-            layeredMemoryContext?.let { ctx ->
-                Log.i(
-                    TAG,
-                    "generateText: layered memory index=${ctx.indexCount} " +
-                        "active=${ctx.activeCount} " +
-                        "chars=${ctx.indexText.length + ctx.activeMemories.sumOf { it.content.length }}"
-                )
-            }
-
             val toolsInternal = buildList {
                 Log.i(TAG, "generateInternal: build tools($assistant)")
                 // 内置记忆工具名（仅记忆开启时受保护）；外部同名工具被过滤并告警，
                 // 保证内置工具的 scope/权限约束不被外部同名工具绕过。
-                val protectedNames = if (assistant?.enableMemory == true) {
-                    if (useLayeredMemory) {
-                        setOf("memory_read", "memory_write", "memory_consolidate")
-                    } else {
-                        setOf("memory_tool")
-                    }
-                } else {
-                    emptySet()
-                }
-                if (assistant?.enableMemory == true) {
-                    val memoryTools = if (useLayeredMemory) {
-                        buildLayeredMemoryTools(
-                            json = json,
-                            scopeId = memoryAssistantId!!,
-                            repo = memoryRepo,
-                        )
+                val protectedNames = memoryMode.toolNames
+                if (memoryMode != MemoryMode.OFF) {
+                    val memoryTools = if (memoryMode == MemoryMode.LAYERED) {
+                        layeredMemoryTools
                     } else {
                         buildMemoryTools(
                             json = json,
@@ -446,16 +418,14 @@ class GenerationHandler(
                     providerImpl = providerImpl,
                     provider = provider,
                     tools = toolsInternal,
-                    memories = currentMemories,
+                    memoryMode = memoryMode,
                     memorySnapshot = memoryResolution.snapshot,
                     claudeMemoryCacheBlocks = memoryResolution.claudeCacheBlocks,
                     memoryDelta = memoryResolution.delta,
                     claudeMemoryPatches = memoryResolution.claudePatches,
-                    layeredMemoryContext = layeredMemoryContext,
                     processingStatus = processingStatus,
                     conversationSystemPrompt = conversationSystemPrompt,
                     conversationModeInjectionIds = conversationModeInjectionIds,
-                    memorySnapshotKey = memorySnapshotKey,
                     workspaceId = workspaceId,
                     workspaceCwd = workspaceCwd,
                 )
@@ -473,7 +443,7 @@ class GenerationHandler(
                             readOrdinaryMemories(
                                 memoryAssistantId = memoryAssistantId,
                                 useGlobalMemory = assistant.useGlobalMemory,
-                                useLayeredMemory = useLayeredMemory,
+                                memoryMode = memoryMode,
                             )
                         },
                     )
@@ -562,7 +532,10 @@ class GenerationHandler(
                         executedTools += tool.copy(
                             output = listOf(
                                 UIMessagePart.Text(
-                                    json.encodeToString(
+                                    layeredMemoryFailureOutput(
+                                        memoryMode, tool.toolName,
+                                        IllegalStateException("Tool execution denied by user. Reason: ${reason.ifBlank { "No reason provided" }}"),
+                                    ) ?: json.encodeToString(
                                         buildJsonObject {
                                             put(
                                                 "error",
@@ -631,7 +604,7 @@ class GenerationHandler(
                             executedTools += tool.copy(
                                 output = listOf(
                                     UIMessagePart.Text(
-                                        json.encodeToString(
+                                        layeredMemoryFailureOutput(memoryMode, tool.toolName, error) ?: json.encodeToString(
                                             buildJsonObject {
                                                 put(
                                                     "error",
@@ -681,9 +654,9 @@ class GenerationHandler(
     private suspend fun readOrdinaryMemories(
         memoryAssistantId: String?,
         useGlobalMemory: Boolean,
-        useLayeredMemory: Boolean,
+        memoryMode: MemoryMode,
     ): List<AssistantMemory> = when {
-        memoryAssistantId == null || useLayeredMemory -> emptyList()
+        memoryMode != MemoryMode.ORDINARY || memoryAssistantId == null -> emptyList()
         useGlobalMemory -> memoryRepo.getGlobalMemoriesForPrompt()
         else -> memoryRepo.getMemoriesOfAssistantForPrompt(memoryAssistantId)
     }
@@ -699,7 +672,7 @@ class GenerationHandler(
         providerImpl: Provider<ProviderSetting>,
         provider: ProviderSetting,
         tools: List<Tool>,
-        memories: List<AssistantMemory>,
+        memoryMode: MemoryMode,
         memorySnapshot: List<AssistantMemory>,
         claudeMemoryCacheBlocks: List<ClaudeMemoryCacheBlock>?,
         memoryDelta: List<UIMessage>,
@@ -707,10 +680,8 @@ class GenerationHandler(
         processingStatus: MutableStateFlow<String?> = MutableStateFlow(null),
         conversationSystemPrompt: String? = null,
         conversationModeInjectionIds: Set<Uuid> = emptySet(),
-        memorySnapshotKey: String? = null,
         workspaceId: String? = null,
         workspaceCwd: String? = null,
-        layeredMemoryContext: LayeredMemoryContext? = null,
     ) {
         val effectiveSystemPrompt =
             if (assistant.allowConversationSystemPrompt && !conversationSystemPrompt.isNullOrBlank()) {
@@ -727,23 +698,6 @@ class GenerationHandler(
             }
         }
         val limitedMessages = messages.limitContext(assistant.contextMessageLimit)
-        val memoryPrompt = if (assistant.enableMemory) {
-            if (layeredMemoryContext != null) {
-                buildLayeredMemoryPrompt(layeredMemoryContext)
-            } else {
-                buildMemoryPrompt(memories = memorySnapshot)
-            }
-        } else {
-            ""
-        }
-        val hasMemoryContent = if (!assistant.enableMemory) {
-            false
-        } else if (layeredMemoryContext != null) {
-            layeredMemoryContext.indexCount > 0 || layeredMemoryContext.activeCount > 0
-        } else {
-            memorySnapshot.any { it.content.isNotBlank() }
-        }
-
         val transformed = buildList {
             add(UIMessage.system(prompt = stableSystemPrompt).copy(isSynthetic = true))
             addAll(limitedMessages)
@@ -761,38 +715,16 @@ class GenerationHandler(
         val systemMessages = transformed.filter { it.role == MessageRole.SYSTEM }
         val stableSystem = systemMessages.firstOrNull() ?: UIMessage.system(stableSystemPrompt)
         val conversationMessages = transformed.filter { it.role != MessageRole.SYSTEM }
-        val latestUserIndex = conversationMessages.indexOfLast { it.role == MessageRole.USER }
-        val logicalPrompt = LogicalPrompt(
+        val logicalPrompt = buildMemoryGenerationPrompt(
+            memoryMode = memoryMode,
             tools = tools,
-            system = listOf(stableSystem),
-            history = if (latestUserIndex >= 0) {
-                conversationMessages.take(latestUserIndex)
-            } else {
-                conversationMessages
-            },
-            transientContext = additionalContextMessages,
-            memorySnapshot = if (hasMemoryContent) {
-                listOf(UIMessage.system(prompt = memoryPrompt).copy(isSynthetic = true))
-            } else {
-                emptyList()
-            },
-            claudeMemoryCacheBlocks = if (assistant.enableMemory && layeredMemoryContext == null) {
-                claudeMemoryCacheBlocks
-            } else {
-                null
-            },
-            claudeMemoryDelta = if (assistant.enableMemory && layeredMemoryContext == null) {
-                // Committed patches already include the pending delta; adding both would duplicate it.
-                claudeMemoryPatches.ifEmpty { memoryDelta }
-            } else {
-                emptyList()
-            },
-            latestUser = conversationMessages.getOrNull(latestUserIndex),
-            currentToolLoop = if (latestUserIndex >= 0) {
-                conversationMessages.drop(latestUserIndex + 1)
-            } else {
-                emptyList()
-            },
+            stableSystem = stableSystem,
+            conversationMessages = conversationMessages,
+            additionalContextMessages = additionalContextMessages,
+            memorySnapshot = memorySnapshot,
+            claudeMemoryCacheBlocks = claudeMemoryCacheBlocks,
+            memoryDelta = memoryDelta,
+            claudeMemoryPatches = claudeMemoryPatches,
         )
         val internalMessages = logicalPrompt.toMessages()
 

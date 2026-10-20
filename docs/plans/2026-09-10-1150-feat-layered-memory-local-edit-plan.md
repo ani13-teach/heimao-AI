@@ -224,17 +224,19 @@ U1 → U2 依赖 U1 的纯函数；U3 依赖 U2 的写路径；U4 依赖 U3 的�
 
 ### U5. 提示词与说明同步
 
-- **Goal:** 模型在系统提示与工具描述里读到同一套写法，不会退回"整段重写"。
+- **Goal:** 模型在固定工具描述里读到一致的按需读取与局部修改规则，不会退回"整段重写"；不自动注入目录或 ACTIVE 正文。
 - **Requirements:** R5, R13
 - **Dependencies:** 无（但需在 U3 之后复查一致性）
-- **Files:** `app/src/main/java/me/rerere/rikkahub/data/ai/GenerationPrompts.kt`、`app/src/main/java/me/rerere/rikkahub/data/ai/tools/LayeredMemoryTools.kt`（`memory_consolidate` 说明文字）
+- **Files:** `app/src/main/java/me/rerere/rikkahub/data/ai/tools/LayeredMemoryTools.kt`（固定读取、写入与维护说明）
 - **Approach:**
-  - `buildLayeredMemoryPrompt` 的合并规则一条改为：默认用局部修改维护已有记录；同一条记录多点优先一次调用多补丁；不同记录可并行；先 create 拿到 id 才能 edit，必须分轮。
+  - 分层模式只注册 `memory_read`、`memory_write`、`memory_consolidate`，不自动读取目录或正文，不参与普通记忆快照、增量和专用缓存通道。读取结果作为工具输出保留在对话中。
+  - 工具固定规则：默认用局部修改维护已有记录；同一条记录多点优先一次调用多补丁；不同记录可并行；先 create 拿到 id 才能 edit，必须分轮。
   - `memory_consolidate` 的 `suggest_upgrades` 说明补一句落地方式：用 `memory_write action=edit` 只改 `confidence_flags`，不必重写正文。
   - 七天的过期确认规则与敏感信息规则保持不变。
 - **Patterns to follow:** 该文件现有中英混排的条目写法（英文一句、中文一句）。
 - **Test scenarios:**
-  - 用一条构造记录生成 `LayeredMemoryContext`，断言提示词包含"局部修改 / 多补丁 / 并行需互不依赖"的关键措辞，且仍包含"先 memory_read"与七天规则。
+  - 检查关闭／普通／分层模式隔离、空库与非空库不改变固定工具定义、分层模式无自动注入、历史与本轮工具结果保持原样，以及当前有效模型的工具能力门禁。
+  - 模式或全局范围切换只影响后续操作，不删除历史结果；工具固定说明保留七天待确认规则与局部修改约束。
 - **Verification:** `:app:testDebugUnitTest` 通过；提示词测试与工具描述用词一致。
 
 ---
@@ -277,7 +279,7 @@ U1 → U2 依赖 U1 的纯函数；U3 依赖 U2 的写路径；U4 依赖 U3 的�
 | U2 | 已完成 | `data/repository/MemoryRepository.kt`（`content: String?` + `edits`、`writeMutex`、`LayeredMemoryWriteResult`、补丁错误带记录 id）、`LayeredMemoryRepositoryTest.kt` |
 | U3 | 已完成 | `data/ai/tools/LayeredMemoryTools.kt`（`parseMemoryWriteRequest` + `MemoryWriteCommand`、schema 加 `edits`/`replace`、返回体带 `fragment` 与 `DiffMetadata`）、`LayeredMemoryToolsValidationTest.kt` |
 | U4 | 已完成（渲染未自动化测试） | `ui/components/message/tools/BuiltinToolUIs.kt`（`MemoryWriteToolUI`）、`ToolUI.kt`（注册）、`values/strings.xml`、`values-zh/strings.xml` |
-| U5 | 已完成 | `data/ai/GenerationPrompts.kt`（分层记忆提示词补局部修改规则）、`LayeredMemoryTools.kt`（`suggest_upgrades` 补落地方式）、`app/src/test/.../ai/LayeredMemoryPromptTest.kt` |
+| U5 | 已完成 | `data/ai/tools/LayeredMemoryTools.kt`（分层固定工具说明承载按需读取与局部修改规则）、`LayeredMemoryTools.kt`（`suggest_upgrades` 补落地方式）、`app/src/test/.../ai/LayeredMemoryPromptTest.kt` |
 
 ### 与方案的偏差（已核实）
 

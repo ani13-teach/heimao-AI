@@ -38,6 +38,18 @@ class LayeredMemoryRepositoryTest {
 
         override suspend fun getMemoryById(id: Int): MemoryEntity? = rows.firstOrNull { it.id == id }
 
+        override suspend fun getMemoryInScope(assistantId: String, id: Int, status: String): MemoryEntity? =
+            rows.firstOrNull { it.id == id && it.assistantId == assistantId && it.status == status }
+
+        override suspend fun searchMemoriesPage(
+            assistantId: String, keyword: String, category: String?, confidencePattern: String?,
+            status: String, limit: Int, afterUpdated: String?, afterId: Int?,
+        ): List<MemoryEntity> = searchMemories(assistantId, keyword, category, confidencePattern, status, Int.MAX_VALUE)
+            .filter { afterUpdated == null || it.updated < afterUpdated ||
+                (it.updated == afterUpdated && it.id < afterId!!) }
+            .sortedWith(compareByDescending<MemoryEntity> { it.updated }.thenByDescending { it.id })
+            .take(limit)
+
         override suspend fun getMemoriesForLayeredIndex(assistantId: String, limit: Int): List<MemoryEntity> =
             rows.filter { it.assistantId == assistantId && it.status == "active" }
                 .sortedWith(compareByDescending<MemoryEntity> { it.updated }.thenByDescending { it.id })
@@ -120,6 +132,36 @@ class LayeredMemoryRepositoryTest {
             dao.rows += row.copy(id = dao.nextId++)
         }
         return MemoryRepository(dao) to dao
+    }
+
+    @Test
+    fun `exact reads constrain ownership status and missing ids`() = runBlocking {
+        val (repo, _) = repoWith(
+            MemoryEntity(assistantId = "a", content = "own", status = "active"),
+            MemoryEntity(assistantId = "b", content = "other", status = "active"),
+            MemoryEntity(assistantId = "a", content = "old", status = "archived"),
+        )
+        assertEquals("own", repo.getMemoryInScope("a", 1, "active")?.content)
+        assertEquals(null, repo.getMemoryInScope("a", 2, "active"))
+        assertEquals(null, repo.getMemoryInScope("a", 3, "active"))
+        assertEquals(null, repo.getMemoryInScope("a", 99, "active"))
+        assertEquals("old", repo.getMemoryInScope("a", 3, "archived")?.content)
+    }
+
+    @Test
+    fun `keyset search preserves literal filters and same-date id ordering`() = runBlocking {
+        val (repo, _) = repoWith(
+            MemoryEntity(assistantId = "a", content = "a_b 100%", updated = "2026-09-10"),
+            MemoryEntity(assistantId = "a", content = "a_b 100%", updated = "2026-09-10"),
+            MemoryEntity(assistantId = "a", content = "axb 100x", updated = "2026-09-11"),
+            MemoryEntity(assistantId = "b", content = "a_b 100%", updated = "2026-09-12"),
+            MemoryEntity(assistantId = "a", content = "a_b 100%", updated = "2026-09-09"),
+        )
+        val first = repo.searchMemoriesPage("a", "a_b 100%", null, null, "active", 2)
+        assertEquals(listOf(2, 1), first.map { it.id })
+        val last = first.last()
+        val next = repo.searchMemoriesPage("a", "a_b 100%", null, null, "active", 2, last.updated, last.id)
+        assertEquals(listOf(5), next.map { it.id })
     }
 
     @Test

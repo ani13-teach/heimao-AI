@@ -46,6 +46,8 @@ import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.AssistantMemory
 import me.rerere.rikkahub.data.model.confidenceSummary
+import me.rerere.rikkahub.data.model.memoryMode
+import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.components.ui.CardGroup
 import me.rerere.rikkahub.ui.components.ui.RikkaConfirmDialog
@@ -63,6 +65,8 @@ fun AssistantMemoryPage(id: String) {
         }
     )
     val assistant by vm.assistant.collectAsStateWithLifecycle()
+    val settings by vm.settings.collectAsStateWithLifecycle()
+    val effectiveModel = settings.findModelById(assistant.chatModelId ?: settings.chatModelId)
     val memories by vm.memories.collectAsStateWithLifecycle()
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
 
@@ -86,6 +90,7 @@ fun AssistantMemoryPage(id: String) {
             innerPadding = innerPadding,
             assistant = assistant,
             memories = memories,
+            layeredMemoryModelError = !assistant.memoryMode.supportsModel(effectiveModel),
             onUpdateAssistant = { vm.update(it) },
             onDeleteMemory = { vm.deleteMemory(it) },
             onAddMemory = { vm.addMemory(it) },
@@ -99,6 +104,7 @@ private fun AssistantMemoryContent(
     innerPadding: PaddingValues,
     assistant: Assistant,
     memories: List<AssistantMemory>,
+    layeredMemoryModelError: Boolean,
     onUpdateAssistant: (Assistant) -> Unit,
     onAddMemory: (AssistantMemory) -> Unit,
     onUpdateMemory: (AssistantMemory) -> Unit,
@@ -190,7 +196,19 @@ private fun AssistantMemoryContent(
                 headlineContent = { Text(stringResource(R.string.assistant_page_layered_memory)) },
                 supportingContent = {
                     Text(
-                        text = stringResource(R.string.assistant_page_layered_memory_desc),
+                        text = stringResource(
+                            if (layeredMemoryModelError) {
+                                R.string.assistant_page_layered_memory_tool_required
+                            } else {
+                                R.string.assistant_page_layered_memory_desc
+                            }
+                        ),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (layeredMemoryModelError) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
                     )
                 },
                 trailingContent = {

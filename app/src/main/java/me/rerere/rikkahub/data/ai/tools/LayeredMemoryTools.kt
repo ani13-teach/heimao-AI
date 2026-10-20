@@ -194,54 +194,43 @@ private fun parseMemoryEdits(element: JsonElement?): List<MemoryEdit> {
     }
 }
 
-/** 完整记录（含正文），memory_read 用。 */
-private fun AssistantMemory.toLayeredJsonObject(): JsonObject = buildJsonObject {
-    put("id", id)
-    put("category", category)
-    put("title", title)
-    put("updated", updated)
-    put("confidence_flags", buildJsonArray { confidenceFlags.forEach { add(it) } })
-    put("tags", buildJsonArray { tags.forEach { add(it) } })
-    put("product", product)
-    put("status", status)
-    put("content", content)
-}
-
-/** 摘要（不含正文），memory_write 回执用：模型靠 fragment/diff 自查，不需要再背一遍整条记录。 */
-private fun AssistantMemory.toSummaryJsonObject(): JsonObject = buildJsonObject {
-    put("id", id)
-    put("category", category)
-    put("title", title)
-    put("updated", updated)
-    put("confidence_flags", buildJsonArray { confidenceFlags.forEach { add(it) } })
-    put("tags", buildJsonArray { tags.forEach { add(it) } })
-    put("product", product)
-    put("status", status)
-}
+/** 摘要只供模型回执；界面的完整差异元数据不经过此限制。 */
+private fun AssistantMemory.toSummaryJsonObject(): JsonObject = boundedMemorySummary(this)
 
 /**
  * 分层记忆工具集：memory_read / memory_write / memory_consolidate。
  *
- * 分层记忆模式下 system prompt 只注入索引 + ACTIVE 正文，正文按需通过
- * memory_read 加载；memory_write 强制 schema（缺必填拒绝）；memory_consolidate
- * 提供冲突检测、置信度升级建议与归档。
+ * 所有数据仅在明确调用后返回，不自动注入目录或 ACTIVE 正文。
  */
-fun buildLayeredMemoryTools(json: Json, scopeId: String, repo: MemoryRepository): List<Tool> = listOf(
+fun buildLayeredMemoryTools(json: Json, scopeId: String, repo: MemoryRepository): List<Tool> {
+    val reports = LayeredMemoryReports()
+    return listOf(
     Tool(
         name = "memory_read",
         description = """
-            Search and load full memory records on demand (layered memory mode).
-            The system prompt only injects a compact index and the most recent ACTIVE records;
-            use this tool to fetch the full content of any other record before relying on it.
+            Search or read memory on demand. No directory or ACTIVE body is automatically injected.
+            Query before relying on user preferences, existing agreements, historical parameters or ongoing tasks;
+            ordinary small talk need not search. Use id for exact reading in the current scope (active by default).
+            id cannot be combined with keywords/category/confidence/cursor. archived requires explicit status.
+            Lists return has_more/next_cursor independently of each record's content_complete/next_offset.
+            Continue lists with cursor and the same filters/status. Cursor binds scope and query, not a database snapshot.
+            Read remaining body with id + version + returned offset (original Unicode code points, not lines).
+            On version_changed restart at offset zero without version; never join different body versions.
+            Metadata text fields are limited to 160 code points; tags/confidence_flags to 8 entries of 48 code points each.
+            Limits are marked by metadata_truncated/truncated_fields. Total serialized output is bounded to $LAYERED_MEMORY_OUTPUT_LIMIT characters.
             Filters: keywords (matches title/tags/content, empty = browse by category), category, confidence substring, status.
             Category values: PARAMS (参数/配置), SOP (流程/步骤), METHOD (方法/技巧), CASES (案例/经验), ACTIVE (进行中事项), GENERAL (通用).
             Confidence flags vocabulary (see memory_write): ✅实测已验证, ⚠️单板待确认, 🔄待复核.
             Age rule: a record whose updated date is older than 7 days with ⚠️/待确认 confidence must be confirmed with the user first.
-            中文：正文不会全部注入，回答前先用本工具检索相关记忆，禁止凭印象编造参数细节。
+            中文：涉及记忆时先按需查询，禁止凭印象编造参数细节；列表翻页和正文续读互不替代。
         """.trimIndent(),
         parameters = {
             InputSchema.Obj(
                 properties = buildJsonObject {
+                    put("id", buildJsonObject { put("type", "integer"); put("description", "Exact record id; excludes keywords/category/confidence/cursor") })
+                    put("cursor", buildJsonObject { put("type", "string"); put("description", "List next_cursor; repeat unchanged filters and status") })
+                    put("offset", buildJsonObject { put("type", "integer"); put("description", "Returned Unicode code-point offset; requires id and version") })
+                    put("version", buildJsonObject { put("type", "string"); put("description", "Body hash returned by a prior read; requires id") })
                     put("keywords", buildJsonObject {
                         put("type", "string")
                         put("description", "Keywords to match against title/tags/content; empty means browse by category")
@@ -272,33 +261,8 @@ fun buildLayeredMemoryTools(json: Json, scopeId: String, repo: MemoryRepository)
             )
         },
         execute = { input ->
-            val params = input.jsonObject
-            val keywords = params["keywords"]?.jsonPrimitive?.contentOrNull
-            val category = params["category"]?.jsonPrimitive?.contentOrNull
-            category?.takeIf { it.isNotBlank() }?.let {
-                if (it !in MEMORY_CATEGORIES) error("invalid category: $it, must be one of $MEMORY_CATEGORIES")
-            }
-            val confidence = params["confidence"]?.jsonPrimitive?.contentOrNull
-            val status = params["status"]?.jsonPrimitive?.contentOrNull ?: "active"
-            if (status != "active" && status != "archived") error("invalid status: $status, must be active or archived")
-            val limit = params["limit"]?.jsonPrimitive?.intOrNull ?: 5
-            if (limit !in 1..20) error("limit must be between 1 and 20")
-
-            val results = repo.searchMemories(
-                assistantId = scopeId,
-                keyword = keywords,
-                category = category,
-                confidence = confidence,
-                status = status,
-                limit = limit,
-            )
-            val payload = buildJsonObject {
-                put("count", results.size)
-                put("memories", buildJsonArray {
-                    results.forEach { add(it.toLayeredJsonObject()) }
-                })
-            }
-            listOf(UIMessagePart.Text(payload.toString()))
+            val payload = readLayeredMemory(scopeId, repo, input.jsonObject)
+            listOf(UIMessagePart.Text(checkedMemoryOutput(payload)))
         }
     ),
     Tool(
@@ -315,6 +279,9 @@ fun buildLayeredMemoryTools(json: Json, scopeId: String, repo: MemoryRepository)
             another and cannot see each other's results, so never chain dependent changes across calls
             (create first, then edit its id in a later turn).
             Use action=replace (id + full content) only for restructuring a record, e.g. merging or condensing it.
+            Before replace, completely read the SAME body version, including every continuation fragment.
+            Partial reads may supply local anchors, but each anchor must still be unique in the latest full body.
+            version is only a read consistency check, NOT a new write lock; existing write concurrency is unchanged.
             content is not accepted for action=edit.
 
             Optional field parameters are applied only when present; pass an empty string/array to clear
@@ -436,11 +403,16 @@ fun buildLayeredMemoryTools(json: Json, scopeId: String, repo: MemoryRepository)
                         put("mode", command.mode)
                         put("memory", result.memory.toSummaryJsonObject())
                         if (command.edits.isNotEmpty()) put("replacements", command.edits.size)
-                        if (diff != null) put("fragment", diff.take(RESULT_FRAGMENT_CHAR_LIMIT))
+                        if (diff != null) {
+                            val fragment = diff.codePointSlice(0, minOf(diff.codePointsLength(), RESULT_FRAGMENT_CHAR_LIMIT))
+                            put("fragment", fragment)
+                            put("fragment_truncated", fragment != diff)
+                        }
                     }
                 }
             }
-            listOf(UIMessagePart.Text(text = payload.toString(), metadata = diffMetadata?.toMetadata()))
+            val boundedPayload = boundMemoryWriteReceipt(payload)
+            listOf(UIMessagePart.Text(text = checkedMemoryOutput(boundedPayload), metadata = diffMetadata?.toMetadata()))
         }
     ),
     Tool(
@@ -448,12 +420,18 @@ fun buildLayeredMemoryTools(json: Json, scopeId: String, repo: MemoryRepository)
         description = """
             Layered memory maintenance.
             Actions:
-            - rebuild_index: rebuild the injected index summary (returns line/char counts and the index text).
+            - rebuild_index: explicitly browse the current memory directory, without loading ACTIVE bodies; supports limit/cursor.
             - detect_conflicts: find records of the same category+product+overlapping tags that state the same key with different values (report only).
             - suggest_upgrades: when a ⚠️/待确认 record's key=value is confirmed by another record, suggest upgrading its confidence flag to ✅实测已验证 (report only). Apply a suggestion with memory_write (action=edit, id, confidence_flags only) — no need to rewrite the record content.
             - archive: archive records by id (ids required). dry_run=true only returns the ids that would be archived; dry_run=false actually archives them.
             After archiving, records disappear from the index and active set.
-            中文：冲突检测与升级建议只报告不自动修改；归档默认 dry_run 预览。
+            All outputs are bounded. For report has_more, repeat the SAME action/ids/dry_run with next_cursor.
+            Long reports use report_fragment: concatenate original code-point fragments then parse the complete JSON.
+            report_version binds report content; changed read-only reports require restarting. Archive receipts are immutable.
+            Report cursors expire on tool rebuild or session eviction;
+            expired archive receipts are NOT automatically re-executed. success describes the operation, complete describes output.
+            Directory cursors are bound to current scope/action. Report snapshots are bound to scope/action/parameters.
+            中文：冲突检测与升级建议只报告不自动修改；归档默认 dry_run 预览，回执续页不会再次归档。
         """.trimIndent(),
         parameters = {
             InputSchema.Obj(
@@ -468,10 +446,12 @@ fun buildLayeredMemoryTools(json: Json, scopeId: String, repo: MemoryRepository)
                         })
                         put("description", "Action to perform (required)")
                     })
+                    put("cursor", buildJsonObject { put("type", "string"); put("description", "next_cursor; repeat unchanged action/ids/dry_run") })
+                    put("limit", buildJsonObject { put("type", "integer"); put("description", "Directory page size (1-20, default 5)") })
                     put("ids", buildJsonObject {
                         put("type", "array")
                         put("items", buildJsonObject { put("type", "integer") })
-                        put("description", "Record ids (required for archive)")
+                        put("description", "Record ids (required for archive, at most 10000 per operation)")
                     })
                     put("dry_run", buildJsonObject {
                         put("type", "boolean")
@@ -486,83 +466,92 @@ fun buildLayeredMemoryTools(json: Json, scopeId: String, repo: MemoryRepository)
             val action = params["action"]?.jsonPrimitive?.contentOrNull
                 ?: error("action is required")
             val dryRun = params["dry_run"]?.jsonPrimitive?.contentOrNull
-                ?.toBooleanStrictOrNull() ?: true
-            val payload = when (action) {
-                "rebuild_index" -> {
-                    val ctx = repo.getLayeredMemoryContext(scopeId)
-                    buildJsonObject {
-                        put("action", "rebuild_index")
-                        put("index_lines", ctx.indexCount)
-                        put("index_chars", ctx.indexText.length)
-                        put("active_count", ctx.activeCount)
-                        put("index", ctx.indexText)
-                    }
-                }
+                ?.let { requireNotNull(it.toBooleanStrictOrNull()) { "dry_run must be a boolean" } } ?: true
+            val cursor = params["cursor"]?.jsonPrimitive?.contentOrNull
+            if (action == "rebuild_index") {
+                require(params.keys.all { it in setOf("action", "cursor", "limit") }) { "directory only accepts action/cursor/limit" }
+                val directoryParams = JsonObject(params.filterKeys { it in setOf("cursor", "limit") })
+                val directory = readLayeredMemory(scopeId, repo, directoryParams, directory = true)
+                listOf(UIMessagePart.Text(checkedMemoryOutput(directory)))
+            } else {
+                val payload = if (cursor != null && action == "archive") {
+                    reports.resume(scopeId, params, cursor)
+                } else {
+                    val report = when (action) {
 
-                "detect_conflicts" -> {
-                    val conflicts = detectConflicts(repo.getMemoryEntitiesByStatus(scopeId, "active"))
-                    buildJsonObject {
-                        put("action", "detect_conflicts")
-                        put("count", conflicts.size)
-                        put("conflicts", buildJsonArray {
-                            conflicts.forEach { conflict ->
-                                add(buildJsonObject {
-                                    put("key", conflict.key)
-                                    put("value_a", conflict.valueA)
-                                    put("value_b", conflict.valueB)
-                                    put("id_a", conflict.idA)
-                                    put("id_b", conflict.idB)
+                        "detect_conflicts" -> {
+                            val conflicts = detectConflicts(repo.getMemoryEntitiesByStatus(scopeId, "active"))
+                            buildJsonObject {
+                                put("action", "detect_conflicts")
+                                put("count", conflicts.size)
+                                put("conflicts", buildJsonArray {
+                                    conflicts.forEach { conflict ->
+                                        add(buildJsonObject {
+                                            put("key", conflict.key)
+                                            put("value_a", conflict.valueA)
+                                            put("value_b", conflict.valueB)
+                                            put("id_a", conflict.idA)
+                                            put("id_b", conflict.idB)
+                                        })
+                                    }
                                 })
                             }
-                        })
-                    }
-                }
+                        }
 
-                "suggest_upgrades" -> {
-                    val upgrades = suggestConfidenceUpgrades(repo.getMemoryEntitiesByStatus(scopeId, "active"))
-                    buildJsonObject {
-                        put("action", "suggest_upgrades")
-                        put("count", upgrades.size)
-                        put("upgrades", buildJsonArray {
-                            upgrades.forEach { upgrade ->
-                                add(buildJsonObject {
-                                    put("id", upgrade.id)
-                                    put("key", upgrade.key)
-                                    put("value", upgrade.value)
-                                    put("reason", upgrade.reason)
+                        "suggest_upgrades" -> {
+                            val upgrades = suggestConfidenceUpgrades(repo.getMemoryEntitiesByStatus(scopeId, "active"))
+                            buildJsonObject {
+                                put("action", "suggest_upgrades")
+                                put("count", upgrades.size)
+                                put("upgrades", buildJsonArray {
+                                    upgrades.forEach { upgrade ->
+                                        add(buildJsonObject {
+                                            put("id", upgrade.id)
+                                            put("key", upgrade.key)
+                                            put("value", upgrade.value)
+                                            put("reason", upgrade.reason)
+                                        })
+                                    }
                                 })
                             }
-                        })
-                    }
-                }
-
-                "archive" -> {
-                    val ids = params["ids"]?.jsonArray?.mapNotNull { it.jsonPrimitive.intOrNull }
-                        ?: error("ids is required for archive")
-                    if (dryRun) {
-                        val wouldArchive = repo.getMemoryEntitiesByStatus(scopeId, "active")
-                            .filter { it.id in ids }
-                            .map { it.id }
-                        buildJsonObject {
-                            put("action", "archive")
-                            put("dry_run", true)
-                            put("would_archive", buildJsonArray { wouldArchive.forEach { add(it) } })
                         }
-                    } else {
-                        val archived = repo.archiveMemories(scopeId, ids)
-                        buildJsonObject {
-                            put("action", "archive")
-                            put("dry_run", false)
-                            put("archived", buildJsonArray { archived.forEach { add(it) } })
-                        }
-                    }
-                }
 
-                else -> error(
-                    "unknown action: $action, must be one of [rebuild_index, detect_conflicts, suggest_upgrades, archive]"
-                )
+                        "archive" -> {
+                            val ids = params["ids"]?.jsonArray?.map {
+                                requireNotNull(it.jsonPrimitive.intOrNull) { "ids must contain integers" }
+                            } ?: error("ids is required for archive")
+                            require(ids.size <= 10_000) { "archive accepts at most 10000 ids per operation" }
+                            if (dryRun) {
+                                val wouldArchive = repo.getMemoryEntitiesByStatus(scopeId, "active")
+                                    .filter { it.id in ids }
+                                    .map { it.id }
+                                buildJsonObject {
+                                    put("action", "archive")
+                                    put("dry_run", true)
+                                    put("success", true)
+                                    put("would_archive", buildJsonArray { wouldArchive.forEach { add(it) } })
+                                }
+                            } else {
+                                val archived = repo.archiveMemories(scopeId, ids)
+                                buildJsonObject {
+                                    put("action", "archive")
+                                    put("dry_run", false)
+                                    put("success", true)
+                                    put("archived", buildJsonArray { archived.forEach { add(it) } })
+                                }
+                            }
+                        }
+
+                        else -> error(
+                            "unknown action: $action, must be one of [rebuild_index, detect_conflicts, suggest_upgrades, archive]"
+                        )
+                    }
+                    if (cursor == null) reports.start(scopeId, params, report)
+                    else reports.resume(scopeId, params, cursor, current = report)
+                }
+                listOf(UIMessagePart.Text(checkedMemoryOutput(payload)))
             }
-            listOf(UIMessagePart.Text(payload.toString()))
         }
     ),
-)
+    )
+}

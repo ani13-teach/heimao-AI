@@ -73,7 +73,10 @@
   <string name="assistant_page_max_tokens_no_token_limit">无Token限制</string>
   <string name="assistant_page_memory">记忆</string>
   <string name="assistant_page_memory_count">记忆: %d</string>
-  <string name="assistant_page_memory_desc">启用记忆后，模型在与你对话时尝试主动记录你的信息，并在后续其他对话中使用，此功能需要模型支持工具调用才能正常工作</string>
+  <string name="assistant_page_memory_desc">启用后，模型会记录对话中的信息，供后续对话使用，需要模型支持工具调用。关闭记忆或切换记忆范围，不会清除聊天历史中已有的记忆内容。</string>
+  <string name="assistant_page_layered_memory">分层记忆</string>
+  <string name="assistant_page_layered_memory_desc">通过 memory_read 按需读取记忆，不在每次请求中自动添加记忆内容。需开启记忆，并使用支持工具调用的模型。</string>
+  <string name="assistant_page_layered_memory_tool_required">当前模型不支持分层记忆，请选择支持工具调用的模型，或关闭分层记忆。</string>
   <string name="assistant_page_message_template">聊天内容模板</string>
   <string name="assistant_page_message_template_desc">控制聊天消息在发送给LLM之前的内容格式，通常不需要修改</string>
   <string name="assistant_page_message_template_missing_message">模板不包含 {{ message }}，用户消息将不会被发送</string>

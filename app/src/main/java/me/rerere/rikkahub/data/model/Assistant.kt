@@ -29,7 +29,7 @@ data class Assistant(
     val streamOutput: Boolean = true,
     val enableMemory: Boolean = false,
     val useGlobalMemory: Boolean = false, // 使用全局共享记忆而非助手隔离记忆
-    val useLayeredMemory: Boolean = false, // 分层记忆：只注入索引+ACTIVE，正文按需用 memory_read 加载
+    val useLayeredMemory: Boolean = false, // 分层记忆：通过工具按需查询，不自动注入索引或正文
     val enableRecentChatsReference: Boolean = false,
     val messageTemplate: String = "{{ message }}",
     val presetMessages: List<UIMessage> = emptyList(),
