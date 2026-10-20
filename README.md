@@ -1,104 +1,59 @@
-<div align="center">
-  <img src="docs/icon.png" alt="App Icon" width="100" />
-  <h1>黑猫ai</h1>
+# 黑猫ai / Heimao AI
 
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/rikkahub/rikkahub)
-[![Ask DeepWiki](https://img.shields.io/badge/zread.ai-blue?style=flat&logo=readthedocs)](https://zread.ai/rikkahub/rikkahub)
+An independently maintained Android fork of [RikkaHub](https://github.com/rikkahub/rikkahub), built with Kotlin, Jetpack Compose and Material 3. This repository is **not** an official upstream distribution.
 
-A native Android LLM chat client that supports switching between different providers for
-conversations 🤖💬
+**[完整简体中文说明](README_ZH_CN.md)** · [繁體中文](README_ZH_TW.md)
 
-Click to join our Discord server 👉 [【黑猫ai】](https://discord.gg/9weBqxe5c4)
+## Documentation
 
-[简体中文](README_ZH_CN.md) | [繁體中文](README_ZH_TW.md) | English
-</div>
+- [Development and maintenance guide (Chinese)](docs/PROJECT_GUIDE.md): architecture, setup, builds, tests, database compatibility, workspace security and signed releases.
+- [Documentation index](docs/README.md): current guidance versus historical plans and verification reports.
+- [Repository guidelines](AGENTS.md): read before editing.
 
-<div align="center">
-  <img src="docs/img/chat.png" alt="Chat Interface" width="150" />
-  <img src="docs/img/desktop.png" alt="Models Picker" width="450" />
-</div>
+## Features
 
-## 🚀 Download
+- OpenAI-, Google- and Anthropic-type providers; configurable models, endpoints, headers and request bodies.
+- Streaming chat, message branches, multimodal attachments and rich Markdown rendering.
+- Configurable assistants, prompt templates, Mode Injection, MCP and web search.
+- Memory and layered memory, assistant-scoped history tools, permanent conversation numbers and multi-conversation summaries.
+- PRoot workspaces, manual terminals, shared/private Linux environments and approved public apt plans.
+- Portable workspace backup/restore, runtime logs, background generation and message queues.
 
-🔗 [Download from Website](https://rikka-ai.com/download) (Recommended)
+Removed features include the local Web server/Web UI, ASR/TTS, quick messages, SillyTavern character-card import, Lorebook, and old update/sponsor/about entries. In-app WebView previews and ordinary file imports/exports remain available.
 
-🔗 [Download from Google Play](https://play.google.com/store/apps/details?id=me.rerere.rikkahub)
+Automatic context compression summarizes older history before requests without deleting chat records. The trigger and target lengths are configured in model settings; defaults are 100,000 and 10,000 estimated tokens. Set the trigger to 0 to disable it.
 
-> [!WARNING]
-> There are many forked versions of RikkaHub. Issues with forks are unrelated to RikkaHub, so please use forks with caution to avoid privacy leaks or excessive permission requests.
+## Download and setup
 
-## 💖 Sponsors
+Check [this fork's Releases](https://github.com/ani13-teach/rikkahub/releases) for available artifacts. `nightly` is a development prerelease; remote release availability was not checked in this documentation-only update. Upstream website/Play Store downloads are not this fork's releases.
 
-|                                         Sponsor                                         | Description                                                                                                                                                                                                                                         |
-|:---------------------------------------------------------------------------------------:|:----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| <img src="docs/sponsors/aihubmix.png" alt="Aihubmix" width="50" /><br /><b>Aihubmix</b> | Thanks to <a href="https://aihubmix.com?aff=pG7r">aihubmix.com</a> for their financial support. We recommend using aihubmix as a one-stop shop for mainstream models worldwide. (OpenAI, Claude, Google Gemini, DeepSeek, Qwen, and hundreds more). |
-| <img src="docs/sponsors/suixiang.jpg" alt="随想AI中转" width="50" /><br /><b><a href="https://sui-xiang.com">随想AI中转</a></b> | 感谢<a href="https://sui-xiang.com">随想AI中转</a>对本项目的赞助！随想AI中转 是一家可靠高效的 API 中继服务提供商，提供 Claude、Codex、Gemini 等的中继服务。注重隐私的中转站·无数据倒卖·无模型掺水，隐私，透明，极速售后。新账户注册每日签到就送 0.5 元测试额度，充值额度 1:1，无需订阅，按量付费。多线路冗余、跨区域容灾、自动故障切换，长链路 SSE 不中断。99.9% 可用性，关键调用从不掉队。 |
-| <img src="docs/sponsors/ztest.png" alt="真测 ztest.ai" width="50" /><br /><b><a href="https://ztest.ai">真测 ztest.ai</a></b> | 感谢<a href="https://ztest.ai">真测 ztest.ai</a>对本项目的赞助！真测 ztest.ai 是一个 AI 中转站模型检测平台，检测结果数据全公开，23 项探针覆盖协议、身份、能力、内容完整性、安全性、性能六大维度，交叉印证识别伪造与降级。作为独立第三方验证平台，实时监测 AI 中转站的模型真实性、响应质量与服务可用性。 |
+Android 8.0/API 26 or later is required; supported ABIs are arm64-v8a and x86_64. Configure your own provider endpoint, API key and model after installation. Tool use requires a compatible model. Linux environments require separate installation.
 
-## ✨ Features
+The release package ID remains `me.rerere.rikkahub`; different signing certificates prevent in-place upgrades from other distributions. Back up first.
 
-- 🎨 Material You Design and 🌙 Dark mode
-- 📦 Workspace: a proot-based Linux agent environment
-- 🔄 Multiple AI Provider Support: custom API / URL / models (all OpenAI, Google, Anthropic compatible api)
-- 🖼️ Multimodal input support (Image, Text Documentation, PDF, Docx)
-- 🖥️ Web access for multi-platform use
-- 🛠️ MCP support
-- 📝 Markdown Rendering (with code highlighting, Latex formulas, tables, Mermaid)
-- 🪾 Message Branching
-- 🔍 Search capabilities (Exa, Tavily, Zhipu, LinkUp, Brave, Perplexity, etc.)
-- 🧩 Prompt variables (model name, time, etc.)
-- 🤳 QR code export and import for providers
-- 🤖 Agent customization
-- 🧠 ChatGPT-like memory feature
-- 📝 AI Translation
-- 🌐 Custom HTTP request headers and request bodies
-- 💌 Silly Tavern character card import
+## Build
 
-## ✨ Contributing
+Current source configuration: Gradle 9.5.0, AGP 9.3.1, Kotlin 2.4.10, Android SDK 37, NDK 28.2.13676358 and CMake 3.22.1. Local development recommends JDK 21; the source JVM target is 17.
 
-This project is developed using [Android Studio](https://developer.android.com/studio). PRs are
-welcome!
+Set your SDK path in ignored `local.properties` and provide your own `app/google-services.json` for a complete APK build.
 
-Technology stack documentation:
+```bash
+./gradlew --version
+./gradlew :app:assembleDebug
+```
 
-- [Kotlin](https://kotlinlang.org/) (Development language)
-- [Koin](https://insert-koin.io/) (Dependency Injection)
-- [Jetpack Compose](https://developer.android.com/jetpack/compose) (UI framework)
-- [DataStore](https://developer.android.com/topic/libraries/architecture/datastore) (Preference data
-  storage)
-- [Room](https://developer.android.com/training/data-storage/room) (Database)
-- [Coil](https://coil-kt.github.io/coil/) (Image loading)
-- [Material You](https://m3.material.io/) (UI design)
-- [Navigation 3](https://developer.android.com/guide/navigation/navigation-3) (Navigation)
-- [Okhttp](https://square.github.io/okhttp/) (HTTP client)
-- [kotlinx.serialization](https://github.com/Kotlin/kotlinx.serialization) (JSON serialization)
+Use `.\gradlew.bat` in PowerShell. Debug APKs are written to `app/build/outputs/apk/debug/` with the `.debug` package suffix. Release signing, test commands and troubleshooting are documented in the maintenance guide.
 
-> [!TIP]
-> You need a `google-services.json` file at `app` folder to build the app.
+## Privacy and safety
 
-> [!IMPORTANT]  
-> The following PRs will be rejected:
-> 1. Translation related changes, such as adding new languages or updating existing translations
-> 2. Adding new features, this project is opinionated and will not accept pull requests for new features
-> 3. Large-scale refactoring and changes generated by AI
+Configured model/search/MCP services may receive the data used by those requests. This is not a fully offline application.
 
-## 💰 Donate
+**New backups are plaintext ZIP archives and may contain API keys, MCP/sync credentials, conversations and workspace data.** Keep them private. Hash verification is not encryption. Legacy encrypted-archive restore support does not make new exports encrypted.
 
-* [Patreon](https://patreon.com/rikkahub)
-* [爱发电](https://afdian.com/a/reovo)
+AI file tools are restricted to `/workspace`. AI shells have different shared/private modes; manual terminals retain full Linux access. PRoot is not a kernel-level security boundary against arbitrary malicious native programs and does not guarantee network isolation.
 
-## ⭐ Star History
+Never commit keys, passwords, private Google Services configuration, `local.properties` or real user databases. Preserve existing uncommitted work and keep changes reviewable. Commits, pushes, upstream synchronization and releases require separate authorization.
 
-If you like this project, please give it a star ⭐
+## License and attribution
 
-<a href="https://www.star-history.com/?type=date&repos=re-ovo%2Frikkahub">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=re-ovo/rikkahub&type=date&theme=dark&legend=top-left&sealed_token=qSytWeq7LkzQQViTjK0MYlvvA_qkfuwjOxOqgbRpLUZZwok5rO6LXhpVL7Mq-q3o89BfKpzE7g66BCy18H6eiqTsD8czD0J-HejLqmHy-npcvCTHu11wZw" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=re-ovo/rikkahub&type=date&legend=top-left&sealed_token=qSytWeq7LkzQQViTjK0MYlvvA_qkfuwjOxOqgbRpLUZZwok5rO6LXhpVL7Mq-q3o89BfKpzE7g66BCy18H6eiqTsD8czD0J-HejLqmHy-npcvCTHu11wZw" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=re-ovo/rikkahub&type=date&legend=top-left&sealed_token=qSytWeq7LkzQQViTjK0MYlvvA_qkfuwjOxOqgbRpLUZZwok5rO6LXhpVL7Mq-q3o89BfKpzE7g66BCy18H6eiqTsD8czD0J-HejLqmHy-npcvCTHu11wZw" />
- </picture>
-</a>
-
-## 📄 License
-
-This project is licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0).
+Licensed under [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0). Upstream copyright and license notices remain in the source. Follow applicable source-availability obligations when distributing modifications or providing relevant network services.

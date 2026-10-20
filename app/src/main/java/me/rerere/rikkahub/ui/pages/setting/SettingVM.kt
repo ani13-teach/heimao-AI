@@ -48,6 +48,8 @@ class SettingVM(
                     ocrPrompt = settings.ocrPrompt,
                     compressModelId = settings.compressModelId,
                     compressPrompt = settings.compressPrompt,
+                    autoCompressionThresholdTokens = settings.autoCompressionThresholdTokens,
+                    autoCompressionTargetTokens = settings.autoCompressionTargetTokens,
                     providers = settings.providers,
                     searchServices = settings.searchServices,
                     searchCommonOptions = settings.searchCommonOptions,
@@ -55,6 +57,15 @@ class SettingVM(
                     mcpServers = settings.mcpServers,
                 )
             }
+        }
+    }
+
+    suspend fun updateContextCompressionSettings(triggerTokens: Int, targetTokens: Int) {
+        settingsStore.transformLatest { current ->
+            current.copy(
+                autoCompressionThresholdTokens = triggerTokens,
+                autoCompressionTargetTokens = targetTokens,
+            )
         }
     }
 }

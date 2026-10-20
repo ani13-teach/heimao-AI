@@ -36,10 +36,11 @@ class LayeredMemoryPromptTest {
         conversation: List<UIMessage> = listOf(question),
         tools: List<Tool> = emptyList(),
         committedPatches: List<UIMessage> = patches,
+        systems: List<UIMessage> = listOf(stableSystem),
     ) = buildMemoryGenerationPrompt(
         memoryMode = mode,
         tools = tools,
-        stableSystem = stableSystem,
+        stableSystems = systems,
         conversationMessages = conversation,
         additionalContextMessages = emptyList(),
         memorySnapshot = memories,
@@ -150,6 +151,25 @@ class LayeredMemoryPromptTest {
             })
         }
         assertTrue(prompt(MemoryMode.LAYERED).history.isEmpty())
+    }
+
+    @Test
+    fun `memory prompt preserves all systems and the real user through compression context`() {
+        val extraSystem = UIMessage.system("Additional required instructions")
+        val summary = contextCompressionMessage("Earlier conversation summary")
+        val reminder = UIMessage.user("Synthetic reminder").copy(isSynthetic = true)
+        val result = historicalRead("CURRENT TOOL RESULT")
+        for (mode in MemoryMode.entries) {
+            val request = prompt(
+                mode,
+                conversation = listOf(summary, question, result, reminder),
+                systems = listOf(stableSystem, extraSystem),
+            )
+            assertEquals(listOf(stableSystem, extraSystem), request.system)
+            assertEquals(listOf(summary), request.history)
+            assertSame(question, request.latestUser)
+            assertEquals(listOf(result, reminder), request.currentToolLoop)
+        }
     }
 
     @Test

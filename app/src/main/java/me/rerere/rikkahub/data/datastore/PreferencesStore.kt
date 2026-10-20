@@ -72,6 +72,12 @@ private val Context.settingsStore by preferencesDataStore(
 )
 
 private fun MutablePreferences.writeSettings(settings: Settings) {
+    val compressionError = validateContextCompressionSettings(
+        settings.autoCompressionThresholdTokens,
+        settings.autoCompressionTargetTokens,
+    )
+    require(compressionError == null) { compressionError.orEmpty() }
+
     this[SettingsStore.DYNAMIC_COLOR] = settings.dynamicColor
     this[SettingsStore.THEME_ID] = settings.themeId
     this[SettingsStore.CUSTOM_THEMES] = JsonInstant.encodeToString(settings.customThemes)
@@ -105,6 +111,8 @@ private fun MutablePreferences.writeSettings(settings: Settings) {
     this[SettingsStore.OCR_PROMPT] = settings.ocrPrompt
     this[SettingsStore.COMPRESS_MODEL] = settings.compressModelId.toString()
     this[SettingsStore.COMPRESS_PROMPT] = settings.compressPrompt
+    this[SettingsStore.AUTO_COMPRESSION_THRESHOLD_TOKENS] = settings.autoCompressionThresholdTokens
+    this[SettingsStore.AUTO_COMPRESSION_TARGET_TOKENS] = settings.autoCompressionTargetTokens
 
     this[SettingsStore.PROVIDERS] = JsonInstant.encodeToString(settings.providers)
 
@@ -174,6 +182,8 @@ class SettingsStore(
         val OCR_PROMPT = stringPreferencesKey("ocr_prompt")
         val COMPRESS_MODEL = stringPreferencesKey("compress_model")
         val COMPRESS_PROMPT = stringPreferencesKey("compress_prompt")
+        val AUTO_COMPRESSION_THRESHOLD_TOKENS = intPreferencesKey("auto_compression_threshold_tokens")
+        val AUTO_COMPRESSION_TARGET_TOKENS = intPreferencesKey("auto_compression_target_tokens")
 
         // 提供商
         val PROVIDERS = stringPreferencesKey("providers")
@@ -240,6 +250,10 @@ class SettingsStore(
                 ocrPrompt = preferences[OCR_PROMPT] ?: DEFAULT_OCR_PROMPT,
                 compressModelId = preferences[COMPRESS_MODEL]?.let { Uuid.parse(it) } ?: DEFAULT_AUTO_MODEL_ID,
                 compressPrompt = preferences[COMPRESS_PROMPT] ?: DEFAULT_COMPRESS_PROMPT,
+                autoCompressionThresholdTokens = preferences[AUTO_COMPRESSION_THRESHOLD_TOKENS]
+                    ?: Settings.DEFAULT_AUTO_COMPRESSION_THRESHOLD_TOKENS,
+                autoCompressionTargetTokens = preferences[AUTO_COMPRESSION_TARGET_TOKENS]
+                    ?: Settings.DEFAULT_AUTO_COMPRESSION_TARGET_TOKENS,
                 assistantId = preferences[SELECT_ASSISTANT]?.let { Uuid.parse(it) }
                     ?: DEFAULT_ASSISTANT_ID,
                 assistantTags = preferences[ASSISTANT_TAGS]?.let {
@@ -568,6 +582,10 @@ data class Settings(
     val ocrPrompt: String = DEFAULT_OCR_PROMPT,
     val compressModelId: Uuid = Uuid.random(),
     val compressPrompt: String = DEFAULT_COMPRESS_PROMPT,
+    /** 所有助手和供应商共用的自动压缩触发阈值；0 关闭。 */
+    val autoCompressionThresholdTokens: Int = DEFAULT_AUTO_COMPRESSION_THRESHOLD_TOKENS,
+    /** 自动压缩后期望保留的 token 数。 */
+    val autoCompressionTargetTokens: Int = DEFAULT_AUTO_COMPRESSION_TARGET_TOKENS,
     val assistantId: Uuid = DEFAULT_ASSISTANT_ID,
     val providers: List<ProviderSetting> = DEFAULT_PROVIDERS,
     val assistants: List<Assistant> = DEFAULT_ASSISTANTS,
@@ -586,6 +604,8 @@ data class Settings(
         const val DEFAULT_AUTO_RETRY_INTERVAL_SECONDS = 3
         const val DEFAULT_AUTO_RETRY_MAX_DURATION_MINUTES = 2
         const val DEFAULT_AUTO_RETRY_MAX_ATTEMPTS = 10
+        const val DEFAULT_AUTO_COMPRESSION_THRESHOLD_TOKENS = 100_000
+        const val DEFAULT_AUTO_COMPRESSION_TARGET_TOKENS = 10_000
 
         // 构造一个用于初始化的settings, 但它不能用于保存，防止使用初始值存储
         fun dummy() = Settings(init = true)

@@ -12,6 +12,13 @@ import kotlin.math.roundToInt
 import kotlin.time.Clock
 import kotlin.uuid.Uuid
 
+/** 摘要覆盖到携带它的原消息；源内容变化或分支切换后由 sourceHash 校验失效。 */
+@Serializable
+data class ContextCompression(
+    val sourceHash: String,
+    val summary: String,
+)
+
 // 公共消息抽象, 具体的Provider实现会转换为API接口需要的DTO
 @Serializable
 data class UIMessage(
@@ -25,6 +32,8 @@ data class UIMessage(
     val modelId: Uuid? = null,
     val usage: TokenUsage? = null,
     val translation: String? = null,
+    // 自动压缩只替换请求上下文，不删除历史；摘要随原消息的 JSON 持久化。
+    val contextCompression: ContextCompression? = null,
     // 请求期间临时拼出来的内部消息（系统提示、注入、时间提醒等）；该标记仅在内存中使用，不落库
     @Transient
     val isSynthetic: Boolean = false,

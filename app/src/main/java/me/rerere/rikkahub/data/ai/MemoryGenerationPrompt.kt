@@ -1,6 +1,5 @@
 package me.rerere.rikkahub.data.ai
 
-import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.Tool
 import me.rerere.ai.provider.ClaudeMemoryCacheBlock
 import me.rerere.ai.provider.LogicalPrompt
@@ -16,7 +15,7 @@ internal fun layeredMemoryFailureOutput(mode: MemoryMode, toolName: String, erro
 internal fun buildMemoryGenerationPrompt(
     memoryMode: MemoryMode,
     tools: List<Tool>,
-    stableSystem: UIMessage,
+    stableSystems: List<UIMessage>,
     conversationMessages: List<UIMessage>,
     additionalContextMessages: List<UIMessage>,
     memorySnapshot: List<AssistantMemory>,
@@ -25,10 +24,10 @@ internal fun buildMemoryGenerationPrompt(
     claudeMemoryPatches: List<UIMessage>,
 ): LogicalPrompt {
     val ordinary = memoryMode == MemoryMode.ORDINARY
-    val latestUserIndex = conversationMessages.indexOfLast { it.role == MessageRole.USER }
+    val latestUserIndex = conversationMessages.latestRealUserIndex()
     return LogicalPrompt(
         tools = tools,
-        system = listOf(stableSystem),
+        system = stableSystems,
         history = if (latestUserIndex >= 0) {
             conversationMessages.take(latestUserIndex)
         } else {

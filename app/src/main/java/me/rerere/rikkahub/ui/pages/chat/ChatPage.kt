@@ -620,11 +620,9 @@ private fun ChatFilesPickerSheet(
     val filesManager: FilesManager = koinInject()
     val workspaceBinding by vm.workspaceBinding.collectAsStateWithLifecycle()
     var showInjectionSheet by remember { mutableStateOf(false) }
-    var showCompressDialog by remember { mutableStateOf(false) }
 
     fun dismissAll() {
         showInjectionSheet = false
-        showCompressDialog = false
         onDismiss()
     }
 
@@ -778,9 +776,6 @@ private fun ChatFilesPickerSheet(
             state = inputState,
             assistant = assistant,
             mcpManager = vm.mcpManager,
-            onCompressContext = { additionalPrompt, targetTokens, keepRecentMessages ->
-                vm.handleCompressContext(additionalPrompt, targetTokens, keepRecentMessages)
-            },
             onUpdateAssistant = {
                 vm.updateSettings(
                     setting.copy(
@@ -803,8 +798,6 @@ private fun ChatFilesPickerSheet(
             onSetWorkspaceBinding = { vm.setWorkspaceBinding(assistant, it) },
             showInjectionSheet = showInjectionSheet,
             onShowInjectionSheetChange = { showInjectionSheet = it },
-            showCompressDialog = showCompressDialog,
-            onShowCompressDialogChange = { showCompressDialog = it },
             onDismiss = { dismissAll() },
             onTakePic = onLaunchCamera,
             onPickImage = { imagePickerLauncher.launch("image/*") },
