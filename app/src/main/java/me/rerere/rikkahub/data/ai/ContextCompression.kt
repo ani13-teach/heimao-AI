@@ -9,6 +9,8 @@ import me.rerere.ai.core.MessageRole
 import me.rerere.ai.provider.LogicalPrompt
 import me.rerere.ai.provider.Model
 import me.rerere.ai.ui.ContextCompression
+import me.rerere.ai.ui.CODEMODE_METADATA_KEY
+import me.rerere.ai.ui.withoutCodemodeTrace
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.utils.JsonInstant as json
@@ -106,7 +108,7 @@ private fun partTokens(part: UIMessagePart): Long = PART_OVERHEAD + when (part) 
 }
 
 private fun metadataTokens(metadata: JsonObject?): Long {
-    val providerFields = metadata?.filterKeys { it != "contextCompression" }.orEmpty()
+    val providerFields = metadata?.filterKeys { it != "contextCompression" && it != CODEMODE_METADATA_KEY }.orEmpty()
     return if (providerFields.isEmpty()) 0L else textTokens(JsonObject(providerFields).toString())
 }
 
@@ -140,7 +142,7 @@ private fun canonicalJson(element: JsonElement): JsonElement = when (element) {
 }
 
 private fun hashPart(part: UIMessagePart): JsonElement {
-    val encoded = json.encodeToJsonElement(part) as JsonObject
+    val encoded = json.encodeToJsonElement(part.withoutCodemodeTrace()) as JsonObject
     return when (part) {
         // Reasoning completion timestamps are streaming bookkeeping too.
         is UIMessagePart.Reasoning -> JsonObject(encoded.filterKeys { it != "finishedAt" })
@@ -199,7 +201,8 @@ internal suspend fun compactContextIfNeeded(
     val wrappedEmpty = reservedPrompt.copy(history = listOf(contextCompressionMessage("")))
     val summaryBudget = targetTokens.toLong() - estimatePromptTokens(wrappedEmpty).toLong()
     check(summaryBudget > 0) { "系统、工具、记忆及当前用户和工具链等必留内容已超出压缩目标，请提高压缩目标" }
-    var source = renderCompressionHistory(prompt.history.filter { it.role != MessageRole.SYSTEM })
+    var source = renderCompressionHistory(prompt.history.filter { it.role != MessageRole.SYSTEM }
+        .map { it.withoutCodemodeTrace() })
     check(source.isNotBlank()) { "历史消息没有可总结的内容，无法压缩上下文" }
     repeat(4) {
         coroutineContext.ensureActive()

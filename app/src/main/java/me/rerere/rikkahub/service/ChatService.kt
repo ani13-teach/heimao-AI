@@ -45,6 +45,8 @@ import me.rerere.ai.registry.ModelRegistry
 import me.rerere.ai.ui.ToolApprovalState
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.ai.ui.codemodeExecution
+import me.rerere.ai.ui.interruptCodemode
 import me.rerere.ai.ui.canResumeToolExecution
 import me.rerere.ai.ui.finishPendingTools
 import me.rerere.ai.ui.finishReasoning
@@ -54,6 +56,9 @@ import me.rerere.rikkahub.AppScope
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.ai.GenerationChunk
 import me.rerere.rikkahub.data.ai.GenerationHandler
+import me.rerere.rikkahub.data.ai.cancelRunningCodemode
+import me.rerere.rikkahub.data.ai.codemode.WorkspaceCodemodeRuntime
+import me.rerere.rikkahub.data.ai.codemode.createWorkspaceCodemodeTool
 import me.rerere.rikkahub.data.ai.fallbackCandidates
 import me.rerere.rikkahub.data.ai.mcp.McpManager
 import me.rerere.rikkahub.data.ai.runWithModelFallback
@@ -1010,6 +1015,8 @@ class ChatService(
                 }
             }
 
+            // Recover persisted executions before invalid-message pruning or tool resumption.
+            recoverRunningCodemode(conversationId)
             // check invalid messages
             checkInvalidMessages(conversationId)
 
@@ -1025,6 +1032,21 @@ class ChatService(
                 processingStatus = session.processingStatus,
             )
             conversation = getConversationFlow(conversationId).value
+            val workspaceTools = createWorkspaceToolsIfReady(
+                workspaceId = assistant.workspaceId?.toString(),
+                cwd = conversation.workspaceCwd,
+                assistantId = assistant.id.toString(),
+                conversationId = conversationId.toString(),
+            )
+            val workspaceCodemodeTool = if (
+                assistant.enableWorkspaceCodemode && workspaceTools.isNotEmpty() &&
+                WorkspaceCodemodeRuntime.isAvailable()
+            ) createWorkspaceCodemodeTool(workspaceTools) else null
+            val persistCheckpoint: suspend (List<UIMessage>) -> Unit = { messages ->
+                val updatedConversation = getConversationFlow(conversationId).value
+                    .updateCurrentMessages(messages)
+                saveConversation(conversationId, updatedConversation)
+            }
 
             // start generating
             generationHandler.generateText(
@@ -1050,12 +1072,8 @@ class ChatService(
                 workspaceCwd = assistant.workspaceId?.let { conversation.workspaceCwd },
                 workspaceAssistantId = assistant.id.toString(),
                 workspaceConversationId = conversationId.toString(),
-                onContextCompressed = { messages ->
-                    // 只更新摘要字段，保留原节点；先落库，再允许生成器发起主请求。
-                    val updatedConversation = getConversationFlow(conversationId).value
-                        .updateCurrentMessages(messages)
-                    saveConversation(conversationId, updatedConversation)
-                },
+                onContextCompressed = persistCheckpoint,
+                onToolCheckpoint = persistCheckpoint,
                 inputTransformers = buildList {
                     addAll(inputTransformers)
                     add(templateTransformer)
@@ -1070,14 +1088,8 @@ class ChatService(
                     if (assistant.enableRecentChatsReference) {
                         addAll(createConversationTools(conversationRepo, assistant.id, conversationId))
                     }
-                    addAll(
-                        createWorkspaceToolsIfReady(
-                            workspaceId = assistant.workspaceId?.toString(),
-                            cwd = conversation.workspaceCwd,
-                            assistantId = assistant.id.toString(),
-                            conversationId = conversationId.toString(),
-                        )
-                    )
+                    addAll(workspaceTools)
+                    workspaceCodemodeTool?.let { add(it) }
                     if (assistant.enabledSkills.isNotEmpty()) {
                         addAll(
                             createSkillTools(
@@ -1116,7 +1128,7 @@ class ChatService(
                             )
                         )
                     }
-                },
+                }.filter { it.name != "codemode" || it === workspaceCodemodeTool },
             ).onCompletion {
                 // 可能被取消了，或者意外结束，兜底更新（仅非挂起操作，取消上下文中安全）。
                 // 终结事件不在这里发送：成功路径由 onSuccess 发送，失败/取消路径由 onFailure 发送，
@@ -1259,6 +1271,7 @@ class ChatService(
     }
 
     private fun cancelToolByUser(tool: UIMessagePart.Tool): UIMessagePart.Tool {
+        if (tool.codemodeExecution != null) return tool.cancelRunningCodemode()
         return tool.copy(
             output = listOf(
                 UIMessagePart.Text(
@@ -1269,7 +1282,28 @@ class ChatService(
         )
     }
 
-    private suspend fun finishInterruptedPendingTools(conversationId: Uuid) {
+    private suspend fun recoverRunningCodemode(
+        conversationId: Uuid,
+        cancelledByUser: Boolean = false,
+    ) {
+        val conversation = getConversationFlow(conversationId).value
+        val updated = conversation.copy(messageNodes = conversation.messageNodes.map { node ->
+            node.copy(messages = node.messages.map { message ->
+                message.copy(parts = message.parts.map { part ->
+                    if (part is UIMessagePart.Tool) {
+                        if (cancelledByUser) part.cancelRunningCodemode() else part.interruptCodemode()
+                    } else part
+                })
+            })
+        })
+        if (updated != conversation) saveConversation(conversationId, updated)
+    }
+
+    private suspend fun finishInterruptedPendingTools(
+        conversationId: Uuid,
+        cancelledByUser: Boolean = false,
+    ) {
+        recoverRunningCodemode(conversationId, cancelledByUser)
         val currentConversation = getConversationFlow(conversationId).value
         val lastNode = currentConversation.messageNodes.lastOrNull() ?: return
         val lastMessage = lastNode.currentMessage
@@ -1887,6 +1921,6 @@ class ChatService(
             session.getJob()?.also { it.cancel() }
         } ?: return
         runCatching { job.join() }
-        finishInterruptedPendingTools(conversationId)
+        finishInterruptedPendingTools(conversationId, cancelledByUser = true)
     }
 }

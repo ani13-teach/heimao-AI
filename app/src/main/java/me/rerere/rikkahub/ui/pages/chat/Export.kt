@@ -88,6 +88,9 @@ import me.rerere.rikkahub.ui.components.message.MessagePartBlock
 import me.rerere.rikkahub.ui.components.message.ThinkingStep
 import me.rerere.rikkahub.ui.components.message.ChatMessageServerToolStep
 import me.rerere.rikkahub.ui.components.message.groupMessageParts
+import me.rerere.rikkahub.ui.components.message.formatCodemodeToolMarkdown
+import me.rerere.rikkahub.ui.components.message.summary
+import me.rerere.ai.ui.codemodeExecution
 import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
 import me.rerere.rikkahub.ui.components.ui.AutoAIIcon
 import me.rerere.rikkahub.ui.components.ui.BitmapComposer
@@ -252,7 +255,7 @@ private fun exportToMarkdown(
         messages.forEach { message ->
             val role = if (message.role == MessageRole.USER) "**User**" else "**Assistant**"
             append("$role:\n\n")
-            message.parts.forEach { part ->
+            message.parts.forEach parts@{ part ->
                 when (part) {
                     is UIMessagePart.Text -> {
                         append(part.text)
@@ -276,6 +279,11 @@ private fun exportToMarkdown(
                     }
 
                     is UIMessagePart.Tool -> {
+                        formatCodemodeToolMarkdown(part)?.let { markdown ->
+                            append(markdown)
+                            appendLine()
+                            return@parts
+                        }
                         append("**Tool**: `${part.toolName}`")
                         appendLine()
                         if (part.toolCallId.isNotBlank()) {
@@ -714,6 +722,27 @@ private fun ChainOfThoughtScope.ExportedReasoningStep(
 private fun ChainOfThoughtScope.ExportedToolStep(
     tool: UIMessagePart.Tool
 ) {
+    val codemodeMarkdown = formatCodemodeToolMarkdown(tool)
+    if (codemodeMarkdown != null) {
+        ControlledChainOfThoughtStep(
+            expanded = true,
+            onExpandedChange = {},
+            icon = {
+                Icon(HugeIcons.Wrench01, contentDescription = null,
+                    modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.secondary)
+            },
+            label = {
+                Text("Codemode · ${tool.codemodeExecution?.summary().orEmpty()}",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.secondary)
+            },
+            content = {
+                MarkdownBlock(content = codemodeMarkdown,
+                    style = MaterialTheme.typography.bodySmall, modifier = Modifier.fillMaxWidth())
+            },
+        )
+        return
+    }
     val memoryAction = runCatching {
         tool.inputAsJson().jsonObject["action"]?.jsonPrimitiveOrNull?.contentOrNull
     }.getOrNull()

@@ -129,6 +129,16 @@ private fun AssistantLocalToolContent(
     ) {
         CardGroup {
             item(
+                headlineContent = { Text("工作区 Codemode") },
+                supportingContent = { Text("用 JavaScript 批量调用工作区工具并筛选结果") },
+                trailingContent = {
+                    Switch(
+                        checked = assistant.enableWorkspaceCodemode,
+                        onCheckedChange = { onUpdate(assistant.copy(enableWorkspaceCodemode = it)) }
+                    )
+                }
+            )
+            item(
                 headlineContent = {
                     Text(stringResource(R.string.assistant_page_local_tools_javascript_engine_title))
                 },

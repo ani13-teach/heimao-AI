@@ -3,6 +3,8 @@ package me.rerere.rikkahub.data.ai
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -35,7 +37,11 @@ import me.rerere.ai.registry.ModelRegistry
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.ToolApprovalState
-import me.rerere.rikkahub.data.ai.tools.WorkspaceAptToolCall
+import me.rerere.ai.ui.CodemodeExecution
+import me.rerere.ai.ui.CodemodeStatus
+import me.rerere.ai.ui.codemodeExecution
+import me.rerere.ai.ui.withCodemodeExecution
+import me.rerere.ai.ui.withoutCodemodeTrace
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.ai.transformers.InputMessageTransformer
 import me.rerere.rikkahub.data.ai.transformers.MessageTransformer
@@ -322,6 +328,7 @@ class GenerationHandler(
         workspaceConversationId: String? = null,
         // 直接等待持久化完成；不能依赖 flowOn 缓冲中的事件在请求失败后仍会送达。
         onContextCompressed: suspend (List<UIMessage>) -> Unit = {},
+        onToolCheckpoint: suspend (List<UIMessage>) -> Unit = {},
     ): Flow<GenerationChunk> = flow {
         val memoryMode = assistant.memoryMode
         memoryMode.requireSupportedModel(model) {
@@ -330,7 +337,12 @@ class GenerationHandler(
         val provider = model.findProvider(settings.providers) ?: error("Provider not found")
         val providerImpl = providerManager.getProviderByType(provider)
 
-        var messages: List<UIMessage> = messages
+        val originalMessages = messages
+        var messages: List<UIMessage> = messages.interruptRunningCodemode()
+        if (messages != originalMessages) {
+            onToolCheckpoint(messages)
+            emit(GenerationChunk.Messages(messages))
+        }
         val memoryAssistantId = if (memoryMode == MemoryMode.OFF) null else {
             if (assistant.useGlobalMemory) MemoryRepository.GLOBAL_MEMORY_ID else assistant.id.toString()
         }
@@ -546,6 +558,23 @@ class GenerationHandler(
             // Handle tools (execute approved tools, handle denied tools)
             val executedTools = arrayListOf<UIMessagePart.Tool>()
             toolsToProcess.forEach { tool ->
+                var currentTool = tool
+                suspend fun checkpointTool(publish: Boolean = true) {
+                    val replacements = executedTools + currentTool
+                    val lastMessage = messages.last()
+                    messages = messages.dropLast(1) + lastMessage.copy(parts = lastMessage.parts.map { part ->
+                        if (part is UIMessagePart.Tool) {
+                            replacements.find { it.toolCallId == part.toolCallId } ?: part
+                        } else part
+                    })
+                    try {
+                        onToolCheckpoint(messages)
+                    } catch (error: Throwable) {
+                        if (error is CancellationException) throw error
+                        throw CodemodeCheckpointException(error)
+                    }
+                    if (publish) emit(GenerationChunk.Messages(messages))
+                }
                 when (tool.approvalState) {
                     is ToolApprovalState.Denied -> {
                         // Tool was denied by user
@@ -592,11 +621,28 @@ class GenerationHandler(
                                 error("Invalid tool arguments JSON for ${tool.toolName}: ${it.message}")
                             }
                             Log.i(TAG, "generateText: executing tool ${toolDef.name} with args: $args")
-                            val result = withContext(WorkspaceAptToolCall(tool.toolCallId)) {
-                                toolDef.execute(args)
+                            val result = if (toolDef.name == "codemode") {
+                                currentTool = currentTool.withCodemodeExecution(
+                                    CodemodeExecution(startedAt = System.currentTimeMillis())
+                                )
+                                checkpointTool()
+                                invokeWithCodemodeCheckpoints(
+                                    execute = { invokeToolRaw(toolDef, args, tool.toolCallId) },
+                                    checkpoint = { execution ->
+                                        currentTool = currentTool.withCodemodeExecution(execution)
+                                        if (execution.status != CodemodeStatus.RUNNING) {
+                                            currentTool = currentTool.copy(output = listOf(
+                                                UIMessagePart.Text("Codemode ${execution.status.name.lowercase()}.")
+                                            ))
+                                        }
+                                        checkpointTool()
+                                    },
+                                )
+                            } else {
+                                invokeToolRaw(toolDef, args, tool.toolCallId)
                             }
                             val hasShellAccess = toolsInternal.any { it.name == "workspace_shell" }
-                            executedTools += tool.copy(
+                            currentTool = currentTool.copy(
                                 output = maybeTruncateToolOutput(
                                     toolCallId = tool.toolCallId,
                                     output = result,
@@ -606,9 +652,40 @@ class GenerationHandler(
                                     conversationId = workspaceConversationId,
                                 )
                             )
+                            if (toolDef.name == "codemode") checkpointTool()
+                            executedTools += currentTool
                         }.onFailure { error ->
                             // 取消必须向上传播，否则停止生成会被误报为工具执行错误
-                            if (error is CancellationException) throw error
+                            if (error is CancellationException) {
+                                if (tool.toolName == "codemode") {
+                                    withContext(NonCancellable) {
+                                        withTimeoutOrNull(2_000) {
+                                            currentTool = currentTool.cancelRunningCodemode()
+                                            runCatching { checkpointTool(publish = false) }
+                                        }
+                                    }
+                                }
+                                throw error
+                            }
+                            if (error is CodemodeCheckpointException) throw error
+                            if (tool.toolName == "codemode") {
+                                currentTool.codemodeExecution?.takeIf { it.status == CodemodeStatus.RUNNING }
+                                    ?.let { execution ->
+                                        val now = System.currentTimeMillis()
+                                        currentTool = currentTool.withCodemodeExecution(execution.copy(
+                                            status = CodemodeStatus.FAILED,
+                                            finishedAt = now,
+                                            error = error.message,
+                                            operations = execution.operations.map { operation ->
+                                                if (operation.status == CodemodeStatus.RUNNING) operation.copy(
+                                                    status = CodemodeStatus.FAILED,
+                                                    finishedAt = now,
+                                                    error = error.message,
+                                                ) else operation
+                                            },
+                                        ))
+                                    }
+                            }
                             error.printStackTrace()
                             if (tool.toolName in MEMORY_TOOL_NAMES) {
                                 // 记忆失败单独记一条，带上动作和记录 id，方便在日志页直接定位
@@ -622,7 +699,7 @@ class GenerationHandler(
                             } else {
                                 chatLogStore.recordToolFailure(toolName = tool.toolName, error = error)
                             }
-                            executedTools += tool.copy(
+                            currentTool = currentTool.copy(
                                 output = listOf(
                                     UIMessagePart.Text(
                                         layeredMemoryFailureOutput(memoryMode, tool.toolName, error) ?: json.encodeToString(
@@ -639,6 +716,8 @@ class GenerationHandler(
                                     )
                                 )
                             )
+                            if (tool.toolName == "codemode") checkpointTool()
+                            executedTools += currentTool
                         }
                     }
                 }
@@ -784,7 +863,7 @@ class GenerationHandler(
             }
         }
         // 全局 token 预算替代助手旧的消息条数裁剪。原聊天节点始终保留。
-        val contextMessages = messages.withStoredContextCompression()
+        val contextMessages = messages.withStoredContextCompression().map { it.withoutCodemodeTrace() }
         val transformed = buildList {
             add(UIMessage.system(prompt = stableSystemPrompt).copy(isSynthetic = true))
             addAll(contextMessages)
@@ -807,7 +886,7 @@ class GenerationHandler(
             tools = tools,
             stableSystems = stableSystems,
             conversationMessages = conversationMessages,
-            additionalContextMessages = additionalContextMessages,
+            additionalContextMessages = additionalContextMessages.map { it.withoutCodemodeTrace() },
             memorySnapshot = memorySnapshot,
             claudeMemoryCacheBlocks = claudeMemoryCacheBlocks,
             memoryDelta = memoryDelta,
@@ -896,6 +975,7 @@ class GenerationHandler(
                 )
             }
         } catch (error: Throwable) {
+            if (error is CancellationException) throw error
             Log.w(TAG, "Failed to save full tool output inside workspace", error)
             return output
         }
