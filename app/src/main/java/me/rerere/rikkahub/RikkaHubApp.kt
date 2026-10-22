@@ -32,6 +32,8 @@ import me.rerere.rikkahub.utils.CrashHandler
 import me.rerere.rikkahub.utils.DatabaseUtil
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
 import me.rerere.rikkahub.data.workspace.AssistantWorkspaceBindingCoordinator
+import me.rerere.rikkahub.data.workspace.BackupTimings
+import me.rerere.rikkahub.data.workspace.WorkspaceArchiveCommitState
 import me.rerere.rikkahub.data.workspace.WorkspaceArchiveCleanup
 import me.rerere.rikkahub.data.workspace.WorkspaceArchiveRecovery
 import me.rerere.rikkahub.data.workspace.WorkspaceArchiveService
@@ -71,6 +73,10 @@ class RikkaHubApp : Application() {
 
         // Recover the database and workspace root before Koin can open a half-restored Room
         // graph. A failure is intentionally allowed to escape and stop normal startup.
+        val archiveRestoreCommitted = runCatching {
+            WorkspaceArchiveRecovery.readJournal(WorkspaceArchiveRecovery.journalFile(this))
+                ?.commitState == WorkspaceArchiveCommitState.COMMITTED
+        }.getOrDefault(false)
         var recoveryOutcome = WorkspaceArchiveRecovery.recoverBeforeKoin(this)
         // Snapshot recovery is a separate local transaction. Its filesystem half is repaired
         // before Room opens, while the Room status half is repaired immediately after Koin.
@@ -118,7 +124,7 @@ class RikkaHubApp : Application() {
 
         // Restore closes Room and exits before it can remove large recovery/staging trees. The
         // next process owns that cleanup after the new Room graph has been created.
-        cleanupPendingArchiveArtifacts()
+        cleanupPendingArchiveArtifacts(archiveRestoreCommitted)
 
         // delete temp files
         deleteTempFiles()
@@ -155,10 +161,14 @@ class RikkaHubApp : Application() {
         }
     }
 
-    private fun cleanupPendingArchiveArtifacts() {
+    private fun cleanupPendingArchiveArtifacts(committed: Boolean) {
         get<AppScope>().launch(Dispatchers.IO) {
             runCatching {
+                BackupTimings.noteRecoveryDecision(filesDir, committed)
                 WorkspaceArchiveCleanup.cleanupPending(this@RikkaHubApp)
+                if (!WorkspaceArchiveCleanup.hasPendingCleanup(this@RikkaHubApp)) {
+                    BackupTimings.completeRestart(filesDir, committed)
+                }
             }.onFailure {
                 Log.e(TAG, "cleanupPendingArchiveArtifacts failed", it)
             }

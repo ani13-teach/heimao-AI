@@ -83,6 +83,9 @@ internal object WorkspaceArchiveCleanup {
         cleanupGeneratedCacheArtifacts(context)
     }
 
+    fun hasPendingCleanup(context: Context): Boolean =
+        pendingMarkers(context.filesDir).isNotEmpty() || WorkspaceArchiveRecovery.protectsPendingCleanup(context)
+
     private fun cleanupGeneratedCacheArtifacts(context: Context) {
         val cacheDir = context.cacheDir
         if (Files.isSymbolicLink(cacheDir.toPath()) || !cacheDir.isDirectory) return

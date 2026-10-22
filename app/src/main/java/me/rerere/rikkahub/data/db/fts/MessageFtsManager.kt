@@ -9,8 +9,8 @@ import me.rerere.rikkahub.data.model.Conversation
 import java.time.Instant
 
 data class MessageSearchResult(
-    val nodeId: String,
-    val messageId: String,
+    val nodeId: String?,
+    val messageId: String?,
     val conversationId: String,
     val conversationNumber: Long,
     val title: String,
@@ -74,12 +74,14 @@ class MessageFtsManager(private val database: AppDatabase) {
         keyword: String,
         sort: MessageSearchSort = MessageSearchSort.RELEVANCE,
         limit: Int = 50,
+        assistantId: String? = null,
     ): List<MessageSearchResult> = searchInternal(
         keyword = keyword,
         sort = sort,
-        assistantId = null,
+        assistantId = assistantId,
         excludeConversationId = null,
         limit = limit,
+        includeTitles = true,
     )
 
     suspend fun searchForAssistant(
@@ -99,6 +101,7 @@ class MessageFtsManager(private val database: AppDatabase) {
         assistantId: String?,
         excludeConversationId: String?,
         limit: Int,
+        includeTitles: Boolean = false,
     ): List<MessageSearchResult> = withContext(Dispatchers.IO) {
         val statement = buildMessageSearchStatement(
             keyword = keyword,
@@ -106,6 +109,7 @@ class MessageFtsManager(private val database: AppDatabase) {
             assistantId = assistantId,
             excludeConversationId = excludeConversationId,
             limit = limit,
+            includeTitles = includeTitles,
         )
         val cursor = db.query(statement.sql, statement.args.toTypedArray())
         cursor.use {
@@ -113,8 +117,8 @@ class MessageFtsManager(private val database: AppDatabase) {
                 while (it.moveToNext()) {
                     add(
                         MessageSearchResult(
-                            nodeId = it.getString(0),
-                            messageId = it.getString(1),
+                            nodeId = if (it.isNull(0)) null else it.getString(0),
+                            messageId = if (it.isNull(1)) null else it.getString(1),
                             conversationId = it.getString(2),
                             conversationNumber = it.getLong(3),
                             title = it.getString(4),
@@ -139,6 +143,7 @@ internal fun buildMessageSearchStatement(
     assistantId: String?,
     excludeConversationId: String? = null,
     limit: Int = 50,
+    includeTitles: Boolean = false,
 ): MessageSearchStatement {
     val normalizedKeyword = keyword.trim()
     require(normalizedKeyword.isNotEmpty()) { "Search query must not be blank" }
@@ -167,7 +172,36 @@ internal fun buildMessageSearchStatement(
         $exclusionFilter
     """.trimIndent()
 
-    val sql = if (assistantId == null) {
+    require(!includeTitles || excludeConversationId == null) {
+        "App search cannot exclude a conversation"
+    }
+
+    val sql = if (includeTitles) {
+        // Keep FTS ranking/snippets inside MATCH; a title hit needs no indexed message.
+        """
+            WITH body_matches AS MATERIALIZED (
+                $baseSelect
+            )
+            SELECT * FROM body_matches
+            UNION ALL
+            SELECT NULL AS node_id, NULL AS message_id,
+                   conversationentity.id AS conversation_id,
+                   conversationentity.conversation_number AS conversation_number,
+                   conversationentity.title AS title,
+                   conversationentity.update_at AS update_at,
+                   conversationentity.title AS snippet,
+                   0.0 AS search_rank
+            FROM conversationentity
+            WHERE conversationentity.title LIKE '%' || ? || '%'
+            $assistantFilter
+              AND NOT EXISTS (
+                  SELECT 1 FROM body_matches
+                  WHERE body_matches.conversation_id = conversationentity.id
+              )
+            ORDER BY ${sort.orderBy}
+            LIMIT ?
+        """.trimIndent()
+    } else if (assistantId == null) {
         """
             $baseSelect
             ORDER BY ${sort.orderBy}
@@ -200,6 +234,10 @@ internal fun buildMessageSearchStatement(
             add(normalizedKeyword)
             if (assistantId != null) add(assistantId)
             if (excludeConversationId != null) add(excludeConversationId)
+            if (includeTitles) {
+                add(normalizedKeyword)
+                if (assistantId != null) add(assistantId)
+            }
             add(limit)
         },
     )

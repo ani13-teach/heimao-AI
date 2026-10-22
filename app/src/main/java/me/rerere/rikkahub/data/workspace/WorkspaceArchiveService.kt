@@ -14,6 +14,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import me.rerere.ai.ui.UIMessage
@@ -89,11 +90,13 @@ class WorkspaceArchiveService(
     suspend fun createBackupFile(
         includeDatabase: Boolean,
         includeFiles: Boolean,
-    ): File = workspaceRepository.withEnvironmentArchiveLease {
+        baseFile: File? = null,
+    ): File = withBackupTiming(context.filesDir, if (baseFile == null) "BACKUP_FULL" else "BACKUP_INCREMENTAL") {
+        workspaceRepository.withEnvironmentArchiveLease {
         withContext(Dispatchers.IO) {
             workspaceRepository.withWorkspaceCatalogArchiveLock {
                 try {
-                    createBackupFileLocked(includeDatabase, includeFiles)
+                    timedBackupPhase(BackupPhase.SOURCE_SCAN) { createBackupFileLocked(includeDatabase, includeFiles, baseFile) }
                 } catch (error: FileSystemException) {
                     // A java.nio file error carries nothing but a path as its message, so a failed
                     // backup would otherwise be undiagnosable from the transport UI. Name the file
@@ -108,9 +111,12 @@ class WorkspaceArchiveService(
         }
     }
 
+    }
+
     private suspend fun createBackupFileLocked(
         includeDatabase: Boolean,
         includeFiles: Boolean,
+        baseFile: File?,
     ): File = withContext(Dispatchers.IO) {
         val timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
         val target = File(context.cacheDir, "backup_${timestamp}_${UUID.randomUUID()}.zip")
@@ -205,6 +211,7 @@ class WorkspaceArchiveService(
                     )
                 },
                 legacyEntries = legacyFiles.map { it.archiveName },
+                legacyFilesIncluded = includeFiles,
                 snapshotsExcluded = databaseSnapshot?.snapshotsExcluded == true,
                 workspaces = payloads,
                 references = references,
@@ -218,49 +225,47 @@ class WorkspaceArchiveService(
                 actualDirectoryRoots = expectedDirectoryRoots,
             )
 
+            val manifestBytes = json.encodeToString(manifest).toByteArray(Charsets.UTF_8)
+            val settingsBytes = json.encodeToString(settings).toByteArray(Charsets.UTF_8)
+            require(manifestBytes.size <= MAX_MANIFEST_BYTES) { "Workspace manifest is too large" }
+            val sources = databaseFiles + payloads.flatMap { workspace ->
+                listOf(workspace.files, workspace.home).map { payload ->
+                    ArchiveSource(File(payloadDirectory, payloadFileName(payload)), payload.path)
+                }
+            } + legacyFiles
+            val incremental = baseFile?.let { base ->
+                timedBackupPhase(BackupPhase.INCREMENTAL_COMPARE) {
+                    ArchiveIncremental.plan(base, listOf(
+                        ArchiveIncremental.describe("manifest.json", manifestBytes),
+                        ArchiveIncremental.describe(WorkspaceArchiveManifest.SETTINGS_PATH, settingsBytes),
+                    ) + sources.map { ArchiveIncremental.describe(it.archiveName, it.file) }, budget)
+                }
+            }
+            val reused = incremental?.entries?.filter { it.fromBase }?.map { it.path }?.toSet().orEmpty()
+            timedBackupPhase(BackupPhase.ZIP_WRITE) {
             FileOutputStream(partialZip).use { rawOutput ->
                 BudgetOutputStream(rawOutput) { bytes ->
                     budget.recordZipCompressedBytes(bytes)
                     budget.recordStagingBytes(bytes, context.cacheDir)
                 }.use { trackedOutput ->
                     ZipOutputStream(BufferedOutputStream(trackedOutput)).use { zipOut ->
-                        addBytes(
-                            zipOut,
-                            "manifest.json",
-                            json.encodeToString(manifest).toByteArray(Charsets.UTF_8),
-                            budget,
-                        )
-                        addBytes(
-                            zipOut,
-                            WorkspaceArchiveManifest.SETTINGS_PATH,
-                            json.encodeToString(settings).toByteArray(Charsets.UTF_8),
-                            budget,
-                        )
-                        databaseFiles.forEach { source -> addFile(zipOut, source.file, source.archiveName, budget) }
-                        payloads.forEach { workspace ->
-                            addFile(
-                                zipOut,
-                                File(payloadDirectory, payloadFileName(workspace.files)),
-                                workspace.files.path,
-                                budget,
-                            )
-                            workspace.home.let { home ->
-                                addFile(
-                                    zipOut,
-                                    File(payloadDirectory, payloadFileName(home)),
-                                    home.path,
-                                    budget,
-                                )
-                            }
+                        incremental?.let { addBytes(zipOut, ArchiveIncremental.INDEX_PATH, ArchiveIncremental.encode(it), budget) }
+                        addBytes(zipOut, "manifest.json", manifestBytes, budget)
+                        if (WorkspaceArchiveManifest.SETTINGS_PATH !in reused) {
+                            addBytes(zipOut, WorkspaceArchiveManifest.SETTINGS_PATH, settingsBytes, budget)
                         }
-                        legacyFiles.forEach { source -> addFile(zipOut, source.file, source.archiveName, budget) }
+                        sources.filterNot { it.archiveName in reused }.forEach { source ->
+                            currentCoroutineContext().ensureActive()
+                            addFile(zipOut, source.file, source.archiveName, budget)
+                        }
                     }
                 }
+            }
             }
             verifyWorkspaceSourcesUnchanged(workspaces, sourceFingerprints)
             budget.checkCompressedFile(partialZip, countBytes = false)
             budget.checkStagingDirectory(payloadDirectory)
-            verifyPortableArchive(partialZip)
+            timedBackupPhase(BackupPhase.ARCHIVE_VERIFY) { verifyPortableArchive(partialZip, baseFile) }
             verifyWorkspaceSourcesUnchanged(workspaces, sourceFingerprints)
             verifyArchiveStateUnchanged(
                 expectedWorkspaces = workspaces,
@@ -313,20 +318,26 @@ class WorkspaceArchiveService(
         includeFiles: Boolean,
         password: CharArray? = null,
         allowLegacy: Boolean = false,
-    ): WorkspaceArchiveRestoreResult = workspaceRepository.withEnvironmentArchiveLease {
+        baseFile: File? = null,
+    ): WorkspaceArchiveRestoreResult = withBackupTiming(context.filesDir, "RESTORE") {
+        workspaceRepository.withEnvironmentArchiveLease {
         withContext(Dispatchers.IO) {
         require(Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS) && file.canRead()) {
             "Backup file does not exist or is unreadable"
         }
-        requireCurrentArchive(file)
+        if (!ArchiveIncremental.isIncremental(file)) requireRestorableWorkspaceArchive(file, json, MAX_MANIFEST_BYTES)
         val result = workspaceRepository.withWorkspaceCatalogArchiveLock {
-            restorePortableArchive(file, includeDatabase, includeFiles, archiveCleanupFile = null)
+            timedBackupPhase(BackupPhase.APPLY_RESTORE) {
+                restorePortableArchive(file, includeDatabase, includeFiles, archiveCleanupFile = null, baseFile = baseFile)
+            }
         }
         require(!result.restartRequired && !result.databaseRestoreAttempted) {
             "A database restore must not return before relaunch"
         }
         result
         }
+    }
+
     }
 
     private fun requireWorkspaceCatalogProjectionCompatible(
@@ -432,13 +443,10 @@ class WorkspaceArchiveService(
         if (!Files.isRegularFile(source.toPath(), LinkOption.NOFOLLOW_LINKS)) return null
         val destination = File(payloadDirectory, "rikka_hub.db")
         val writableDatabase = database.openHelper.writableDatabase
-        var retryCause: Throwable? = null
-        var completed = false
         var conversationReferences = emptyList<WorkspaceConversationReference>()
         var liveWorkspaceCatalog = emptyList<WorkspaceCatalogRecord>()
-        repeat(MAX_DATABASE_SNAPSHOT_ATTEMPTS) {
+        retryArchiveSnapshot(MAX_DATABASE_SNAPSHOT_ATTEMPTS, { it is SnapshotRetry }) {
             checkpointWal(writableDatabase)
-            try {
                 database.runInTransaction {
                     val wal = File(source.parentFile, "${source.name}-wal")
                     require(!Files.isSymbolicLink(wal.toPath())) {
@@ -476,17 +484,6 @@ class WorkspaceArchiveService(
                     expectedWorkspaceCatalog = exportedWorkspaceCatalog,
                     expectedSnapshotsEmpty = true,
                 )
-                completed = true
-                return@repeat
-            } catch (retry: SnapshotRetry) {
-                retryCause = retry
-            }
-        }
-        if (!completed) {
-            throw IllegalStateException(
-                "Unable to create a stable Room database snapshot after retries",
-                retryCause,
-            )
         }
         return DatabaseSnapshot(
             source = ArchiveSource(destination, "database/rikka_hub.db"),
@@ -904,17 +901,17 @@ class WorkspaceArchiveService(
         file: File,
         password: CharArray? = null,
         allowLegacy: Boolean = false,
+        baseFile: File? = null,
     ) {
-        requireCurrentArchive(file)
-        verifyPortableArchive(file)
+        if (!ArchiveIncremental.isIncremental(file)) requireCurrentArchive(file)
+        verifyPortableArchive(file, baseFile)
     }
 
     private fun requireCurrentArchive(file: File) =
         requireCurrentWorkspaceArchive(file, json, MAX_MANIFEST_BYTES)
 
-    private fun verifyPortableArchive(file: File) {
+    private fun verifyPortableArchive(file: File, baseFile: File? = null) {
         val budget = WorkspaceArchiveBudget()
-        budget.checkCompressedFile(file)
         val verificationRoot = File(context.cacheDir, ".workspace-verify-${UUID.randomUUID()}")
         var failure: Throwable? = null
         try {
@@ -925,45 +922,40 @@ class WorkspaceArchiveService(
             var manifest: WorkspaceArchiveManifest? = null
             var settings: Settings? = null
             var stagedDatabase: File? = null
-            ZipInputStream(BufferedInputStream(FileInputStream(file))).use { zipIn ->
+            openPortableInput(file, baseFile, budget).use { zipIn ->
                 val first = zipIn.nextEntry ?: error("Workspace archive is empty")
-                budget.recordZipEntry()
+                if (zipIn !is BudgetedArchiveInput) budget.recordZipEntry()
                 val firstName = WorkspaceArchivePathSafety.normalize(first.name)
                 require(firstName == "manifest.json" && !first.isDirectory) {
                     "Portable workspace manifest must be the first ZIP entry"
                 }
-                manifest = json.decodeFromString<WorkspaceArchiveManifest>(
-                    readCurrentEntry(first, zipIn, MAX_MANIFEST_BYTES, budget).toString(Charsets.UTF_8)
-                ).also { it.validate() }
+                manifest = decodePortableManifest(readCurrentEntry(first, zipIn, MAX_MANIFEST_BYTES, budget))
                 val validatedManifest = manifest!!
                 val expected = expectedPortableEntries(validatedManifest)
                 val seen = HashSet<String>()
                 seen += "manifest.json"
                 while (true) {
                     val entry = zipIn.nextEntry ?: break
-                    budget.recordZipEntry()
+                    if (zipIn !is BudgetedArchiveInput) budget.recordZipEntry()
                     val name = WorkspaceArchivePathSafety.normalize(entry.name)
                     require(seen.add(name)) { "Duplicate ZIP entry: $name" }
                     require(name in expected && !entry.isDirectory) { "Unexpected ZIP entry: $name" }
                     when {
                         name in validatedManifest.workspacePayloadPaths() -> {
                             val descriptor = validatedManifest.payloadByPath(name)
-                            val target = File(
-                                verificationRoot,
-                                "archive-payloads/${payloadFileName(descriptor)}",
-                            )
-                            val digest = copyCurrentEntryToFile(
+                            val digest = WorkspaceArchiveTarValidator.validate(
                                 zipIn,
-                                target,
-                                MAX_PAYLOAD_BYTES,
-                                budget,
-                                stagingRoot = verificationRoot,
+                                limits = WorkspaceArchiveTar.Limits(MAX_TAR_ENTRIES, MAX_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES),
+                                maxArchiveBytes = MAX_PAYLOAD_BYTES,
+                                onEntry = budget::recordTarEntry,
+                                onFileBytes = budget::recordWorkspaceBytes,
+                                onReadBytes = { bytes ->
+                                    budget.recordTarBytes(bytes)
+                                    if (zipIn !is BudgetedArchiveInput) budget.recordZipDecompressedBytes(bytes)
+                                },
                             )
                             require(digest.length == descriptor.length) { "Payload length mismatch: $name" }
-                            require(digest.sha256 == descriptor.sha256.lowercase()) {
-                                "Payload hash mismatch: $name"
-                            }
-                            validateTarPayload(target, verificationRoot, budget)
+                            require(digest.sha256 == descriptor.sha256.lowercase()) { "Payload hash mismatch: $name" }
                         }
 
                         name in validatedManifest.databaseEntries -> {
@@ -1308,6 +1300,7 @@ class WorkspaceArchiveService(
         includeDatabase: Boolean,
         includeFiles: Boolean,
         archiveCleanupFile: File? = null,
+        baseFile: File? = null,
     ): WorkspaceArchiveRestoreResult {
         val staging = File(context.filesDir, ".workspace-restore-${UUID.randomUUID()}.partial")
         val budget = WorkspaceArchiveBudget()
@@ -1317,9 +1310,18 @@ class WorkspaceArchiveService(
         var failure: Throwable? = null
         var restoreResult: WorkspaceArchiveRestoreResult? = null
         try {
-            val prepared = extractPortableArchive(file, staging, includeDatabase, budget)
+            val prepared = timedBackupPhase(BackupPhase.ZIP_EXTRACT) {
+                extractPortableArchive(file, staging, includeDatabase, budget, baseFile)
+            }
             val warnings = mutableListOf<String>()
-            val preparedWorkspaces = prepareWorkspaceStaging(prepared, staging, warnings, budget)
+            val preparedWorkspaces = timedBackupPhase(BackupPhase.WORKSPACE_EXTRACT) {
+                prepareWorkspaceStaging(prepared, staging, warnings, budget)
+            }
+            if (prepared.manifest.legacyFilesIncluded == true) {
+                listOf(FileFolders.UPLOAD, FileFolders.SKILLS, FileFolders.FONTS).forEach { folder ->
+                    WorkspaceArchivePathSafety.ensureDirectory(File(prepared.legacyDirectory, folder))
+                }
+            }
             val restoredSettings = prepared.settingsFile.let { settingsFile ->
                 decodeArchiveSettings(settingsFile.readText(Charsets.UTF_8))
             }
@@ -1408,19 +1410,19 @@ class WorkspaceArchiveService(
         staging: File,
         includeDatabase: Boolean,
         budget: WorkspaceArchiveBudget,
+        baseFile: File?,
     ): PreparedPortableArchive {
-        budget.checkCompressedFile(file)
-        ZipInputStream(BufferedInputStream(FileInputStream(file))).use { zipIn ->
+        openPortableInput(file, baseFile, budget, allowLegacyRestore = true).use { zipIn ->
             val first = zipIn.nextEntry ?: error("Workspace archive is empty")
-            budget.recordZipEntry()
+            if (zipIn !is BudgetedArchiveInput) budget.recordZipEntry()
             require(WorkspaceArchivePathSafety.normalize(first.name) == "manifest.json" && !first.isDirectory) {
                 "Portable workspace manifest must be the first ZIP entry"
             }
-            val manifest = json.decodeFromString<WorkspaceArchiveManifest>(
-                readCurrentEntry(first, zipIn, MAX_MANIFEST_BYTES, budget).toString(Charsets.UTF_8)
+            val restored = decodeWorkspaceArchiveForRestore(
+                readCurrentEntry(first, zipIn, MAX_MANIFEST_BYTES, budget).toString(Charsets.UTF_8), json,
             )
-            manifest.validate()
-            val expected = expectedPortableEntries(manifest)
+            val manifest = restored.portable
+            val expected = expectedPortableEntries(manifest) + restored.ignoredLinuxPayloads.keys
             val seen = HashSet<String>()
             seen += "manifest.json"
             val settingsFile = File(staging, WorkspaceArchiveManifest.SETTINGS_PATH)
@@ -1433,7 +1435,7 @@ class WorkspaceArchiveService(
             while (true) {
                 val entry = zipIn.nextEntry ?: break
                 entryCount++
-                budget.recordZipEntry()
+                if (zipIn !is BudgetedArchiveInput) budget.recordZipEntry()
                 require(entryCount <= MAX_ZIP_ENTRIES) { "Too many ZIP entries" }
                 val name = WorkspaceArchivePathSafety.normalize(entry.name)
                 require(seen.add(name)) { "Duplicate ZIP entry: $name" }
@@ -1478,6 +1480,13 @@ class WorkspaceArchiveService(
                                 descriptor = manifest.databasePayloadFor(name),
                             )
                         }
+                    }
+
+                    name in restored.ignoredLinuxPayloads -> {
+                        val payload = restored.ignoredLinuxPayloads.getValue(name)
+                        val digest = copyCurrentEntry(zipIn, NullOutputStream, MAX_PAYLOAD_BYTES, budget)
+                        require(digest.length == payload.length) { "Payload length mismatch: $name" }
+                        require(digest.sha256 == payload.sha256) { "Payload hash mismatch: $name" }
                     }
 
                     name in manifest.workspacePayloadPaths() -> {
@@ -1838,6 +1847,7 @@ class WorkspaceArchiveService(
                 )
                 recoveryJournal = closing
                 databaseCloseAttempted = true
+                currentCoroutineContext()[BackupTimingSession]?.restarting()
                 closeDatabaseAndExitAfterSwap(
                     staged = prepared.databaseFiles,
                     recovery = databaseRecoveryDirectory,
@@ -2136,9 +2146,6 @@ class WorkspaceArchiveService(
                     "Refusing to replace symbolic-link folder: $folder"
                 }
                 val recovery = File(recoveryRoot, folder)
-                require(recovery.parentFile?.mkdirs() != false) {
-                    "Unable to create legacy recovery directory: $folder"
-                }
                 WorkspaceArchiveDirectoryTransaction(
                     staging = source,
                     target = target,
@@ -2239,8 +2246,9 @@ class WorkspaceArchiveService(
         require(file.isFile) { "Backup source is not a file: ${file.path}" }
         ZipEntry(name).let { entry ->
             budget.recordZipEntry()
+            zipOut.setLevel(ArchiveCompression.level(name))
             zipOut.putNextEntry(entry)
-            file.inputStream().buffered().use { input ->
+            file.inputStream().buffered(BUFFER_SIZE).use { input ->
                 val buffer = ByteArray(BUFFER_SIZE)
                 while (true) {
                     val read = input.read(buffer)
@@ -2262,9 +2270,25 @@ class WorkspaceArchiveService(
     ) {
         budget.recordZipEntry()
         budget.recordZipDecompressedBytes(bytes.size.toLong())
+        zipOut.setLevel(ArchiveCompression.level(name))
         zipOut.putNextEntry(ZipEntry(name))
         zipOut.write(bytes)
         zipOut.closeEntry()
+    }
+
+    private fun decodePortableManifest(bytes: ByteArray): WorkspaceArchiveManifest {
+        val text = bytes.toString(Charsets.UTF_8)
+        requireWorkspaceManifestVersion(text, json, WorkspaceArchiveManifest.FORMAT)
+        return json.decodeFromString<WorkspaceArchiveManifest>(text).also { it.validate() }
+    }
+
+    private fun openPortableInput(
+        file: File, baseFile: File?, budget: WorkspaceArchiveBudget, allowLegacyRestore: Boolean = false,
+    ): ZipInputStream {
+        if (ArchiveIncremental.isIncremental(file)) return ArchiveIncremental.open(file, baseFile, budget, allowLegacyRestore)
+        ArchiveIncremental.checkedDirectory(file, budget)
+        budget.checkCompressedFile(file)
+        return ZipInputStream(BufferedInputStream(FileInputStream(file), BUFFER_SIZE))
     }
 
     private fun hasPortableManifest(file: File): Boolean =
@@ -2325,7 +2349,7 @@ class WorkspaceArchiveService(
             if (read == 0) continue
             length = Math.addExact(length, read.toLong())
             require(length <= maxBytes) { "Archive entry exceeds size limit" }
-            budget?.recordZipDecompressedBytes(read.toLong())
+            if (input !is BudgetedArchiveInput) budget?.recordZipDecompressedBytes(read.toLong())
             if (stagingBudget != null) {
                 if (stagingRoot != null) {
                     stagingBudget.recordStagingBytes(read.toLong(), stagingRoot)
@@ -2986,7 +3010,7 @@ class WorkspaceArchiveService(
 
     companion object {
         private const val TAG = "WorkspaceArchiveService"
-        private const val BUFFER_SIZE = 64 * 1024
+        private const val BUFFER_SIZE = ArchiveCompression.BUFFER_SIZE
         private const val MAX_MANIFEST_BYTES = 2L * 1024 * 1024
         private const val MAX_SETTINGS_BYTES = 16L * 1024 * 1024
         private const val MAX_DATABASE_ENTRY_BYTES = 4L * 1024 * 1024 * 1024

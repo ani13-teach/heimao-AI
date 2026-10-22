@@ -587,7 +587,9 @@
   <string name="search_detail_username">Username</string>
   <string name="search_page_hint">Enter keywords and press Search to find messages</string>
   <string name="search_page_no_results">No results</string>
-  <string name="search_page_placeholder">Search message content...</string>
+  <string name="search_page_placeholder">Search titles and message content...</string>
+  <string name="search_page_scope_current_assistant">Current assistant</string>
+  <string name="search_page_scope_all_assistants">All assistants</string>
   <string name="search_page_rebuild_button">Rebuild Index</string>
   <string name="search_page_rebuild_index">Rebuild Message Index</string>
   <string name="search_page_rebuild_index_desc">This will clear the existing index and re-scan all chat history. The more messages, the longer it takes. Continue?</string>

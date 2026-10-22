@@ -51,6 +51,11 @@ class WorkspaceArchiveSecurityTest {
         assertEquals("#!/bin/sh\necho ok\n", File(restored, "nested/run.sh").readText())
         assertTrue(File(restored, "nested/run.sh").canExecute())
         assertTrue(Files.isSymbolicLink(File(restored, "run-link").toPath()))
+        assumeTrue(
+            "filesystem does not expose stable hardlink identities",
+            Files.readAttributes(executable.toPath(), java.nio.file.attribute.BasicFileAttributes::class.java)
+                .fileKey() != null,
+        )
         assertTrue(Files.isSameFile(
             File(restored, "nested/run.sh").toPath(),
             File(restored, "nested/run-copy.sh").toPath(),

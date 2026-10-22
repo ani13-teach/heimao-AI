@@ -20,6 +20,9 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -144,6 +147,32 @@ fun SearchPage(vm: SearchVM = koinViewModel()) {
                 ),
             )
 
+            SingleChoiceSegmentedButtonRow(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp)
+            ) {
+                MessageSearchScope.entries.forEachIndexed { index, scope ->
+                    SegmentedButton(
+                        shape = SegmentedButtonDefaults.itemShape(
+                            index = index,
+                            count = MessageSearchScope.entries.size,
+                        ),
+                        onClick = { vm.onScopeChange(scope) },
+                        selected = vm.searchScope == scope,
+                    ) {
+                        Text(
+                            stringResource(
+                                when (scope) {
+                                    MessageSearchScope.CURRENT_ASSISTANT -> R.string.search_page_scope_current_assistant
+                                    MessageSearchScope.ALL_ASSISTANTS -> R.string.search_page_scope_all_assistants
+                                }
+                            )
+                        )
+                    }
+                }
+            }
+
             Box(modifier = Modifier.weight(1f)) {
                 if (vm.isLoading || vm.isRebuilding) {
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
@@ -206,7 +235,7 @@ fun SearchPage(vm: SearchVM = koinViewModel()) {
                                         navigateToChatPage(
                                             navController,
                                             chatId = Uuid.parse(result.conversationId),
-                                            nodeId = Uuid.parse(result.nodeId),
+                                            nodeId = result.nodeId?.let { Uuid.parse(it) },
                                         )
                                     }
                                 )

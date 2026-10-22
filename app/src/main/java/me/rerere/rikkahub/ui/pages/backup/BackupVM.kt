@@ -108,10 +108,11 @@ class BackupVM(
         webDavSync.deleteBackupFile(settings.value.webDavConfig, item)
     }
 
-    suspend fun exportToFile(): File {
+    suspend fun exportToFile(baseFile: File? = null): File {
         val file = workspaceArchiveService.createBackupFile(
             includeDatabase = true,
             includeFiles = true,
+            baseFile = baseFile,
         )
         recordBackupTime()
         return file
@@ -124,6 +125,7 @@ class BackupVM(
         file: File,
         password: CharArray?,
         allowLegacy: Boolean = false,
+        baseFile: File? = null,
     ): WorkspaceArchiveRestoreResult {
         return workspaceArchiveService.restoreBackupFile(
             file = file,
@@ -131,10 +133,15 @@ class BackupVM(
             includeFiles = true,
             password = password,
             allowLegacy = allowLegacy,
+            baseFile = baseFile,
         ).also {
             restoreWarnings.value = it.warnings
         }
     }
+
+    fun verifyFullBase(file: File) = workspaceArchiveService.verifyBackupFile(file)
+
+    fun localBackupTimings(filesDir: File): String = me.rerere.rikkahub.data.workspace.BackupTimings.export(filesDir)
 
     suspend fun restoreFromChatBox(file: File): ChatboxRestoreResult {
         var importedConversations = 0

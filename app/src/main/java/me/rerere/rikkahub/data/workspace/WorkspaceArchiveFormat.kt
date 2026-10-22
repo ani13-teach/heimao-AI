@@ -18,6 +18,7 @@ data class WorkspaceArchiveManifest(
     val databaseEntries: List<String> = emptyList(),
     val databasePayloads: List<WorkspaceArchivePayload> = emptyList(),
     val legacyEntries: List<String> = emptyList(),
+    val legacyFilesIncluded: Boolean? = null,
     val excluded: List<String> = DEFAULT_EXCLUDED,
     /** Full database payloads deliberately omit local snapshot rows because their files are not portable. */
     val snapshotsExcluded: Boolean = false,
@@ -73,7 +74,7 @@ data class WorkspaceArchiveManifest(
             payload.validate(expectedPath = "database/rikka_hub.db")
         }
         legacyEntries.forEach { entry ->
-            require(entry.isSafePortablePath()) { "Unsafe legacy entry: $entry" }
+            require(entry.isSafePortablePath() && entry.substringBefore('/') in setOf("upload", "skills", "fonts") && '/' in entry) { "Unsafe legacy entry: $entry" }
         }
         require(legacyEntries.distinct().size == legacyEntries.size) {
             "Duplicate legacy entry"
@@ -233,7 +234,7 @@ data class WorkspaceConversationReference(
 private val SHA256_REGEX = Regex("[0-9a-fA-F]{64}")
 private val ARCHIVE_COMPONENT_REGEX = Regex("[A-Za-z0-9._-]{1,255}")
 
-internal fun String.isValidArchiveComponent(): Boolean = ARCHIVE_COMPONENT_REGEX.matches(this)
+internal fun String.isValidArchiveComponent(): Boolean = this != "." && this != ".." && ARCHIVE_COMPONENT_REGEX.matches(this)
 
 internal fun String.isSafePortablePath(): Boolean = runCatching {
     WorkspaceArchivePathSafety.normalize(this)

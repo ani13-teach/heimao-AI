@@ -96,6 +96,7 @@ import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.model.ContextBlock
 import me.rerere.rikkahub.data.model.GenerationMessageSnapshot
+import me.rerere.rikkahub.data.model.MessageNode
 import me.rerere.rikkahub.data.model.commitGenerationMessages
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.memoryMode
@@ -186,6 +187,18 @@ internal fun resolveConversationForInitialization(
         newConversation = true,
     ).updateCurrentMessages(assistant.presetMessages)
 }
+
+internal fun createForkedConversation(
+    source: Conversation,
+    copiedNodes: List<MessageNode>,
+): Conversation = Conversation(
+    assistantId = source.assistantId,
+    messageNodes = copiedNodes,
+    customSystemPrompt = source.customSystemPrompt,
+    modeInjectionIds = source.modeInjectionIds,
+    workspaceCwd = source.workspaceCwd,
+    newConversation = true,
+)
 
 /**
  * 筛选不符合工具命名要求（非空且仅含 ASCII 字母数字）的 MCP 服务器名。
@@ -720,8 +733,29 @@ class ChatService(
         reason: String = "",
         answer: String? = null,
     ) {
-        val session = getOrCreateSession(conversationId)
-        session.getJob()?.cancel()
+        if (conversationId in deletedConversations) return
+        val session = sessions[conversationId] ?: return
+        appScope.launch {
+            session.withToolApproval {
+                handleToolApprovalLocked(session, conversationId, toolCallId, approved, reason, answer)
+            }
+        }
+    }
+
+    private suspend fun handleToolApprovalLocked(
+        session: ConversationSession,
+        conversationId: Uuid,
+        toolCallId: String,
+        approved: Boolean,
+        reason: String,
+        answer: String?,
+    ) {
+        if (conversationId in deletedConversations || sessions[conversationId] !== session) return
+        if (session.state.value.currentMessages.flatMap { it.getTools() }
+                .none { it.toolCallId == toolCallId && it.isPending }
+        ) return
+        val previousJob = session.getJob()
+        previousJob?.cancel()
 
         // 还有别的工具等用户审批时，这轮不会真的继续生成，不需要前台服务。
         val hasOtherPendingTools = session.state.value.messageNodes.any { node ->
@@ -735,11 +769,15 @@ class ChatService(
             keepAliveInBackground = !hasOtherPendingTools,
         ) {
             try {
+                // 旧任务的检查点补偿结束后，才能读取和保存审批状态。
+                previousJob?.join()
+                session.awaitInitialized()
+                requireConversationAvailable(conversationId)
                 val conversation = session.state.value
                 val matching = conversation.messageNodes.flatMap { it.currentMessage.parts }
                     .filterIsInstance<UIMessagePart.Tool>()
                     .singleOrNull { it.toolCallId == toolCallId && it.isPending }
-                    ?: error("No pending tool call matches this approval")
+                    ?: return@launchGenerationJob
                 if (matching.toolName == "workspace_apt_execute" && approved) {
                     require(answer == null) { "Apt execution requires an explicit approval" }
                     val params = matching.inputAsJson().jsonObject
@@ -799,11 +837,14 @@ class ChatService(
 
                 _generationDoneFlow.emit(conversationId)
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                session.messageQueue.pause()
                 addError(e, conversationId, title = context.getString(R.string.error_title_tool_approval))
             }
         }
 
         if (session.setJob(job)) job.start()
+        job.join()
     }
 
     // ---- 历史对话总结上下文 ----
@@ -1970,14 +2011,7 @@ class ChatService(
                 )
             }
 
-        val forkConversation = Conversation(
-            id = Uuid.random(),
-            assistantId = currentConversation.assistantId,
-            messageNodes = copiedNodes,
-            customSystemPrompt = currentConversation.customSystemPrompt,
-            modeInjectionIds = currentConversation.modeInjectionIds,
-            workspaceCwd = currentConversation.workspaceCwd,
-        )
+        val forkConversation = createForkedConversation(currentConversation, copiedNodes)
 
         saveConversation(forkConversation.id, forkConversation)
         return forkConversation

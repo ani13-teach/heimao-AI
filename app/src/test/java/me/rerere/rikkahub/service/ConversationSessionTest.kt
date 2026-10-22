@@ -1,5 +1,6 @@
 package me.rerere.rikkahub.service
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -8,6 +9,7 @@ import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.model.Conversation
 import org.junit.Assert.assertEquals
@@ -18,6 +20,76 @@ import org.junit.Test
 import kotlin.uuid.Uuid
 
 class ConversationSessionTest {
+    @Test
+    fun `consecutive tool approvals wait for earlier approval instead of cancelling it`() = runBlocking {
+        withTimeout(5_000) {
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+            try {
+                val conversation = Conversation.ofId(Uuid.random())
+                val session = ConversationSession(conversation.id, conversation, scope, onIdle = {})
+                val oldGenerationFinished = CompletableDeferred<Unit>()
+                val waiting = CompletableDeferred<Unit>()
+                val savedApprovals = mutableListOf<String>()
+                val first = scope.launch {
+                    session.withToolApproval {
+                        waiting.complete(Unit)
+                        oldGenerationFinished.await()
+                        savedApprovals.add("first")
+                    }
+                }
+                waiting.await()
+                val second = scope.launch {
+                    session.withToolApproval {
+                        savedApprovals.add("second")
+                    }
+                }
+                assertFalse(first.isCancelled)
+                assertFalse(second.isCompleted)
+                assertTrue(savedApprovals.isEmpty())
+
+                oldGenerationFinished.complete(Unit)
+                first.join()
+                second.join()
+                assertFalse(first.isCancelled)
+                assertEquals(listOf("first", "second"), savedApprovals)
+            } finally {
+                scope.cancel()
+            }
+        }
+    }
+
+    @Test
+    fun `cancelled approval releases the next waiting approval`() = runBlocking {
+        withTimeout(5_000) {
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+            try {
+                val conversation = Conversation.ofId(Uuid.random())
+                val session = ConversationSession(conversation.id, conversation, scope, onIdle = {})
+                val entered = CompletableDeferred<Unit>()
+                var secondSaved = false
+                val first = scope.launch {
+                    session.withToolApproval {
+                        entered.complete(Unit)
+                        awaitCancellation()
+                    }
+                }
+                entered.await()
+                val second = scope.launch {
+                    session.withToolApproval { secondSaved = true }
+                }
+                assertFalse(secondSaved)
+
+                first.cancel()
+                first.join()
+                second.join()
+                assertTrue(first.isCancelled)
+                assertTrue(secondSaved)
+            } finally {
+                scope.cancel()
+            }
+        }
+    }
+
     @Test
     fun `awaitInitialized waits until initialization completes`() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)

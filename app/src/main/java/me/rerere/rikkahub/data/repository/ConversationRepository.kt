@@ -6,6 +6,7 @@ import androidx.paging.PagingData
 import androidx.paging.PagingSource
 import androidx.paging.map
 import androidx.room.withTransaction
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -41,6 +42,16 @@ internal fun mergeConversationForRegularUpdate(
 internal class GenerationConversationCommitState(initiallyPersisted: Boolean) {
     var requiresExisting: Boolean = initiallyPersisted
         private set
+
+    fun requireValidTarget(conversation: Conversation, existingAssistantId: String?) {
+        if (existingAssistantId == null) {
+            if (requiresExisting || !conversation.newConversation || conversation.conversationNumber != 0L) {
+                throw CancellationException("Generation conversation no longer exists")
+            }
+        } else if (existingAssistantId != conversation.assistantId.toString()) {
+            throw CancellationException("Generation conversation owner changed")
+        }
+    }
 
     fun recordPersisted() {
         requiresExisting = true
@@ -446,13 +457,7 @@ class ConversationRepository(
     ): Conversation {
         val persisted = database.withTransaction {
             val existing = conversationDAO.getConversationById(conversation.id.toString())
-            check(existing != null || (!commitState.requiresExisting &&
-                conversation.newConversation && conversation.conversationNumber == 0L)) {
-                "Generation conversation no longer exists"
-            }
-            check(existing == null || existing.assistantId == conversation.assistantId.toString()) {
-                "Generation conversation owner changed"
-            }
+            commitState.requireValidTarget(conversation, existing?.assistantId)
             val value = if (existing == null) {
                 assignConversationNumber(conversation.copy(workspaceCwd = null))
             } else mergeConversationForRegularUpdate(conversation, existing)
@@ -518,7 +523,8 @@ class ConversationRepository(
         keyword: String,
         sort: MessageSearchSort = MessageSearchSort.RELEVANCE,
         limit: Int = 50,
-    ) = messageFtsManager.search(keyword, sort, limit)
+        assistantId: Uuid? = null,
+    ) = messageFtsManager.search(keyword, sort, limit, assistantId?.toString())
 
     suspend fun searchMessagesOfAssistant(
         assistantId: Uuid,

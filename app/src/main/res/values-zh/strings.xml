@@ -580,7 +580,9 @@
   <string name="search_detail_username">用户名</string>
   <string name="search_page_hint">输入关键词并点击搜索以查找消息</string>
   <string name="search_page_no_results">无结果</string>
-  <string name="search_page_placeholder">搜索消息内容…</string>
+  <string name="search_page_placeholder">搜索标题和消息内容…</string>
+  <string name="search_page_scope_current_assistant">当前助手</string>
+  <string name="search_page_scope_all_assistants">所有助手</string>
   <string name="search_page_rebuild_button">重建索引</string>
   <string name="search_page_rebuild_index">重建消息索引</string>
   <string name="search_page_rebuild_index_desc">这将清除现有索引并重新扫描所有聊天记录。消息越多，耗时越长。是否继续？</string>

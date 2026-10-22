@@ -18,9 +18,11 @@ internal class WorkspaceArchiveDirectoryTransaction(
         require(!Files.isSymbolicLink(target.toPath())) {
             "Restore target is a symbolic link: ${target.path}"
         }
+        recovery.parentFile?.let { parent ->
+            require(parent.mkdirs() || parent.isDirectory) { "Unable to create restore recovery directory: ${parent.path}" }
+        }
         if (target.exists()) {
             require(target.isDirectory) { "Restore target is not a directory: ${target.path}" }
-            recovery.parentFile?.mkdirs()
             require(!recovery.exists()) { "Restore recovery path already exists: ${recovery.path}" }
             require(target.renameTo(recovery)) { "Failed to move old directory to recovery" }
             oldDirectoryMoved = true

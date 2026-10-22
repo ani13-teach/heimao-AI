@@ -78,7 +78,7 @@
 
 - `MessageNode` 包含备选消息，不能把全部备选消息当作当前可见分支或模型上下文。
 - 永久会话编号全局唯一，删除后不复用；新增与导入保持 Repository 的事务分配路径。
-- AI 历史搜索保持当前助手范围并排除当前会话；App 全局搜索保持原有全局语义。
+- AI 历史搜索保持当前助手范围并排除当前会话；App 消息搜索同时匹配标题与正文，默认当前助手，可切换所有助手。
 - 总结来源必须属于来源助手；保留可见分支选择、取消、分块和上下文缓存语义。
 - Room 结构变更同步实体、数据库版本、迁移实现与注册、`project/app/schemas/`、备份恢复 schema gate 和迁移测试。不得靠删除数据库或工作区解决兼容问题。
 
@@ -93,10 +93,12 @@
 ### 凭据与用户数据
 
 - `local.properties`、私有 `google-services.json`、签名文件、口令、API Key、MCP token、真实数据库与敏感备份不进 Git，不复制进公开交付物或日志。
-- 当前备份/快照 v2 使用 `files.tar` + `home.tar`，无 Linux 或源设备 ABI 依赖，拒绝 v1、旧加密包和无 manifest 归档。新备份仍为可能含凭据的明文 ZIP，SHA-256 不代表保密或来源认证。
+- 当前备份/快照 v2 使用 `files.tar` + `home.tar`，无 Linux 或源设备 ABI 依赖。备份恢复兼容带完整清单的旧 Linux v2 完整包及其 v1 增量包：保留聊天、设置、附件和工作区 files/HOME，Linux 载荷校验后丢弃并清空旧运行环境元数据；新导出与标准验证仍要求便携格式。拒绝归档 v1、旧加密包和无 manifest 归档。新备份仍为可能含凭据的明文 ZIP，SHA-256 不代表保密或来源认证。
 - 测试使用隔离 Debug 包与测试数据；不得覆盖正式应用数据或为验证覆盖安装而擅自卸载正式应用。
 
 ## 6. 构建与验证
+
+- 每次重新打包都必须升级版本号，无论源码是否变化、是否正式发布。打包前在 `project/app/build.gradle.kts` 中递增 `versionCode`，并按现有版本格式升级 `versionName`；不得沿用上一次打包的版本号。
 
 先在总目录使用 PowerShell 执行 `./tools/check-environment.ps1`。脚本与 `environment/local.properties.template` 含旧机器的路径候选值，应核对本机环境，不直接照搬。维护指南推荐本机 JDK 21；应用 JVM target 为 17，两者不同。
 

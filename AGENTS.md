@@ -9,7 +9,7 @@
 - 开始和结束时检查 `git status --short`、`git branch --show-current`、`git remote -v`，保留现有未提交修改与未跟踪文件。不能根据旧父目录说明自动丢弃改动。
 - 不自动 reset/restore/clean/stash，不覆盖别的会话新写内容；提交、推送、上游同步和正式发布需单独授权。
 - 应用 DI 默认 `portableRuntime=true`，使用 `KotlinWorkspaceShellRunner` 的有限命令、管道、重定向、`&&` 和本地 Python，不是完整 Bash/apt。默认 UI 无 Linux 安装/切换和 apt，终端为命令输入、执行与取消。AI 文件工具仍限 `/workspace` 并保留归属校验。Python 为同 UID、非导出的 `:workspace_python` 工作进程，每次执行后终止并确认退出；路径映射不是安全隔离。
-- 当前备份/快照 v2 使用 `files.tar` + `home.tar`，不携带 Linux 或依赖源设备 ABI，拒绝 v1、旧加密包和无 manifest 归档。新备份仍为可能含凭据的明文 ZIP。密钥、口令、local.properties、私有 Google 配置、真实数据库和敏感备份不进 Git、不公开上传。
+- 当前备份/快照 v2 使用 `files.tar` + `home.tar`，不携带 Linux 或依赖源设备 ABI。备份恢复兼容旧 Linux v2 完整包及其 v1 增量包，仅迁移聊天、设置、附件和工作区 files/HOME；Linux 载荷校验后丢弃，清空旧运行环境元数据。新导出与标准验证仍要求便携格式，拒绝归档 v1、旧加密包和无 manifest 归档。新备份仍为可能含凭据的明文 ZIP。密钥、口令、local.properties、私有 Google 配置、真实数据库和敏感备份不进 Git、不公开上传。
 - 历史设计与交接中的旧路径、数据库版本、签名和通过记录不能自动视作当前事实。以源码和对应版本的验证为准。
 
 ## Project Overview
@@ -83,7 +83,7 @@ git diff --check
 
 - 构建配置、测试地图及发布步骤见维护指南；PowerShell 使用 `.\gradlew.bat`，本机推荐 JDK 21，JVM target 17。Chaquopy 17.1.0 / Python 3.13 要求构建机同主次版本 Python；numpy 1.26.2、pandas 2.1.3、matplotlib 3.8.4、openpyxl 3.1.5 固定版本。
 - Room 当前版本以 `AppDatabase.kt` 为准，结构变更同步迁移注册、app/schemas、备份 schema gate 和设备迁移测试。
-- 保持永久会话编号不复用、总结来源助手归属、AI 历史搜索助手范围，以及全局 App 搜索原有语义。
+- 保持永久会话编号不复用、总结来源助手归属及 AI 历史搜索助手范围。App 消息搜索默认当前助手，可切换所有助手，同时匹配标题与正文。
 - 只编译或存在测试文件不等于通过端到端验证；设备测试、Provider 调用和 APK 安装没执行就如实说明。
 
 ## Internationalization

@@ -3,6 +3,7 @@ package me.rerere.rikkahub.data.db
 import androidx.room.Room
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
@@ -74,7 +75,9 @@ class GenerationConversationDeletionTest {
             assertTrue(state.requiresExisting)
             assertEquals(listOf(summary), ContextBlockRepository(db).getBlocks(conversation.id))
             db.conversationDao().delete(repository.conversationToConversationEntity(saved))
-            assertTrue(runCatching { repository.commitGenerationConversation(saved, state, listOf(summary)) }.isFailure)
+            assertTrue(runCatching {
+                repository.commitGenerationConversation(saved, state, listOf(summary))
+            }.exceptionOrNull() is CancellationException)
             assertFalse(repository.existsConversationById(conversation.id))
             assertTrue(db.messageNodeDao().getNodesOfConversation(conversation.id.toString()).isEmpty())
             assertTrue(ContextBlockRepository(db).getBlocks(conversation.id).isEmpty())
@@ -86,7 +89,7 @@ class GenerationConversationDeletionTest {
             val conversation = fresh()
             assertTrue(runCatching {
                 repository.commitGenerationConversation(conversation, GenerationConversationCommitState(true))
-            }.isFailure)
+            }.exceptionOrNull() is CancellationException)
             assertTrue(runCatching { repository.updateConversation(conversation) }.isFailure)
             assertFalse(repository.existsConversationById(conversation.id))
             assertTrue(db.messageNodeDao().getNodesOfConversation(conversation.id.toString()).isEmpty())
@@ -101,7 +104,7 @@ class GenerationConversationDeletionTest {
             val saved = repository.commitGenerationConversation(original, state, listOf(summary))
             assertTrue(runCatching {
                 repository.commitGenerationConversation(saved.copy(assistantId = Uuid.random()), state)
-            }.isFailure)
+            }.exceptionOrNull() is CancellationException)
             val edited = saved.copy(title = "must roll back", messageNodes = listOf(UIMessage.user("changed").toMessageNode()))
             assertTrue(runCatching {
                 repository.commitGenerationConversation(edited, state, listOf(summary.copy(summary = "conflicting")))
@@ -125,7 +128,9 @@ class GenerationConversationDeletionTest {
             }
             db.conversationDao().deleteAll()
             saved.forEach { (conversation, state) ->
-                assertTrue(runCatching { repository.commitGenerationConversation(conversation, state) }.isFailure)
+                assertTrue(runCatching {
+                    repository.commitGenerationConversation(conversation, state)
+                }.exceptionOrNull() is CancellationException)
                 assertFalse(repository.existsConversationById(conversation.id))
                 assertTrue(db.messageNodeDao().getNodesOfConversation(conversation.id.toString()).isEmpty())
                 assertTrue(ContextBlockRepository(db).getBlocks(conversation.id).isEmpty())
@@ -143,18 +148,16 @@ class GenerationConversationDeletionTest {
             var mainRequestSent = false
             var attempts = 0
             val generation = launch {
-                runCatching {
-                    commitGenerationMessages(state, GenerationMessageSnapshot.capture(original), original.currentMessages) { value ->
-                        attempts++
-                        repository.commitGenerationConversation(value, commitState).also {
-                            if (attempts == 1) {
-                                entered.complete(Unit)
-                                release.await()
-                            }
+                commitGenerationMessages(state, GenerationMessageSnapshot.capture(original), original.currentMessages) { value ->
+                    attempts++
+                    repository.commitGenerationConversation(value, commitState).also {
+                        if (attempts == 1) {
+                            entered.complete(Unit)
+                            release.await()
                         }
                     }
-                    mainRequestSent = true
                 }
+                mainRequestSent = true
             }
             entered.await()
             val entity = db.conversationDao().getConversationById(original.id.toString())!!
@@ -162,6 +165,7 @@ class GenerationConversationDeletionTest {
             generation.cancel()
             release.complete(Unit)
             generation.join()
+            assertTrue(generation.isCancelled)
             assertEquals(2, attempts)
             assertFalse(mainRequestSent)
             assertFalse(repository.existsConversationById(original.id))

@@ -2,6 +2,7 @@ package me.rerere.rikkahub.data.workspace
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -56,6 +57,65 @@ class WorkspaceArchiveRollbackTest {
         )
         assertEquals("old", File(target, "old-only/files/state.txt").readText())
         assertFalse(staging.exists())
+        assertFalse(recovery.exists())
+    }
+
+    @Test
+    fun `legacy folders share an existing recovery parent and roll back independently`() {
+        val recoveryRoot = temporaryFolder.newFolder("legacy-recovery")
+        val transactions = listOf("upload", "skills", "fonts").map { folder ->
+            val target = temporaryFolder.newFolder(folder)
+            File(target, "state.txt").writeText("old-$folder")
+            val staging = temporaryFolder.newFolder("staged-$folder")
+            File(staging, "state.txt").writeText("new-$folder")
+            val recovery = File(recoveryRoot, folder)
+            WorkspaceArchiveDirectoryTransaction(staging, target, recovery).also {
+                it.activate()
+                assertEquals("new-$folder", File(target, "state.txt").readText())
+                assertEquals("old-$folder", File(recovery, "state.txt").readText())
+            }
+        }
+
+        transactions.asReversed().forEach { it.rollback() }
+
+        listOf("upload", "skills", "fonts").forEach { folder ->
+            assertEquals("old-$folder", File(temporaryFolder.root, "$folder/state.txt").readText())
+            assertFalse(File(recoveryRoot, folder).exists())
+        }
+    }
+
+    @Test
+    fun `legacy folder with no previous target uses an existing recovery parent`() {
+        val recoveryRoot = temporaryFolder.newFolder("legacy-recovery")
+        val target = File(temporaryFolder.root, "upload")
+        val staging = temporaryFolder.newFolder("staged-upload")
+        File(staging, "state.txt").writeText("new")
+        val recovery = File(recoveryRoot, "upload")
+        val transaction = WorkspaceArchiveDirectoryTransaction(staging, target, recovery)
+
+        transaction.activate()
+
+        assertEquals("new", File(target, "state.txt").readText())
+        assertFalse(recovery.exists())
+        transaction.rollback()
+        assertFalse(target.exists())
+    }
+
+    @Test
+    fun `file blocking the recovery parent fails without moving existing data`() {
+        val target = temporaryFolder.newFolder("upload")
+        File(target, "state.txt").writeText("old")
+        val staging = temporaryFolder.newFolder("staged-upload")
+        File(staging, "state.txt").writeText("new")
+        val blockedParent = temporaryFolder.newFile("legacy-recovery").apply { writeText("blocker") }
+        val recovery = File(blockedParent, "upload")
+        val transaction = WorkspaceArchiveDirectoryTransaction(staging, target, recovery)
+
+        assertThrows(IllegalArgumentException::class.java) { transaction.activate() }
+
+        assertEquals("old", File(target, "state.txt").readText())
+        assertEquals("new", File(staging, "state.txt").readText())
+        assertEquals("blocker", blockedParent.readText())
         assertFalse(recovery.exists())
     }
 

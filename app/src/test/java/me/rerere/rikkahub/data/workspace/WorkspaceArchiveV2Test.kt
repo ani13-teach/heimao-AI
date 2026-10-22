@@ -107,6 +107,33 @@ class WorkspaceArchiveV2Test {
         assertFalse(recovery.exists())
     }
 
+    @Test fun `Linux fields including null are rejected before deserialization`() {
+        val payload = WorkspaceArchivePayload("workspaces/id/files.tar", 1024, "a".repeat(64))
+        val workspace = WorkspaceArchiveWorkspace("id", "portable", "id", files = payload,
+            home = payload.copy(path = "workspaces/id/home.tar"))
+        val objectValue = json.parseToJsonElement(json.encodeToString(WorkspaceArchiveManifest(createdAt = 1, workspaces = listOf(workspace)))) as kotlinx.serialization.json.JsonObject
+        val workspaceObject = (objectValue.getValue("workspaces") as kotlinx.serialization.json.JsonArray).single() as kotlinx.serialization.json.JsonObject
+        val badWorkspaces = listOf(
+            kotlinx.serialization.json.JsonObject(workspaceObject + ("linux" to kotlinx.serialization.json.JsonNull)),
+            kotlinx.serialization.json.JsonObject(workspaceObject - "home"),
+            kotlinx.serialization.json.JsonObject(workspaceObject + ("home" to kotlinx.serialization.json.JsonNull)),
+        )
+        badWorkspaces.forEach { bad ->
+            val text = kotlinx.serialization.json.JsonObject(objectValue + ("workspaces" to kotlinx.serialization.json.JsonArray(listOf(bad)))).toString()
+            assertTrue(runCatching { requireWorkspaceManifestVersion(text, Json { ignoreUnknownKeys = true }, WorkspaceArchiveManifest.FORMAT) }.isFailure)
+        }
+        val shared = kotlinx.serialization.json.JsonObject(objectValue + ("sharedLinuxPayloads" to kotlinx.serialization.json.JsonNull)).toString()
+        assertTrue(runCatching { requireWorkspaceManifestVersion(shared, json, WorkspaceArchiveManifest.FORMAT) }.isFailure)
+    }
+
+    @Test fun `legacy attachments are limited to upload skills fonts and reject dot components`() {
+        listOf("workspaces/id/linux.tar", "upload/../secret", "upload/./secret", "fonts").forEach { path ->
+            assertTrue(runCatching { WorkspaceArchiveManifest(createdAt = 1, legacyEntries = listOf(path)).validate() }.isFailure)
+        }
+        WorkspaceArchiveManifest(createdAt = 1, legacyEntries = listOf("upload/a", "skills/a", "fonts/a")).validate()
+        assertTrue(runCatching { WorkspaceArchiveWorkspace(".", "x", "..", files = WorkspaceArchivePayload("x", 0, "0".repeat(64)), home = WorkspaceArchivePayload("y", 0, "0".repeat(64))).let { WorkspaceArchiveManifest(createdAt = 1, workspaces = listOf(it)).validate() } }.isFailure)
+    }
+
     private fun tree(root: File): Map<String, String> = root.walkTopDown().associate {
         it.relativeTo(root).path to if (it.isDirectory) "D" else it.readBytes().joinToString(",")
     }

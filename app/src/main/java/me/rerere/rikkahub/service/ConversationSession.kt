@@ -9,6 +9,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import me.rerere.rikkahub.data.model.Conversation
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.uuid.Uuid
@@ -28,6 +30,12 @@ class ConversationSession(
 
     // 生成中排队等发送的消息
     val messageQueue = MessageQueue()
+
+    private val toolApprovalMutex = Mutex()
+
+    internal suspend fun withToolApproval(block: suspend () -> Unit) {
+        toolApprovalMutex.withLock { block() }
+    }
 
     // 从队列取出到写进会话历史之间，附件仍要当成有效引用，否则会被误删
     @Volatile

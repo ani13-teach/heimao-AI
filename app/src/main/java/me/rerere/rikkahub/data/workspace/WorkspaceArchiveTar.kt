@@ -19,9 +19,9 @@ import java.security.MessageDigest
 import java.util.Date
 import java.util.Locale
 
-/** Streaming TAR codec used by both the files and Linux workspace payloads. */
+/** Streaming TAR codec used by portable files and HOME payloads. */
 object WorkspaceArchiveTar {
-    private const val BUFFER_SIZE = 64 * 1024
+    private const val BUFFER_SIZE = ArchiveCompression.BUFFER_SIZE
     private const val MAX_LINK_LENGTH = 16 * 1024
     // Keep rwx plus setuid/setgid/sticky bits; masking to 0777 silently loses valid modes.
     private const val PERMISSION_MASK = 0xfff
@@ -110,7 +110,9 @@ object WorkspaceArchiveTar {
         onEntry: () -> Unit = {},
         onFileBytes: (Long) -> Unit = {},
     ): Int {
-        require(hasTarEndMarkers(input)) { "Truncated TAR archive" }
+        input.inputStream().buffered(BUFFER_SIZE).use { stream ->
+            WorkspaceArchiveTarValidator.validate(stream, limits = limits)
+        }
         WorkspaceArchivePathSafety.ensureDirectory(targetRoot)
         var entries = 0
         var payloadBytes = 0L
@@ -119,6 +121,7 @@ object WorkspaceArchiveTar {
         TarArchiveInputStream(BufferedInputStream(input.inputStream())).use { tarIn ->
             while (true) {
                 val entry = tarIn.nextTarEntry ?: break
+                require(entry.isCheckSumOK) { "Invalid TAR header checksum" }
                 entries++
                 require(entries <= limits.maxEntries) { "Too many TAR entries" }
                 onEntry()

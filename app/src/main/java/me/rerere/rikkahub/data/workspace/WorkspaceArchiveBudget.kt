@@ -18,7 +18,13 @@ internal data class WorkspaceArchiveBudgetLimits(
 
 internal class WorkspaceArchiveBudget(
     private val limits: WorkspaceArchiveBudgetLimits = WorkspaceArchiveBudgetLimits(),
+    private val usableSpace: (File) -> Long = { it.usableSpace },
+    private val clock: () -> Long = System::nanoTime,
+    private val safetyReserveBytes: Long = 16L * 1024 * 1024,
 ) {
+    private data class SpaceReservation(var remaining: Long, var bytes: Long, val checkedAt: Long)
+    private val reservations = mutableMapOf<String, SpaceReservation>()
+    private var zipCentralDirectoryBytes = 0L
     private var zipEntries = 0
     private var zipCompressedBytes = 0L
     private var zipDecompressedBytes = 0L
@@ -26,6 +32,10 @@ internal class WorkspaceArchiveBudget(
     private var tarBytes = 0L
     private var workspaceBytes = 0L
     private var stagingBytes = 0L
+
+    fun recordZipCentralDirectoryBytes(bytes: Long) {
+        zipCentralDirectoryBytes = addWithin(zipCentralDirectoryBytes, bytes, 64L * 1024 * 1024, "ZIP central directory exceeds archive budget")
+    }
 
     fun recordZipEntry() {
         zipEntries++
@@ -101,7 +111,7 @@ internal class WorkspaceArchiveBudget(
      */
     fun checkAvailableSpace(root: File, requiredBytes: Long = 1L) {
         require(requiredBytes >= 0L) { "Required available space must not be negative" }
-        val usable = root.usableSpace
+        val usable = usableSpace(root)
         if (usable > 0L) {
             require(usable >= requiredBytes) {
                 "Insufficient available space for archive staging: need=$requiredBytes, usable=$usable"
@@ -110,8 +120,23 @@ internal class WorkspaceArchiveBudget(
     }
 
     fun recordStagingBytes(bytes: Long, spaceRoot: File) {
-        checkAvailableSpace(spaceRoot, bytes)
+        require(bytes >= 0L) { "Staging byte count must not be negative" }
         recordStagingBytes(bytes)
+        val key = spaceRoot.absolutePath
+        val now = clock()
+        var reservation = reservations[key]
+        val required = Math.addExact(bytes, safetyReserveBytes)
+        if (reservation == null || now - reservation.checkedAt >= 250_000_000L ||
+            reservation.bytes >= 8L * 1024 * 1024 || reservation.remaining < required) {
+            val available = usableSpace(spaceRoot)
+            if (available > 0L) require(available >= required) {
+                "Insufficient available space for archive staging: need=$required, usable=$available"
+            }
+            reservation = SpaceReservation(if (available > 0L) available else Long.MAX_VALUE, 0, now)
+            reservations[key] = reservation
+        }
+        reservation.remaining -= bytes
+        reservation.bytes = Math.addExact(reservation.bytes, bytes)
     }
 
     fun checkStagingDirectory(root: File) {

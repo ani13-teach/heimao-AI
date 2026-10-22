@@ -14,6 +14,11 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material3.CircularWavyProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -26,14 +31,17 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.dokar.sonner.ToastType
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import me.rerere.rikkahub.R
-import me.rerere.rikkahub.data.workspace.LegacyWorkspaceArchiveRequiresConfirmationException
-import me.rerere.rikkahub.data.workspace.WorkspaceArchivePasswordRequiredException
-import me.rerere.rikkahub.ui.pages.backup.components.BackupPasswordDialog
-import me.rerere.rikkahub.ui.pages.backup.components.LegacyBackupConfirmationDialog
+import me.rerere.rikkahub.data.workspace.BackupPhase
+import me.rerere.rikkahub.data.workspace.BackupTimingSession
+import me.rerere.rikkahub.data.workspace.timedBackupPhase
+import me.rerere.rikkahub.data.workspace.withBackupTiming
 import me.rerere.rikkahub.ui.components.ui.CardGroup
 import me.rerere.rikkahub.ui.components.ui.StickyHeader
 import me.rerere.rikkahub.ui.context.LocalToaster
@@ -52,91 +60,96 @@ fun ImportExportTab(vm: BackupVM) {
     var isExporting by remember { mutableStateOf(false) }
     var isRestoring by remember { mutableStateOf(false) }
     var importType by remember { mutableStateOf("local") }
-    var pendingLegacyRestore by remember { mutableStateOf<PendingLocalLegacyRestore?>(null) }
-    var showLegacyConfirmation by remember { mutableStateOf(false) }
-    // Only a legacy encrypted backup needs a password, so the dialog is raised on demand instead
-    // of gating every restore.
-    var passwordRequiredUri by remember { mutableStateOf<Uri?>(null) }
+    var baseFile by remember { mutableStateOf<File?>(null) }
+    var isChoosingBase by remember { mutableStateOf(false) }
+    var timingText by remember { mutableStateOf<String?>(null) }
+    val busy = isExporting || isRestoring || isChoosingBase
+    DisposableEffect(Unit) { onDispose { baseFile?.delete() } }
 
     fun startExport(targetUri: Uri) {
+        if (isExporting || isRestoring || isChoosingBase) return
+        isExporting = true
         scope.launch {
-            isExporting = true
-            var exportFile: File? = null
             try {
-                val generatedFile = vm.exportToFile()
-                exportFile = generatedFile
-                withContext(Dispatchers.IO) {
-                    context.contentResolver.openOutputStream(targetUri)?.use { outputStream ->
-                        FileInputStream(generatedFile).use { inputStream ->
-                            inputStream.copyTo(outputStream)
+                withBackupTiming(context.filesDir, if (baseFile == null) "EXPORT" else "EXPORT_INCREMENTAL") {
+                    var exportFile: File? = null
+                    var status = "SUCCESS"
+                    try {
+                        val generatedFile = vm.exportToFile(baseFile)
+                        exportFile = generatedFile
+                        timedBackupPhase(BackupPhase.DESTINATION_COPY, bytes = generatedFile.length(), files = 1) {
+                            withContext(Dispatchers.IO) {
+                                context.contentResolver.openOutputStream(targetUri)?.use { outputStream ->
+                                    FileInputStream(generatedFile).use { inputStream ->
+                                        copyBackupStream(inputStream, outputStream)
+                                    }
+                                } ?: error("Unable to open selected export destination")
+                            }
                         }
-                    } ?: error("Unable to open selected export destination")
+                        toaster.show(context.getString(R.string.backup_page_backup_success), type = ToastType.Success)
+                    } catch (error: Throwable) {
+                        status = if (error is CancellationException) "CANCELLED" else "FAILED"
+                        if (error is CancellationException) throw error
+                        error.printStackTrace()
+                        toaster.show(
+                            context.getString(R.string.backup_page_backup_failed, error.message ?: ""),
+                            type = ToastType.Error,
+                        )
+                    } finally {
+                        withContext(NonCancellable + Dispatchers.IO) {
+                            timedBackupPhase(BackupPhase.CLEANUP) { exportFile?.let(::cleanupTemporaryFile) }
+                            currentCoroutineContext()[BackupTimingSession]?.finish(status)
+                        }
+                    }
                 }
-                toaster.show(
-                    context.getString(R.string.backup_page_backup_success),
-                    type = ToastType.Success,
-                )
-            } catch (error: Throwable) {
-                error.printStackTrace()
-                toaster.show(
-                    context.getString(R.string.backup_page_backup_failed, error.message ?: ""),
-                    type = ToastType.Error,
-                )
-            } finally {
-                withContext(NonCancellable + Dispatchers.IO) {
-                    exportFile?.let(::cleanupTemporaryFile)
-                }
-                isExporting = false
-            }
+            } finally { isExporting = false }
         }
     }
 
-    fun startLocalRestore(sourceUri: Uri, password: CharArray?, allowLegacy: Boolean) {
+    fun startLocalRestore(sourceUri: Uri) {
+        if (isExporting || isRestoring || isChoosingBase) return
+        isRestoring = true
         scope.launch {
-            isRestoring = true
-            var waitingForLegacyConfirmation = false
-            var waitingForPassword = false
-            val tempFile = File(context.cacheDir, "temp_restore_${System.currentTimeMillis()}.zip")
-            val partialFile = File(tempFile.path + ".partial")
             try {
-                withContext(Dispatchers.IO) {
-                    context.contentResolver.openInputStream(sourceUri)?.use { inputStream ->
-                        FileOutputStream(partialFile).use { outputStream ->
-                            inputStream.copyTo(outputStream)
+                withBackupTiming(context.filesDir, if (baseFile == null) "IMPORT" else "IMPORT_INCREMENTAL") {
+                    val tempFile = File(context.cacheDir, "temp_restore_${System.currentTimeMillis()}.zip")
+                    val partialFile = File(tempFile.path + ".partial")
+                    var status = "SUCCESS"
+                    try {
+                        timedBackupPhase(BackupPhase.SOURCE_COPY, files = 1) {
+                            withContext(Dispatchers.IO) {
+                                context.contentResolver.openInputStream(sourceUri)?.use { inputStream ->
+                                    FileOutputStream(partialFile).use { outputStream ->
+                                        copyBackupStream(inputStream, outputStream)
+                                    }
+                                } ?: error("Unable to open selected backup")
+                                require(partialFile.renameTo(tempFile)) { "Unable to finalize selected backup" }
+                            }
                         }
-                    } ?: error("Unable to open selected backup")
-                    require(partialFile.renameTo(tempFile)) { "Unable to finalize selected backup" }
+                        vm.restoreFromLocalFile(tempFile, password = null, baseFile = baseFile)
+                        vm.restoreWarnings.value.takeIf { it.isNotEmpty() }?.let { warnings ->
+                            toaster.show(warnings.joinToString("; "), type = ToastType.Warning)
+                        }
+                        toaster.show(context.getString(R.string.backup_page_restore_success), type = ToastType.Success)
+                    } catch (error: Throwable) {
+                        status = if (error is CancellationException) "CANCELLED" else "FAILED"
+                        if (error is CancellationException) throw error
+                        error.printStackTrace()
+                        toaster.show(
+                            context.getString(R.string.backup_page_restore_failed, error.message ?: ""),
+                            type = ToastType.Error,
+                        )
+                    } finally {
+                        withContext(NonCancellable + Dispatchers.IO) {
+                            timedBackupPhase(BackupPhase.CLEANUP) {
+                                cleanupTemporaryFile(partialFile)
+                                cleanupTemporaryFile(tempFile)
+                            }
+                            currentCoroutineContext()[BackupTimingSession]?.finish(status)
+                        }
+                    }
                 }
-                vm.restoreFromLocalFile(tempFile, password, allowLegacy)
-                vm.restoreWarnings.value.takeIf { it.isNotEmpty() }?.let { warnings ->
-                    toaster.show(warnings.joinToString("; "), type = ToastType.Warning)
-                }
-                toaster.show(
-                    context.getString(R.string.backup_page_restore_success),
-                    type = ToastType.Success,
-                )
-            } catch (passwordRequired: WorkspaceArchivePasswordRequiredException) {
-                waitingForPassword = true
-                passwordRequiredUri = sourceUri
-            } catch (legacy: LegacyWorkspaceArchiveRequiresConfirmationException) {
-                if (allowLegacy) throw legacy
-                waitingForLegacyConfirmation = true
-                pendingLegacyRestore = PendingLocalLegacyRestore(sourceUri, password)
-                showLegacyConfirmation = true
-            } catch (error: Throwable) {
-                error.printStackTrace()
-                toaster.show(
-                    context.getString(R.string.backup_page_restore_failed, error.message ?: ""),
-                    type = ToastType.Error,
-                )
-            } finally {
-                withContext(NonCancellable + Dispatchers.IO) {
-                    cleanupTemporaryFile(partialFile)
-                    cleanupTemporaryFile(tempFile)
-                }
-                if (!waitingForLegacyConfirmation && !waitingForPassword) password?.fill('\u0000')
-                isRestoring = false
-            }
+            } finally { isRestoring = false }
         }
     }
 
@@ -153,7 +166,7 @@ fun ImportExportTab(vm: BackupVM) {
     ) { uri ->
         uri?.let { sourceUri ->
             if (importType == "local") {
-                startLocalRestore(sourceUri, password = null, allowLegacy = false)
+                startLocalRestore(sourceUri)
             } else {
                 scope.launch {
                     isRestoring = true
@@ -165,7 +178,7 @@ fun ImportExportTab(vm: BackupVM) {
                         withContext(Dispatchers.IO) {
                             context.contentResolver.openInputStream(sourceUri)?.use { inputStream ->
                                 FileOutputStream(tempFile).use { outputStream ->
-                                    inputStream.copyTo(outputStream)
+                                    copyBackupStream(inputStream, outputStream)
                                 }
                             } ?: error("Unable to open selected file")
                         }
@@ -195,31 +208,56 @@ fun ImportExportTab(vm: BackupVM) {
         }
     }
 
-    passwordRequiredUri?.let { uri ->
-        BackupPasswordDialog(
-            onDismiss = {
-                passwordRequiredUri = null
-            },
-            onConfirm = { password, _ ->
-                passwordRequiredUri = null
-                startLocalRestore(uri, password.toCharArray(), allowLegacy = false)
-            },
-        )
+    val exportTimingsLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json"),
+    ) { uri ->
+        if (uri != null) scope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    context.contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8)?.use { writer ->
+                        writer.write(vm.localBackupTimings(context.filesDir))
+                    } ?: error("Unable to open selected timing destination")
+                }
+                toaster.show("计时记录已导出", type = ToastType.Success)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                toaster.show("计时记录导出失败：${error.message.orEmpty()}", type = ToastType.Error)
+            }
+        }
     }
 
-    if (showLegacyConfirmation) {
-        LegacyBackupConfirmationDialog(
-            onDismiss = {
-                pendingLegacyRestore?.password?.fill('\u0000')
-                pendingLegacyRestore = null
-                showLegacyConfirmation = false
-            },
-            onConfirm = {
-                val pending = pendingLegacyRestore ?: return@LegacyBackupConfirmationDialog
-                pendingLegacyRestore = null
-                showLegacyConfirmation = false
-                startLocalRestore(pending.uri, pending.password, allowLegacy = true)
-            },
+    val baseDocumentLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) scope.launch {
+            isChoosingBase = true
+            val selected = File(context.cacheDir, "backup_base_${java.util.UUID.randomUUID()}.zip")
+            var accepted = false
+            try {
+                withContext(Dispatchers.IO) {
+                    context.contentResolver.openInputStream(uri)?.use { input ->
+                        selected.outputStream().use { output -> copyBackupStream(input, output) }
+                    } ?: error("Unable to open selected base backup")
+                    vm.verifyFullBase(selected)
+                }
+                baseFile?.let(::cleanupTemporaryFile)
+                baseFile = selected
+                accepted = true
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                toaster.show(error.message ?: "无法读取完整基础备份", type = ToastType.Error)
+            } finally {
+                withContext(NonCancellable + Dispatchers.IO) { if (!accepted) cleanupTemporaryFile(selected) }
+                isChoosingBase = false
+            }
+        }
+    }
+    timingText?.let { text ->
+        AlertDialog(
+            onDismissRequest = { timingText = null },
+            title = { Text("本地备份计时") },
+            text = { Text(text, modifier = Modifier.verticalScroll(rememberScrollState())) },
+            confirmButton = { TextButton(onClick = { timingText = null }) { Text("关闭") } },
         )
     }
 
@@ -237,7 +275,25 @@ fun ImportExportTab(vm: BackupVM) {
         item {
             CardGroup {
                 item(
-                    onClick = if (!isExporting) {
+                    onClick = if (!busy) ({ baseDocumentLauncher.launch(arrayOf("application/zip", "application/octet-stream")) }) else null,
+                    headlineContent = { Text("选择完整基础备份") },
+                    supportingContent = { Text(if (isChoosingBase) "正在检查基础备份" else if (baseFile == null) "未选择：导出完整备份" else "已选择：导出差分备份，并用于差分恢复") },
+                )
+                if (baseFile != null) item(
+                    onClick = if (!busy) ({ baseFile?.let(::cleanupTemporaryFile); baseFile = null }) else null,
+                    headlineContent = { Text("取消基础备份") },
+                )
+                item(
+                    onClick = if (!busy) ({ scope.launch { timingText = withContext(Dispatchers.IO) { vm.localBackupTimings(context.filesDir) } } }) else null,
+                    headlineContent = { Text("本地备份计时") },
+                )
+                item(
+                    onClick = if (!busy) ({ exportTimingsLauncher.launch("backup-timings.json") }) else null,
+                    headlineContent = { Text("导出备份耗时记录") },
+                    leadingContent = { Icon(HugeIcons.File01, null) },
+                )
+                item(
+                    onClick = if (!busy) {
                         {
                             val timestamp = LocalDateTime.now()
                                 .format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
@@ -264,7 +320,7 @@ fun ImportExportTab(vm: BackupVM) {
                 )
 
                 item(
-                    onClick = if (!isRestoring) {
+                    onClick = if (!busy) {
                         {
                             importType = "local"
                             openDocumentLauncher.launch(arrayOf("application/octet-stream", "application/zip"))
@@ -300,7 +356,7 @@ fun ImportExportTab(vm: BackupVM) {
         item {
             CardGroup {
                 item(
-                    onClick = if (!isRestoring) {
+                    onClick = if (!busy) {
                         {
                             importType = "chatbox"
                             openDocumentLauncher.launch(arrayOf("application/json"))
@@ -318,7 +374,7 @@ fun ImportExportTab(vm: BackupVM) {
                 )
 
                 item(
-                    onClick = if (!isRestoring) {
+                    onClick = if (!busy) {
                         {
                             importType = "cherry"
                             openDocumentLauncher.launch(arrayOf("application/zip"))
@@ -338,11 +394,6 @@ fun ImportExportTab(vm: BackupVM) {
         }
     }
 }
-
-private data class PendingLocalLegacyRestore(
-    val uri: Uri,
-    val password: CharArray?,
-)
 
 private fun cleanupTemporaryFile(file: File) {
     if (!file.exists()) return
