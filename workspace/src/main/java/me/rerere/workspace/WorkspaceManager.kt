@@ -12,6 +12,7 @@ class WorkspaceManager(
     private val shellRunner: WorkspaceShellRunner = HostShellRunner(),
     private val bindMounts: List<WorkspaceBindMount> = emptyList(),
     private val rootfsPatchOptionsProvider: () -> RootfsPatchOptions = { RootfsPatchOptions() },
+    val portableRuntime: Boolean = false,
 ) {
     private val fileSystem = WorkspaceFileSystem(config)
 
@@ -29,6 +30,10 @@ class WorkspaceManager(
     }
 
     fun ensureWorkspace(root: String): File {
+        if (portableRuntime) {
+            runtimePaths(root)
+            return workspaceDir(root)
+        }
         val dir = ensureWorkspaceFiles(root)
         if (environments.hasExternalHome(root)) {
             // HOME and the guest temp areas are workspace-local for both the shared and the
@@ -74,11 +79,23 @@ class WorkspaceManager(
      * Guest HOME for [root]. When the shared rootfs is selected this is a workspace-local
      * directory, so sharing one rootfs does not merge every workspace's `/root`.
      */
-    fun homeDir(root: String): File = environments.homeDir(root)
+    fun homeDir(root: String): File = if (portableRuntime) File(workspaceDir(root), "home") else environments.homeDir(root)
+
+    fun runtimePaths(root: String): WorkspaceRuntimePaths = if (portableRuntime) {
+        PortableWorkspaceRuntime.prepare(workspaceDir(root), environments.hasExternalHome(root))
+    } else {
+        ensureWorkspace(root)
+        WorkspaceRuntimePaths(root, filesDir(root), homeDir(root), tempDir(root))
+    }
 
     fun tempDir(root: String): File = File(workspaceDir(root), TEMP_DIR)
 
-    fun hasRootfs(root: String): Boolean = linuxDir(root).hasUsableFullRootfs()
+    fun hasRootfs(root: String): Boolean = if (portableRuntime) {
+        listOf(workspaceDir(root), filesDir(root), homeDir(root), tempDir(root)).all {
+            !java.nio.file.Files.isSymbolicLink(it.toPath()) &&
+                java.nio.file.Files.isDirectory(it.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS)
+        }
+    } else linuxDir(root).hasUsableFullRootfs()
 
     fun deleteWorkspace(root: String): Boolean = workspaceDir(root).deleteRecursively()
 
@@ -148,6 +165,18 @@ class WorkspaceManager(
     fun resolveRootfsPath(root: String, path: String): RootfsLocation {
         val trimmed = path.trim().trimEnd('/').ifBlank { "/" }
         require(trimmed.startsWith("/")) { "Rootfs path must be absolute: $path" }
+
+        if (portableRuntime) {
+            val mappings = listOf(
+                "/workspace" to filesDir(root), "/root" to homeDir(root),
+                "/home" to homeDir(root), "/tmp" to tempDir(root),
+            ) + sortedBindMounts.map { it.target.trimEnd('/') to it.source }
+            val mapping = mappings.firstOrNull { (prefix, _) -> trimmed == prefix || trimmed.startsWith("$prefix/") }
+                ?: error("Path is outside the portable workspace: $path")
+            val relative = trimmed.removePrefix(mapping.first).trimStart('/')
+            RootfsPathSafety.resolve(mapping.second, relative.ifEmpty { "." })
+            return RootfsLocation(mapping.second, relative)
+        }
 
         sortedBindMounts.forEach { mount ->
             val target = mount.target.trimEnd('/')
@@ -237,7 +266,7 @@ class WorkspaceManager(
 
     /** AI gets a full development shell only when it is backed by a private rootfs. */
     fun aiShellAccessMode(root: String): WorkspaceShellAccessMode =
-        if (environments.isShared(root)) WorkspaceShellAccessMode.WORKSPACE_ONLY
+        if (portableRuntime || environments.isShared(root)) WorkspaceShellAccessMode.WORKSPACE_ONLY
         else WorkspaceShellAccessMode.WORKSPACE_PACKAGE
 
     /**
@@ -263,6 +292,17 @@ class WorkspaceManager(
         stdin: ByteArray? = null,
         accessMode: WorkspaceShellAccessMode = WorkspaceShellAccessMode.FULL_ROOTFS,
     ): WorkspaceShellContext {
+        if (portableRuntime) {
+            val paths = runtimePaths(root)
+            val workingDir = fileSystem.resolve(paths.filesDir, cwd)
+            require(workingDir.isDirectory) { "Working directory does not exist: $cwd" }
+            return WorkspaceShellContext(
+                root, command, cwd, paths.filesDir, paths.homeDir, paths.tempDir,
+                workingDir, timeoutMillis, stdin, WorkspaceShellAccessMode.WORKSPACE_ONLY,
+                homeDir = paths.homeDir, guestTempDir = paths.tempDir,
+                guestVarTempDir = paths.tempDir, patchRootfs = false,
+            )
+        }
         require(accessMode != WorkspaceShellAccessMode.WORKSPACE_PACKAGE || !environments.isShared(root)) {
             "AI package shell cannot run on the shared Linux rootfs"
         }
@@ -324,7 +364,7 @@ class WorkspaceManager(
 
     private fun areaDir(root: String, area: WorkspaceStorageArea): File = when (area) {
         WorkspaceStorageArea.FILES -> filesDir(root)
-        WorkspaceStorageArea.LINUX -> linuxDir(root)
+        WorkspaceStorageArea.LINUX -> if (portableRuntime) homeDir(root) else linuxDir(root)
     }
 
     fun cleanupAllTempDirs() {

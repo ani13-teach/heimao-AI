@@ -20,12 +20,11 @@ android {
         }
     }
 
-    // Extract bundled native libraries (e.g. PRoot) to nativeLibraryDir so
-    // runtime lookups by absolute path work, matching the app module's config
-    // and the ProotShellRunner expectations in both app and instrumented tests.
+    // Match the application native library extraction policy.
     packaging {
         jniLibs {
             useLegacyPackaging = true
+            excludes += setOf("**/libproot_exec.so", "**/libproot_loader.so", "**/libtermux.so")
         }
     }
 }

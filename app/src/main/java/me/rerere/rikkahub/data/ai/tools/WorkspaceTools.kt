@@ -69,8 +69,6 @@ suspend fun createWorkspaceTools(
             conversationId = conversationId,
             accessGate = accessGate,
         ),
-        createAptPlanTool(workspaceId, assistantId, conversationId, accessGate),
-        createAptExecuteTool(workspaceId, assistantId, conversationId, accessGate),
     )
 }
 
@@ -304,13 +302,9 @@ private fun createEditFileTool(
 internal fun workspaceShellDescription(defaultCwd: String = ""): String = buildString {
     append("Run a shell command in the current workspace. ")
     append("The working directory is always /workspace or one of its subdirectories. ")
-    append("A private Linux environment provides a full development shell with installed tools such as Python, npm, Go and Cargo. ")
-    append("A shared Linux environment uses a files-only sandbox: its public Rootfs and system packages cannot be modified by this tool; Python, pip and bash are unavailable there. ")
-    append("Use the public environment maintenance UI for system-wide package installation, upgrades and removal. ")
-    append("Use workspace_apt_plan to simulate public package changes, then workspace_apt_execute with its planId and planFingerprint for user approval. ")
-    append("For project-specific Python dependencies in a private environment use python3 -m venv /workspace/.venv and /workspace/.venv/bin/python -m pip. ")
+    append("Supports common file and text commands, Python, pipelines, redirection and command combinations. ")
+    append("This portable command runner is not a complete Bash or Linux distribution; apt and system package installation are unavailable. ")
     append("The workspace does not mount or expose /skills, /upload, /tool_outputs, /proc, /sys, or external app directories. ")
-    append("The PRoot guest root is not Android host root. ")
     if (defaultCwd.isNotBlank()) {
         append("Defaults to '$defaultCwd'. ")
     }

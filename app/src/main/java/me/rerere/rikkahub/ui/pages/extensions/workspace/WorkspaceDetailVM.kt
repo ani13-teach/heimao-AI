@@ -3,6 +3,7 @@ package me.rerere.rikkahub.ui.pages.extensions.workspace
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
@@ -43,6 +44,7 @@ class WorkspaceDetailVM(
     private val _state = MutableStateFlow(WorkspaceDetailState())
     val state = _state.asStateFlow()
 
+    private var terminalJob: Job? = null
     private val _terminalState = MutableStateFlow(WorkspaceTerminalState())
     val terminalState = _terminalState.asStateFlow()
 
@@ -441,25 +443,25 @@ class WorkspaceDetailVM(
             }
         }
         if (previous.running) return
-        viewModelScope.launch {
-            runCatching {
-                repository.executeCommand(id, trimmed)
-            }.onSuccess { result ->
+        terminalJob = viewModelScope.launch {
+            try {
+                val result = repository.executeCommand(id, trimmed)
+                _terminalState.update { it.copy(history = it.history + WorkspaceTerminalEntry.Result(result)) }
+            } catch (error: CancellationException) {
+                _terminalState.update { it.copy(history = it.history + WorkspaceTerminalEntry.Error("已取消")) }
+                throw error
+            } catch (error: Exception) {
                 _terminalState.update {
-                    it.copy(
-                        running = false,
-                        history = it.history + WorkspaceTerminalEntry.Result(result),
-                    )
+                    it.copy(history = it.history + WorkspaceTerminalEntry.Error(redactWorkspaceText(error.message ?: "命令执行失败")))
                 }
-            }.onFailure { error ->
-                _terminalState.update {
-                    it.copy(
-                        running = false,
-                        history = it.history + WorkspaceTerminalEntry.Error(error.message ?: "命令执行失败"),
-                    )
-                }
+            } finally {
+                _terminalState.update { it.copy(running = false) }
             }
         }
+    }
+
+    fun cancelTerminalCommand() {
+        terminalJob?.cancel()
     }
 
     fun updateTerminalInput(input: String) {
@@ -475,7 +477,6 @@ class WorkspaceDetailVM(
             val workspace = repository.getById(id)
             _state.update { it.copy(workspace = workspace) }
             refreshStorageStats()
-            refreshSharedEnvironment()
         }
     }
 

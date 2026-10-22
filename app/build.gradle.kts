@@ -6,6 +6,7 @@ import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
+    id("com.chaquo.python") version "17.1.0"
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.ksp)
@@ -101,7 +102,7 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
-            pickFirsts += "lib/*/libtermux.so"
+            excludes += setOf("**/libproot_exec.so", "**/libproot_loader.so", "**/libtermux.so")
         }
     }
     tasks.withType<KotlinCompile>().configureEach {
@@ -116,6 +117,22 @@ android {
         compilerOptions.optIn.add("kotlin.time.ExperimentalTime")
         compilerOptions.optIn.add("kotlinx.coroutines.ExperimentalCoroutinesApi")
         compilerOptions.optIn.add("androidx.navigation3.runtime.ExperimentalNavigation3Api")
+    }
+}
+
+chaquopy {
+    defaultConfig {
+        version = "3.13"
+        buildPython("python")
+        pip {
+            options("--index-url", "https://pypi.tuna.tsinghua.edu.cn/simple",
+                "--extra-index-url", "https://chaquo.com/pypi-13.1",
+                "--retries", "0", "--timeout", "45", "--only-binary", ":all:")
+            install("numpy==1.26.2")
+            install("pandas==2.1.3")
+            install("matplotlib==3.8.4")
+            install("openpyxl==3.1.5")
+        }
     }
 }
 
@@ -147,7 +164,6 @@ dependencies {
     implementation(libs.androidx.work.runtime.ktx)
     implementation(libs.androidx.browser)
     implementation(libs.androidx.profileinstaller)
-    implementation(libs.termux.terminal.view)
     implementation(libs.guava.listenablefuture)
 
     // Compose

@@ -154,6 +154,10 @@
     </provider>
 
     <service
+      android:name=".data.workspace.python.WorkspacePythonService"
+      android:exported="false"
+      android:process=":workspace_python" />
+    <service
       android:name=".service.ChatGenerationForegroundService"
       android:exported="false"
       android:foregroundServiceType="dataSync" />

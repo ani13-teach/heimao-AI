@@ -13,7 +13,6 @@ data class WorkspaceArchiveManifest(
     val appVersion: String = "",
     val databaseVersion: Int = AppDatabase.CURRENT_VERSION,
     val createdAt: Long = 0L,
-    val createdAbi: List<String> = emptyList(),
     val settingsPath: String = SETTINGS_PATH,
     /** Names are retained for transport compatibility; [databasePayloads] supplies coverage. */
     val databaseEntries: List<String> = emptyList(),
@@ -49,7 +48,7 @@ data class WorkspaceArchiveManifest(
             require(roots.add(workspace.root)) { "Duplicate workspace root: ${workspace.root}" }
             require(workspace.name.length <= MAX_NAME_LENGTH) { "Workspace name is too long" }
             workspace.files.validate(expectedPath = "workspaces/${workspace.root}/files.tar")
-            workspace.linux?.validate(expectedPath = "workspaces/${workspace.root}/linux.tar")
+            workspace.home.validate(expectedPath = "workspaces/${workspace.root}/home.tar")
         }
 
         databaseEntries.forEach { entry ->
@@ -119,7 +118,7 @@ data class WorkspaceArchiveManifest(
 
     companion object {
         const val FORMAT = "heimao.workspace.archive"
-        const val CURRENT_VERSION = 1
+        const val CURRENT_VERSION = 2
         const val SETTINGS_PATH = "settings.json"
         const val MAX_WORKSPACES = 1_000
         const val MAX_REFERENCES = 100_000
@@ -128,8 +127,8 @@ data class WorkspaceArchiveManifest(
         val DATABASE_ENTRY_NAMES = setOf("database/rikka_hub.db")
         val DEFAULT_EXCLUDED = listOf(
             "workspaces/*/tmp",
-            "workspaces/*/linux/tmp",
-            "workspaces/*/linux/var/tmp",
+            "workspaces/*/linux",
+            "runtime dependencies",
             "filesDir/global credentials",
             "settings provider keys, backup passwords and OAuth tokens",
         )
@@ -147,7 +146,7 @@ data class WorkspaceArchiveWorkspace(
     val lastAccessAt: Long? = null,
     val runtimeMetadata: WorkspaceRuntimeMetadata = WorkspaceRuntimeMetadata(),
     val files: WorkspaceArchivePayload,
-    val linux: WorkspaceArchivePayload? = null,
+    val home: WorkspaceArchivePayload,
     /** Legacy workspace metadata retained for exact single-workspace restoration. */
     val toolApprovals: String = "{}",
 )
@@ -158,7 +157,6 @@ data class WorkspaceSnapshotManifest(
     val format: String = FORMAT,
     val formatVersion: Int = CURRENT_VERSION,
     val createdAt: Long = 0L,
-    val createdAbi: List<String> = emptyList(),
     val workspace: WorkspaceArchiveWorkspace,
 ) {
     fun validate() {
@@ -173,11 +171,11 @@ data class WorkspaceSnapshotManifest(
             "Snapshot files payload path does not match workspace root"
         }
         workspace.files.validate(expectedPath = workspace.files.path)
-        val linux = workspace.linux ?: error("Workspace snapshot Linux payload is missing")
-        require(linux.path == "workspaces/${workspace.root}/linux.tar") {
-            "Snapshot Linux payload path does not match workspace root"
+        val home = workspace.home
+        require(home.path == "workspaces/${workspace.root}/home.tar") {
+            "Snapshot HOME payload path does not match workspace root"
         }
-        linux.validate(expectedPath = linux.path)
+        home.validate(expectedPath = home.path)
         require(workspace.name.length <= WorkspaceArchiveManifest.MAX_NAME_LENGTH) {
             "Snapshot workspace name is too long"
         }
@@ -188,7 +186,7 @@ data class WorkspaceSnapshotManifest(
 
     companion object {
         const val FORMAT = "heimao.workspace.snapshot"
-        const val CURRENT_VERSION = 1
+        const val CURRENT_VERSION = 2
         const val MANIFEST_PATH = "manifest.json"
     }
 }

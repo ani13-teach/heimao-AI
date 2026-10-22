@@ -46,7 +46,7 @@ git remote -v
 
 ## 3. 功能现状与开发状态
 
-当前源码包含多供应商聊天、消息分支、附件解析、MCP、网络搜索、记忆、历史参考、永久编号与总结、Linux 工作区、备份恢复、运行日志及后台生成。
+当前源码包含多供应商聊天、消息分支、附件解析、MCP、网络搜索、记忆、历史参考、永久编号与总结、便携工作区、备份恢复、运行日志及后台生成。
 
 精简后已无 `speech`、`web` 和 `web-ui` 模块；ASR/TTS、快捷消息、角色卡导入、Lorebook 与旧更新/赞助/关于入口已移除。Android WebView、Mode Injection、普通助手/附件、导出分享继续保留。后来恢复的运行日志不能与早期删除的请求日志入口混为一谈。
 
@@ -67,7 +67,7 @@ git remote -v
 | `highlight` | 代码语法高亮 |
 | `material3` | Material 色彩相关工具 |
 | `search` | 多种联网搜索提供商 |
-| `workspace` | PRoot、文件系统、Shell、Linux 环境及本地 native 构建 |
+| `workspace` | 工作区文件、独立 HOME、Kotlin 有限命令执行、迁移及本地 native 构建 |
 | `app:baselineprofile` | 启动/运行性能 profile |
 | `build-logic` | included build，统一模块构建约定 |
 
@@ -93,10 +93,10 @@ ChatPage / ChatVM
 | --- | --- |
 | 生成与会话服务 | `data/ai/GenerationHandler.kt`、`service/ChatService.kt` |
 | 输入/输出转换 | `data/ai/transformers/Transformer.kt` |
-| AI 文件、Shell、apt 工具 | `data/ai/tools/WorkspaceTools.kt` |
+| AI 文件与有限命令工具 | `data/ai/tools/WorkspaceTools.kt` |
 | 历史参考工具 | `data/ai/tools/ConversationTools.kt` |
 | 工作区与运行协调 | `data/repository/WorkspaceRepository.kt`、`data/workspace/` |
-| apt 计划与审批执行 | `data/workspace/WorkspaceAptPlanService.kt` |
+| 本地 Python 执行与工作进程 | `data/workspace/python/AndroidWorkspacePythonExecutor.kt`、`data/workspace/python/WorkspacePythonService.kt`、`app/src/main/python/workspace_runner.py` |
 | 可携带备份 | `data/workspace/WorkspaceArchiveService.kt` |
 | 会话编号、归属、持久化 | `data/repository/ConversationRepository.kt`、`data/db/dao/ConversationDAO.kt` |
 | 总结内容选择、分块 | `data/summary/ConversationSummary.kt` |
@@ -106,7 +106,7 @@ ChatPage / ChatVM
 | 历史选择与聊天 UI | `ui/pages/history/`、`ui/pages/chat/` |
 | 人工终端 | `ui/pages/extensions/workspace/WorkspaceTerminalPage.kt` |
 
-工作区核心在 `workspace/src/main/java/me/rerere/workspace/`：`WorkspaceManager.kt`、`ProotShellRunner.kt`、`WorkspaceFileSystem.kt`、`WorkspaceEnvironmentStore.kt`。
+工作区核心在 `workspace/src/main/java/me/rerere/workspace/`：`WorkspaceManager.kt`、`KotlinWorkspaceShellRunner.kt`、`PortableWorkspaceRuntime.kt`、`WorkspaceFileSystem.kt`。旧 PRoot/共享 Linux/apt 实现仍有源码，但不是默认运行链路，APK 打包排除 PRoot 与 termux native 库；QuickJS 和 `libworkspace` 保留。
 
 ## 5. 工作区与安全边界（当前实现）
 
@@ -114,25 +114,20 @@ ChatPage / ChatVM
 
 AI 文件读写、编辑只接受 `/workspace` 或其子路径，走工作区文件区 API。路径规范化须拒绝越界、空字节、相邻前缀目录和外部目录；授权还要核对助手/会话的工作区归属。不能把描述文字或用户审批当成路径检查的替代品。
 
-### Shell 模式
+### 默认命令运行时与 Python
 
-| 场景 | 模式 | 可见环境 |
-| --- | --- | --- |
-| 共享 Linux 的 AI 普通 Shell | `WORKSPACE_ONLY` | 工作区文件及所需基础运行时，不提供完整共享 Linux/Python |
-| 私有 Linux 的 AI Shell | `WORKSPACE_PACKAGE` | 私有 Linux 与已安装开发工具，可修改私有系统 |
-| 用户手动终端 | `FULL_ROOTFS` | 完整有效 Linux，保留用户配置挂载与既有终端能力 |
+应用依赖注入在 `RepositoryModule.kt` 设置 `portableRuntime = true`，使用 `KotlinWorkspaceShellRunner`，不是 `WorkspaceManager` 构造器的默认值。支持有限命令、管道、重定向、`&&` 及 `python`/`python3`，不调用完整 Bash 或 apt，不提供任意 Linux 命令、交互式 PTY 或包管理器。默认工作区页面无 Linux 安装、共享/私有切换和 apt 入口；终端为命令输入、执行、取消与结果历史。
 
-`WorkspaceManager.aiShellAccessMode()` 按环境选择模式。AI 模式不挂用户外部 bind、`/proc`、`/sys`、上传和 skills 目录；私有模式能用哪些 Python/npm 工具取决于实际安装，不保证预装。
+工作区保留独立文件区、HOME 和临时目录，命令路径映射为 `/workspace`、`/root`/`/home`、`/tmp`。Python 通过 Chaquopy 在同 UID、`exported=false` 的 `:workspace_python` 工作进程执行；正常完成、超时和取消后都终止整个进程并确认退出，未确认时保留终止待处理状态。该进程不是 Android isolatedProcess；路径映射与进程重建不构成安全隔离，不能声称阻止 Python 读取应用数据、调用原生能力或联网。AI 文件工具的 `/workspace` 路径边界和助手/会话归属检查不变。
 
-PRoot 是用户态环境及防误操作机制，不是内核虚拟机、恶意代码隔离证明或网络阻断保证。修改挂载与 Shell 行为需覆盖三种模式，不能再照旧文档把所有 AI Shell 统一说成只有文件区。
+Codemode 工具描述要求多步文件任务、批量读写、重复命令和结果筛选统计默认优先；单次简单操作可直接调用工具。实际仍只有 `read`、`write`、`edit`、`shell` 四种工作区调用，全部串行（包括 `Promise.all`），仅通过 `text(...)` 返回文本结果。
 
-### 共享 Linux 与公共 apt
+### 旧 Linux 工作区迁移
 
-- 新工作区默认共享；无环境标识的旧工作区保留私有环境，不自动合并或删除旧 rootfs。
-- 共享 rootfs 位于 `shared-linux/linux`，与每个工作区的文件、HOME 和临时目录分离。
-- 公共维护采用独占控制；运行中的任务/终端不能被静默杀掉。未结束的维护操作要恢复处理后才能继续。
-- apt 走结构化参数：模拟计划 → 计划 ID/指纹绑定 → 明确审批 → 排他执行。普通 Shell 不得绕过这条链直接修改公共包环境。
-- 普通工作区工具无需逐次审批，不代表取消路径检查、归属检查、审计或 apt 审批。
+- 迁移到独立 HOME，复制并核对旧私有 `linux/root`；已有独立 HOME 的工作区沿用其 HOME。
+- HOME 文件、目录和父目录先持久化（fsync），再写入并持久化 runtime marker，完成后才删除对应旧 `linux`；迁移失败保留源数据，不靠删除目录解决冲突。
+- 全部工作区迁移成功后才删除 `shared-linux`；任一工作区失败则保留公共源目录。
+- 迁移与命令执行仍受工作区锁和运行协调约束；便携运行时不再使用公共 apt 审批链。
 
 ## 6. 记忆、检索、总结与数据库兼容
 
@@ -144,14 +139,14 @@ PRoot 是用户态环境及防误操作机制，不是内核虚拟机、恶意�
 - 来源作为 user 权限的附加上下文放在最新用户要求之前，不创建隐藏消息节点。**`summaryContext` 会作为会话元数据持久缓存**，不能声称完全不落库。
 - 大来源需要分块归并、上限、进度与取消；先检查来源规模，不能一次加载所有历史再假装实现了内存上限。
 
-本次核对数据库版本为 **31**，以 `APP_DATABASE_VERSION` 为准。修改 Room 结构要同步 entity、版本、迁移注册、`app/schemas/` 与迁移测试；恢复逻辑中的 schema gate 也要检查。保留编号、助手归属、消息节点和总结元数据。旧 JSON 中普通未知字段可兼容忽略，但旧多态工具类型需显式迁移测试，不做破坏性数据清理。
+数据库版本为 **32**，以 `APP_DATABASE_VERSION` 为准。修改 Room 结构要同步 entity、版本、迁移注册、`app/schemas/` 与迁移测试；恢复逻辑中的 schema gate 也要检查。保留编号、助手归属、消息节点和总结元数据。旧 JSON 中普通未知字段可兼容忽略，但旧多态工具类型需显式迁移测试，不做破坏性数据清理。
 
 ## 7. 备份恢复与隐私
 
-当前导出是 ZIP：持久设置、可选数据库、工作区 TAR 与 manifest。工作区环境始终是可携带单元；旧“文件”选项只控制 upload/skills/fonts 等兼容项。共享工作区按有效 Linux 和独立 HOME 导出，恢复成私有环境，不把另一台设备的公共环境引用直接激活。
+当前备份与快照采用 v2：持久设置、可选数据库、工作区 TAR 与 manifest。每个工作区使用 `files.tar` 和 `home.tar`，不携带 Linux rootfs，不依赖源设备 ABI，也不恢复共享/私有 Linux 环境。旧“文件”选项只控制 upload/skills/fonts 等兼容项。
 
 - **新导出不是加密包**，设置保留 API Key、URL、MCP token 和同步凭据。用户数据库与工作区也可能含敏感内容，禁止公开上传。
-- `WorkspaceArchiveEncryption.kt` 保留旧加密包的解密恢复支持，不能据此宣称当前导出自动加密。
+- 恢复入口拒绝 v1、旧加密包和无 v2 manifest 的归档；旧加密辅助源码仍在，不代表当前入口支持旧包或自动加密。
 - manifest 的长度与 SHA-256 校验解决完整性问题，不解决保密性或来源认证。
 - 数据库备份涉及 WAL checkpoint；恢复有暂存、路径/符号链接校验、回滚记录，含数据库的恢复要求重启。
 - 工作区源指纹只检测变更，不是冻结所有外部文件句柄的文件系统事务。备份时避免外部程序继续写入。
@@ -171,6 +166,8 @@ PRoot 是用户态环境及防误操作机制，不是内核虚拟机、恶意�
 | CMake | 3.22.1（`workspace/build.gradle.kts`） |
 | ABI | arm64-v8a、x86_64，另产 universal APK |
 | App 版本 | 2.4.9 / versionCode 177，以 `app/build.gradle.kts` 为准 |
+| 本地 Python | Chaquopy 17.1.0 / Python 3.13；构建机 `python` 必须同主次版本 |
+| 固定 Python 依赖 | numpy 1.26.2、pandas 2.1.3、matplotlib 3.8.4、openpyxl 3.1.5 |
 
 1. 安装 JDK、SDK 平台 37、对应构建工具、NDK 与 CMake；将 `JAVA_HOME`、`ANDROID_HOME`/`ANDROID_SDK_ROOT` 指向实际目录。
 2. 在仓库根建立 `local.properties`，它已被 Git 忽略。例如：
@@ -197,8 +194,9 @@ Git Bash 使用 `./gradlew`；PowerShell 使用 `.\gradlew.bat`。依赖来自 G
 
 ```bash
 git diff --check
-./gradlew :workspace:testDebugUnitTest --tests me.rerere.workspace.WorkspaceShellAccessTest --tests me.rerere.workspace.RootfsPathResolutionTest
-./gradlew :workspace:testDebugUnitTest --tests me.rerere.workspace.SharedEnvironmentTest --tests me.rerere.workspace.WorkspaceAptExecutionTest
+./gradlew :workspace:testDebugUnitTest --tests me.rerere.workspace.PortableWorkspaceTest
+./gradlew :app:testDebugUnitTest --tests 'me.rerere.rikkahub.data.workspace.WorkspaceArchiveV2Test' -x :app:processDebugGoogleServices
+python -m unittest discover -s app/src/androidTest/python -p 'test_workspace_runner.py'
 ./gradlew :app:testDebugUnitTest -x :app:processDebugGoogleServices
 ./gradlew :ai:testDebugUnitTest
 ./gradlew :app:compileDebugAndroidTestKotlin -x :app:processDebugGoogleServices
@@ -212,14 +210,14 @@ git diff --check
 | 重点 | 测试入口（相对模块测试包） |
 | --- | --- |
 | 路径/工具边界 | app `data/ai/tools/WorkspaceToolsTest.kt` |
-| Shell、rootfs、共享环境、apt | workspace `WorkspaceShellAccessTest.kt`、`RootfsPathResolutionTest.kt`、`SharedEnvironmentTest.kt`、`WorkspaceAptExecutionTest.kt` |
+| 便携命令、HOME 迁移与故障恢复 | workspace `PortableWorkspaceTest.kt`；设备 `PortableWorkspaceInstrumentedTest.kt` |
+| Python 路径、执行、进程终止与取消 | `app/src/androidTest/python/test_workspace_runner.py`；app 设备 `data/workspace/python/AndroidWorkspacePythonExecutorTest.kt` |
 | FTS 隔离 | app `data/db/fts/MessageFtsManagerQueryTest.kt` |
 | 分层记忆 | app `data/repository/LayeredMemory*Test.kt`、`data/ai/LayeredMemoryPromptTest.kt` |
 | 总结与临时上下文 | app `data/summary/ConversationSummaryTest.kt`、`data/ai/GenerationHandlerContextTest.kt` |
-| 备份、安全、回滚、schema | app `data/workspace/WorkspaceArchive*Test.kt`、`data/workspace/RoomSchema31Test.kt`、`data/workspace/SharedWorkspaceArchiveTest.kt` |
-| apt 计划与指纹 | app `data/workspace/WorkspaceApt*Test.kt` |
+| v2 备份/快照、安全、回滚、schema | app `data/workspace/WorkspaceArchiveV2Test.kt`、`data/workspace/WorkspaceArchive*Test.kt`、`data/workspace/WorkspaceSnapshotTest.kt`、`data/workspace/RoomSchema31Test.kt`、`data/workspace/SharedWorkspaceArchiveTest.kt`；设备 `data/workspace/PortableWorkspaceBackupInstrumentedTest.kt` |
 
-上表 JVM 测试分别位于 `app/src/test/java/me/rerere/rikkahub/` 和 `workspace/src/test/java/me/rerere/workspace/`；星号代表一组文件，不是一个文件名。
+上表 Kotlin JVM 测试分别位于 `app/src/test/java/me/rerere/rikkahub/` 和 `workspace/src/test/java/me/rerere/workspace/`；星号代表一组文件，不是一个文件名。
 
 有已授权的测试设备/模拟器时：
 
@@ -229,7 +227,7 @@ adb devices
 ./gradlew :workspace:connectedDebugAndroidTest
 ```
 
-这会安装测试包并执行设备操作，先确认目标是可用测试设备。设备重点覆盖 `MemoryDAOTest`、`ConversationSummaryDAOTest`、`Migration_30_31_Test`、旧版本迁移、FTS、归档 schema gate、`WorkspaceAptPlanDAOTest` 和 `ProotWorkspaceOnlyInstrumentedTest`。PRoot 受限模式测试不自动证明私有环境/完整终端全部行为；还要按此次改动检查实际运行。
+这会安装测试包并执行设备操作，先确认目标是可用测试设备。设备重点覆盖 `PortableWorkspaceInstrumentedTest`、`AndroidWorkspacePythonExecutorTest`、`PortableWorkspaceBackupInstrumentedTest`，以及 `MemoryDAOTest`、`ConversationSummaryDAOTest`、`Migration_30_31_Test`、旧版本迁移、FTS 和归档 schema gate。旧 PRoot/apt 测试仍用于遗留实现，不代表默认便携运行时验收；模拟器验证不等于正式 Release 发布。
 
 通过 Kotlin 编译不等于设备验证，通过 JVM 测试也不等于 APK 与当前源码一致。没有设备或 Provider 凭据时明确记未执行，不能借用旧报告标“通过”。
 
@@ -280,8 +278,8 @@ CI 位于 `.github/workflows/daily-build.yml`：每天或手动触发，使用 `
 | sdkmanager 报代理 MalformedURLException | 检查 HTTP_PROXY/HTTPS_PROXY 是否为空字符串；只在该命令环境清除无效值，不改全局代理配置 |
 | Google Services 任务失败 | 提供自己的正确配置；测试任务可按上文排除处理，完整 APK 不可据此跳过 |
 | Windows Shell/链接相关测试失败 | 保存实际日志，在合适环境复测；不能当成本次改动自动免责 |
-| 共享工作区 AI 无法运行 Python | 这是普通 Shell 的当前边界；私有环境按需安装工具，公共包变更走 apt 审批 |
-| 公共环境提示 Busy/待恢复 | 检查运行任务、终端 lease 与维护恢复记录，不强杀/删目录绕过 |
+| 工作区 Python 无法运行 | 核对内置 Python、固定依赖、工作进程连接及终止状态；无需安装 Linux 或 apt |
+| 便携迁移失败/工作区未就绪 | 检查 HOME 冲突、同步和 marker 状态，保留旧 linux/shared-linux，不删源绕过 |
 | 备份恢复 schema 不一致 | 检查归档版本、迁移、schema gate 及实际错误；用隔离测试数据复现，不能删用户工作区 |
 | APK 无法覆盖安装 | 比较包名、versionCode 和证书指纹；先备份，不自动卸载 |
 | README/历史说明冲突 | 以当前源码、任务授权和对应版本的证据为准；旧路径/旧验收不作当前结论 |

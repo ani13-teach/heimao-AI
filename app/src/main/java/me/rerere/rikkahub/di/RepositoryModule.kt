@@ -16,7 +16,8 @@ import me.rerere.rikkahub.data.repository.WorkspaceRepository
 import me.rerere.rikkahub.data.workspace.WorkspaceAptExecutor
 import me.rerere.rikkahub.data.workspace.WorkspaceRuntimeCoordinator
 import me.rerere.rikkahub.data.workspace.RootfsPatchOptionsProvider
-import me.rerere.workspace.ProotShellRunner
+import me.rerere.workspace.KotlinWorkspaceShellRunner
+import me.rerere.rikkahub.data.workspace.python.AndroidWorkspacePythonExecutor
 import me.rerere.workspace.RootfsInstaller
 import me.rerere.workspace.RootfsPatchOptions
 import me.rerere.workspace.WorkspaceManager
@@ -59,15 +60,16 @@ val repositoryModule = module {
     single {
         val context: Context = get()
         val rootfsPatchOptionsProvider: RootfsPatchOptionsProvider = get()
-        // 同一份挂载表既用于 PRoot 的 -b 参数, 也用于文件工具的路径解析, 避免两处漂移。
+        // Keep file-tool path mappings available to the portable runner.
         val bindMounts = context.workspaceBindMounts()
         WorkspaceManager(
             baseDir = File(context.filesDir, "workspaces"),
-            shellRunner = ProotShellRunner(
-                nativeLibraryDir = File(context.applicationInfo.nativeLibraryDir),
+            shellRunner = KotlinWorkspaceShellRunner(
+                pythonExecutor = AndroidWorkspacePythonExecutor(context),
             ),
             bindMounts = bindMounts,
             rootfsPatchOptionsProvider = rootfsPatchOptionsProvider::invoke,
+            portableRuntime = true,
         )
     }
 

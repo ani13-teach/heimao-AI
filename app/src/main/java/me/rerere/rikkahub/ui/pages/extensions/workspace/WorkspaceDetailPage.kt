@@ -100,23 +100,9 @@ fun WorkspaceDetailPage(id: String) {
     val navController = LocalNavController.current
     val vm: WorkspaceDetailVM = koinViewModel(parameters = { parametersOf(id) })
     val state by vm.state.collectAsStateWithLifecycle()
-    var showMaintenanceTerminal by remember { mutableStateOf(false) }
-    if (showMaintenanceTerminal) {
-        // 维护终端是页面级模式: 复用同一 VM 和已有终端页, 不新增导航路由.
-        val leaveMaintenance = {
-            showMaintenanceTerminal = false
-            vm.refreshSharedEnvironment()
-        }
-        BackHandler { leaveMaintenance() }
-        WorkspaceTerminalPage(id = id, maintenance = true, onBack = leaveMaintenance)
-        return
-    }
-    val installProgress by vm.installProgress.collectAsStateWithLifecycle()
-    val installError by vm.installError.collectAsStateWithLifecycle()
-    val pagerState = rememberPagerState { 2 }
+    val pagerState = rememberPagerState(initialPage = 1) { 2 }
     val scope = rememberCoroutineScope()
     var deleteTarget by remember { mutableStateOf<WorkspaceFileEntry?>(null) }
-    var showInstallDialog by remember { mutableStateOf(false) }
     var previewImageUri by remember { mutableStateOf<String?>(null) }
     var restoreTarget by remember { mutableStateOf<WorkspaceSnapshotEntity?>(null) }
     var deleteSnapshotTarget by remember { mutableStateOf<WorkspaceSnapshotEntity?>(null) }
@@ -212,25 +198,9 @@ fun WorkspaceDetailPage(id: String) {
                     storageStats = state.storageStats,
                     snapshotBusy = state.snapshotBusy,
                     snapshotLimitExceeded = state.snapshotLimitExceeded,
-                    installProgress = installProgress,
-                    sharedEnvironment = state.sharedEnvironment,
-                    sharedAptBlocked = state.sharedAptBlocked,
-                    blockingAptPlans = state.blockingAptPlans,
-                    sharedLoading = state.sharedLoading,
-                    sharedBusy = state.sharedBusy,
-                    referencingWorkspaces = state.referencingWorkspaces,
-                    toolChecks = state.toolChecks,
-                    toolCheckRunning = state.toolCheckRunning,
-                    onInstallRootfs = { showInstallDialog = true },
                     onCreateSnapshot = vm::createSnapshot,
                     onRestoreSnapshot = { restoreTarget = it },
                     onDeleteSnapshot = { deleteSnapshotTarget = it },
-                    onSwitchToShared = vm::switchToSharedEnvironment,
-                    onSwitchToPrivate = vm::switchToPrivateEnvironment,
-                    onRestoreSharedRecovery = vm::restoreSharedRecovery,
-                    onAcknowledgeAptStopped = vm::acknowledgeAptProcessStopped,
-                    onOpenMaintenance = { showMaintenanceTerminal = true },
-                    onCheckTools = vm::checkSharedEnvironmentTools,
                 )
 
                 1 -> WorkspaceFilesPage(
@@ -296,46 +266,6 @@ fun WorkspaceDetailPage(id: String) {
                 )
             }
         }
-    }
-
-    state.workspace?.let { workspace ->
-        if (showInstallDialog) {
-            InstallRootfsDialog(
-                workspace = workspace,
-                shared = state.sharedEnvironment.isShared,
-                onDismiss = { showInstallDialog = false },
-                onConfirm = { url ->
-                    vm.installRootfs(url)
-                    showInstallDialog = false
-                },
-            )
-        }
-    }
-
-    installError?.let { message ->
-        AlertDialog(
-            onDismissRequest = vm::dismissInstallError,
-            title = { Text(stringResource(R.string.workspace_detail_rootfs_install_failed)) },
-            text = { Text(message) },
-            confirmButton = {
-                TextButton(onClick = vm::dismissInstallError) {
-                    Text(stringResource(R.string.common_confirm))
-                }
-            },
-        )
-    }
-
-    state.sharedError?.let { message ->
-        AlertDialog(
-            onDismissRequest = vm::dismissSharedError,
-            title = { Text(stringResource(R.string.workspace_shared_error_title)) },
-            text = { Text(message) },
-            confirmButton = {
-                TextButton(onClick = vm::dismissSharedError) {
-                    Text(stringResource(R.string.common_confirm))
-                }
-            },
-        )
     }
 
     state.snapshotError?.let { message ->
@@ -441,35 +371,10 @@ private fun WorkspaceBasicPage(
     storageStats: WorkspaceStorageStats?,
     snapshotBusy: Boolean,
     snapshotLimitExceeded: WorkspaceSnapshotLimitUiState?,
-    installProgress: RootfsInstallProgress?,
-    sharedEnvironment: SharedEnvironmentUiState,
-    sharedAptBlocked: Boolean,
-    blockingAptPlans: List<me.rerere.rikkahub.data.db.entity.WorkspaceAptPlanEntity>,
-    sharedLoading: Boolean,
-    sharedBusy: Boolean,
-    referencingWorkspaces: List<WorkspaceEntity>,
-    toolChecks: List<WorkspaceToolCheck>,
-    toolCheckRunning: Boolean,
-    onInstallRootfs: () -> Unit,
     onCreateSnapshot: () -> Unit,
     onRestoreSnapshot: (WorkspaceSnapshotEntity) -> Unit,
     onDeleteSnapshot: (WorkspaceSnapshotEntity) -> Unit,
-    onSwitchToShared: () -> Unit,
-    onSwitchToPrivate: () -> Unit,
-    onRestoreSharedRecovery: () -> Unit,
-    onAcknowledgeAptStopped: (me.rerere.rikkahub.data.db.entity.WorkspaceAptPlanEntity) -> Unit,
-    onOpenMaintenance: () -> Unit,
-    onCheckTools: () -> Unit,
 ) {
-    val shellStatus = workspace?.shellStatus
-    val installing = installProgress != null || shellStatus == WorkspaceShellStatus.INSTALLING.name
-    val rootfsReady = shellStatus == WorkspaceShellStatus.READY.name
-    val installButtonText = when {
-        installing -> stringResource(R.string.workspace_detail_installing)
-        rootfsReady -> stringResource(R.string.workspace_detail_reinstall_rootfs)
-        else -> stringResource(R.string.workspace_detail_install_rootfs)
-    }
-
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(16.dp),
@@ -497,30 +402,6 @@ private fun WorkspaceBasicPage(
         }
 
         item {
-            WorkspaceRuntimeMetadataCard(workspace?.runtimeMetadataOrDefault())
-        }
-
-        item {
-            WorkspaceSharedEnvironmentCard(
-                state = sharedEnvironment,
-                blocked = sharedAptBlocked,
-                blockingAptPlans = blockingAptPlans,
-                loading = sharedLoading,
-                busy = sharedBusy,
-                referencingWorkspaces = referencingWorkspaces,
-                toolChecks = toolChecks,
-                toolCheckRunning = toolCheckRunning,
-                rootfsReady = rootfsReady,
-                onSwitchToShared = onSwitchToShared,
-                onSwitchToPrivate = onSwitchToPrivate,
-                onRestoreRecovery = onRestoreSharedRecovery,
-                onAcknowledgeAptStopped = onAcknowledgeAptStopped,
-                onOpenMaintenance = onOpenMaintenance,
-                onCheckTools = onCheckTools,
-            )
-        }
-
-        item {
             WorkspaceStorageCard(storageStats)
         }
 
@@ -539,45 +420,7 @@ private fun WorkspaceBasicPage(
             WorkspaceAuditCard(auditEvents)
         }
 
-        item {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CustomColors.cardColorsOnSurfaceContainer,
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(16.dp),
-                ) {
-                    Text(
-                        text = stringResource(R.string.workspace_detail_enable_shell),
-                        style = MaterialTheme.typography.titleMedium,
-                    )
-                    Text(
-                        text = stringResource(R.string.workspace_detail_enable_shell_desc),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
 
-                    Button(
-                        onClick = onInstallRootfs,
-                        enabled = workspace != null && !installing,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Icon(HugeIcons.Bash, contentDescription = null)
-                        Text(
-                            text = installButtonText,
-                            modifier = Modifier.padding(start = 8.dp),
-                        )
-                    }
-
-                    installProgress?.let { progress ->
-                        RootfsProgress(progress)
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -1042,7 +885,7 @@ private fun WorkspaceAreaSelector(
 ) {
     val areas = listOf(
         WorkspaceStorageArea.FILES to stringResource(R.string.workspace_detail_area_files),
-        WorkspaceStorageArea.LINUX to stringResource(R.string.workspace_detail_area_rootfs),
+        WorkspaceStorageArea.LINUX to "个人目录",
     )
     SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
         areas.forEachIndexed { index, (area, label) ->

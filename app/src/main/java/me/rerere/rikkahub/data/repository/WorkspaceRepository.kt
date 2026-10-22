@@ -132,7 +132,59 @@ class WorkspaceRepository(
 
     private fun environmentChanged() { environmentRevision.update { it + 1 } }
 
-    suspend fun checkIntegrity() = withWorkspaceCatalogArchiveLock {
+    suspend fun checkIntegrity() {
+        if (manager.portableRuntime) {
+            migratePortableWorkspaces()
+        } else {
+            checkLegacyIntegrity()
+        }
+    }
+
+    suspend fun migratePortableWorkspaces(): Boolean = withEnvironmentArchiveLease {
+        check(manager.portableRuntime) { "Portable runtime is required for migration" }
+        withWorkspaceCatalogArchiveLock {
+            withContext(Dispatchers.IO) {
+                var migrated = true
+                for (workspace in dao.getAll()) {
+                    try {
+                        rootfsOperationLock(workspace.id).withLock {
+                            check(manager.workspaceDir(workspace.root).isDirectory) {
+                                "Workspace directory is missing"
+                            }
+                            manager.ensureWorkspace(workspace.root)
+                            updateShellState(workspace.id, WorkspaceShellStatus.READY.name)
+                        }
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
+                        migrated = false
+                        updateShellState(workspace.id, WorkspaceShellStatus.BROKEN.name)
+                        Log.e(TAG, "Portable workspace migration failed: id=${workspace.id}", error)
+                    }
+                }
+                if (migrated) {
+                    val shared = manager.environments.sharedLinuxDir().parentFile!!.toPath()
+                    if (java.nio.file.Files.exists(shared, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                        java.nio.file.Files.walkFileTree(shared, object : java.nio.file.SimpleFileVisitor<java.nio.file.Path>() {
+                            override fun visitFile(path: java.nio.file.Path, attrs: java.nio.file.attribute.BasicFileAttributes): java.nio.file.FileVisitResult {
+                                java.nio.file.Files.delete(path)
+                                return java.nio.file.FileVisitResult.CONTINUE
+                            }
+                            override fun postVisitDirectory(path: java.nio.file.Path, error: java.io.IOException?): java.nio.file.FileVisitResult {
+                                if (error != null) throw error
+                                java.nio.file.Files.delete(path)
+                                return java.nio.file.FileVisitResult.CONTINUE
+                            }
+                        })
+                    }
+                }
+                environmentChanged()
+                migrated
+            }
+        }
+    }
+
+    private suspend fun checkLegacyIntegrity() = withWorkspaceCatalogArchiveLock {
         withContext(Dispatchers.IO) {
             val workspaces = dao.getAll()
             for (workspace in workspaces) {
@@ -249,10 +301,11 @@ class WorkspaceRepository(
             updatedAt = now,
             lastAccessAt = null,
         )
-        manager.environments.initializeShared(workspace.root)
-        manager.ensureWorkspace(workspace.root)
-        dao.upsert(workspace)
-        workspace
+        if (!manager.portableRuntime) manager.environments.initializeShared(workspace.root)
+        withContext(Dispatchers.IO) { manager.ensureWorkspace(workspace.root) }
+        val ready = if (manager.portableRuntime) workspace.copy(shellStatus = WorkspaceShellStatus.READY.name) else workspace
+        dao.upsert(ready)
+        ready
     }
 
     suspend fun rename(id: String, name: String): Boolean = withWorkspaceCatalogArchiveLock {
@@ -299,6 +352,7 @@ class WorkspaceRepository(
         onProgress: (RootfsInstallProgress) -> Unit = {},
         expectedSha256: String? = null,
     ): Boolean = withWorkspaceCatalogArchiveLock {
+        check(!manager.portableRuntime) { "Linux installation is unavailable in portable workspaces" }
         val workspace = dao.getById(id) ?: return@withWorkspaceCatalogArchiveLock false
         if (isSharedWorkspace(workspace)) {
             installSharedRootfs(workspace, url, onProgress, expectedSha256)
@@ -681,6 +735,7 @@ class WorkspaceRepository(
      * switch can be undone, and the stored row is left untouched.
      */
     suspend fun switchToShared(id: String): Boolean = withWorkspaceCatalogArchiveLock {
+        check(!manager.portableRuntime) { "Shared Linux is unavailable in portable workspaces" }
         val workspace = dao.getById(id) ?: return@withWorkspaceCatalogArchiveLock false
         if (isSharedWorkspace(workspace)) return@withWorkspaceCatalogArchiveLock true
         workspaceRuntimeCoordinator.acquireExclusiveLease(id, WorkspaceRuntimeGates.SHARED_ENVIRONMENT).use {
@@ -1146,7 +1201,7 @@ class WorkspaceRepository(
         waitForIdleMillis: Long = 0L,
         block: suspend () -> T,
     ): T = workspaceRuntimeCoordinator.withEnvironmentArchiveLease(waitForIdleMillis) {
-        requireSharedAptSessionsAllowed()
+        if (!manager.portableRuntime) requireSharedAptSessionsAllowed()
         block()
     }
 
@@ -1330,13 +1385,14 @@ class WorkspaceRepository(
      * True when the workspace is bound to the public rootfs. An unreadable marker is treated as
      * private, which is exactly the layout every workspace had before the store existed.
      */
-    private fun isSharedWorkspace(root: String): Boolean = manager.environments.isShared(root)
+    private fun isSharedWorkspace(root: String): Boolean = !manager.portableRuntime && manager.environments.isShared(root)
 
     private fun isSharedWorkspace(entity: WorkspaceEntity): Boolean =
         isSharedWorkspace(entity.root)
 
     private fun projectEnvironment(entity: WorkspaceEntity): WorkspaceEntity =
-        WorkspaceEnvironmentProjection.project(entity, isSharedWorkspace(entity), environmentState())
+        if (manager.portableRuntime) entity
+        else WorkspaceEnvironmentProjection.project(entity, isSharedWorkspace(entity), environmentState())
 
     private fun projectEnvironments(entities: List<WorkspaceEntity>): List<WorkspaceEntity> {
         if (entities.none(::isSharedWorkspace)) return entities
@@ -1367,6 +1423,7 @@ class WorkspaceRepository(
      * A shared workspace is ready only after recovery has settled every journaled exchange.
      */
     private fun workspaceShellReady(workspace: WorkspaceEntity): Boolean {
+        if (manager.portableRuntime) return workspace.shellStatus == WorkspaceShellStatus.READY.name
         if (!manager.hasRootfs(workspace.root)) return false
         if (!isSharedWorkspace(workspace)) {
             return workspace.shellStatus == WorkspaceShellStatus.READY.name

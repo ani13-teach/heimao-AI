@@ -1,6 +1,6 @@
 package me.rerere.rikkahub.data.workspace
 
-import me.rerere.workspace.WorkspaceEnvironmentStore
+import me.rerere.workspace.WorkspaceManager
 import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
@@ -10,63 +10,38 @@ import java.io.File
 class SharedWorkspaceArchiveTest {
     @get:Rule val temporary = TemporaryFolder()
 
-    @Test fun `shared Linux exports each HOME and restores as private without changing public files`() {
+    @Test fun `local legacy HOME migrates before export and rootfs is not archived`() {
         val base = temporary.newFolder("workspaces")
-        val store = WorkspaceEnvironmentStore(base)
-        val linux = store.sharedLinuxDir()
-        File(linux, "usr/lib").mkdirs()
-        File(linux, "usr/lib/public-library").writeText("common")
-        File(linux, "root").mkdirs()
-        File(linux, "root/not-project-data").writeText("public-home")
-        for (id in listOf("one", "two")) {
-            store.initializeShared(id)
-            File(store.homeDir(id), "config").writeText(id)
-            val tar = File(temporary.root, "$id.tar")
-            WorkspaceArchiveTar.create(linux, tar, directoryOverrides = mapOf("root" to store.homeDir(id)))
-            val restoredBase = File(temporary.root, "restored-$id")
-            val restoredLinux = File(restoredBase, "$id/linux")
-            WorkspaceArchiveTar.extract(tar, restoredLinux)
-            assertEquals("common", File(restoredLinux, "usr/lib/public-library").readText())
-            assertEquals(id, File(restoredLinux, "root/config").readText())
-            assertFalse(File(restoredLinux, "root/not-project-data").exists())
-            assertFalse(WorkspaceEnvironmentStore(restoredBase).isShared(id))
-        }
-        assertEquals("public-home", File(linux, "root/not-project-data").readText())
-        assertEquals("common", File(linux, "usr/lib/public-library").readText())
+        org.junit.Assume.assumeTrue("Real directory fsync is covered by Android instrumentation", runCatching {
+            java.nio.channels.FileChannel.open(base.toPath(), java.nio.file.StandardOpenOption.READ).use { it.force(true) }
+        }.isSuccess)
+        val legacy = File(base, "project/linux/root").apply { mkdirs() }
+        File(legacy, "配置").writeText("保留")
+        File(base, "project/linux/usr/bin").mkdirs()
+        File(base, "project/linux/usr/bin/old").writeText("runtime")
+        val manager = WorkspaceManager(base, portableRuntime = true)
+        val source = manager.runtimePaths("project")
+        val tar = File(temporary.root, "home.tar")
+        WorkspaceArchiveTar.create(source.homeDir, tar)
+        val restoredBase = temporary.newFolder("restored")
+        WorkspaceArchiveTar.extract(tar, File(restoredBase, "project/home"))
+        val restored = WorkspaceManager(restoredBase, portableRuntime = true).runtimePaths("project")
+        assertEquals("保留", File(restored.homeDir, "配置").readText())
+        assertEquals(source.homeDir, manager.runtimePaths("project").homeDir)
+        assertFalse(File(restoredBase, "project/linux").exists())
+        assertFalse(File(restored.homeDir, "usr").exists())
+        assertEquals("portable-v1", File(restoredBase, "project/runtime").readText())
     }
 
-    @Test fun `skipped Linux keeps archived HOME in a private workspace`() {
-        val workspaces = temporary.newFolder("restore-workspaces")
-        val workspace = File(workspaces, "project").apply { mkdirs() }
-        val linux = File(workspace, "linux")
-        File(linux, "root").mkdirs()
-        File(linux, "root/profile").writeText("keep")
-        File(linux, "usr/bin").mkdirs()
-        File(linux, "usr/bin/tool").writeText("incompatible")
-
-        val home = preserveWorkspaceHomeFromSkippedRootfs(
-            workspaceStagingRoot = workspaces,
-            workspaceRoot = workspace,
-            root = "project",
-            extractedLinux = linux,
-        )
-        assertTrue(linux.deleteRecursively())
-
-        val store = WorkspaceEnvironmentStore(workspaces)
-        assertEquals("keep", File(home, "profile").readText())
-        assertFalse(linux.exists())
-        assertFalse(store.isShared("project"))
-        assertTrue(store.hasExternalHome("project"))
-        assertEquals(home, store.homeDir("project"))
-    }
-
-    @Test fun `HOME survives export before Linux has been installed`() {
-        val home = temporary.newFolder("home")
-        File(home, "keep").writeText("configuration")
-        val tar = File(temporary.root, "empty-linux.tar")
-        WorkspaceArchiveTar.create(File(temporary.root, "missing"), tar, directoryOverrides = mapOf("root" to home))
+    @Test fun `independent HOME exports without any runtime installation`() {
+        val source = temporary.newFolder("home")
+        File(source, "空目录").mkdirs()
+        File(source, "中文.txt").writeText("内容")
+        val tar = File(temporary.root, "home.tar")
+        WorkspaceArchiveTar.create(source, tar)
         val restored = File(temporary.root, "restored")
         WorkspaceArchiveTar.extract(tar, restored)
-        assertEquals("configuration", File(restored, "root/keep").readText())
+        assertEquals("内容", File(restored, "中文.txt").readText())
+        assertTrue(File(restored, "空目录").isDirectory)
     }
 }

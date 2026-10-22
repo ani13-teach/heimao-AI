@@ -222,13 +222,13 @@ class WorkspaceArchiveSecurityTest {
         val oldVersion = WorkspaceArchiveManifest(
             createdAt = 1,
             databaseVersion = 30,
-            workspaces = listOf(WorkspaceArchiveWorkspace("id", "one", "id", files = payload)),
+            workspaces = listOf(WorkspaceArchiveWorkspace("id", "one", "id", files = payload, home = payload.copy(path = "workspaces/id/home.tar"))),
         )
         assertTrue(runCatching { oldVersion.validate() }.isFailure)
 
         val outsideReference = WorkspaceArchiveManifest(
             createdAt = 1,
-            workspaces = listOf(WorkspaceArchiveWorkspace("id", "one", "id", files = payload)),
+            workspaces = listOf(WorkspaceArchiveWorkspace("id", "one", "id", files = payload, home = payload.copy(path = "workspaces/id/home.tar"))),
             references = WorkspaceArchiveReferences(
                 assistants = listOf(WorkspaceAssistantReference("assistant", "outside")),
             ),
@@ -245,7 +245,7 @@ class WorkspaceArchiveSecurityTest {
         )
         val manifest = WorkspaceArchiveManifest(
             createdAt = 1,
-            workspaces = listOf(WorkspaceArchiveWorkspace("id", "one", "id", files = payload)),
+            workspaces = listOf(WorkspaceArchiveWorkspace("id", "one", "id", files = payload, home = payload.copy(path = "workspaces/id/home.tar"))),
             references = WorkspaceArchiveReferences(
                 assistants = listOf(WorkspaceAssistantReference("assistant", null)),
                 conversations = listOf(WorkspaceConversationReference("conversation", "id")),
@@ -264,7 +264,7 @@ class WorkspaceArchiveSecurityTest {
         )
         val manifest = WorkspaceArchiveManifest(
             createdAt = 1,
-            workspaces = listOf(WorkspaceArchiveWorkspace("id", "one", "id", files = payload)),
+            workspaces = listOf(WorkspaceArchiveWorkspace("id", "one", "id", files = payload, home = payload.copy(path = "workspaces/id/home.tar"))),
             references = WorkspaceArchiveReferences(
                 conversations = listOf(
                     WorkspaceConversationReference("conversation", "id"),
@@ -285,8 +285,8 @@ class WorkspaceArchiveSecurityTest {
         val manifest = WorkspaceArchiveManifest(
             createdAt = 1,
             workspaces = listOf(
-                WorkspaceArchiveWorkspace("id", "one", "id", files = payload),
-                WorkspaceArchiveWorkspace("id", "two", "other", files = payload.copy(path = "workspaces/other/files.tar")),
+                WorkspaceArchiveWorkspace("id", "one", "id", files = payload, home = payload.copy(path = "workspaces/id/home.tar")),
+                WorkspaceArchiveWorkspace("id", "two", "other", files = payload.copy(path = "workspaces/other/files.tar"), home = payload.copy(path = "workspaces/other/home.tar")),
             ),
         )
         assertTrue(runCatching { manifest.validate() }.isFailure)
@@ -306,7 +306,7 @@ class WorkspaceArchiveSecurityTest {
                 WorkspaceArchivePayload("database/rikka_hub.db", 1, "1".repeat(64)),
             ),
             workspaces = listOf(
-                WorkspaceArchiveWorkspace("id", "one", "id", files = workspacePayload),
+                WorkspaceArchiveWorkspace("id", "one", "id", files = workspacePayload, home = workspacePayload.copy(path = "workspaces/id/home.tar")),
             ),
         )
         assertTrue(runCatching { base.validate() }.isFailure)
@@ -325,7 +325,7 @@ class WorkspaceArchiveSecurityTest {
             createdAt = 1,
             databaseEntries = listOf(databasePath),
             workspaces = listOf(
-                WorkspaceArchiveWorkspace("id", "one", "id", files = workspacePayload),
+                WorkspaceArchiveWorkspace("id", "one", "id", files = workspacePayload, home = workspacePayload.copy(path = "workspaces/id/home.tar")),
             ),
         )
         assertTrue(runCatching { withoutDescriptor.validate() }.isFailure)

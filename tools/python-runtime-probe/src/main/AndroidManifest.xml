@@ -1,0 +1,7 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:label="Python Runtime Probe" android:allowBackup="false" android:fullBackupContent="false">
+        <service android:name=".PythonWorkerService" android:exported="false" android:process=":python_worker" />
+        <service android:name=".IsolatedPythonService" android:exported="false"
+            android:isolatedProcess="true" android:process=":isolated_python" />
+    </application>
+</manifest>

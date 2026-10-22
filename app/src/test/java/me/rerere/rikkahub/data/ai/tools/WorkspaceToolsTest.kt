@@ -49,10 +49,11 @@ class WorkspaceToolsTest {
 
         assertEquals(setOf("command", "cwd", "timeout"), schema.keys)
         assertFalse(schema.containsKey("mode"))
-        assertTrue(workspaceShellDescription().contains("private Linux environment"))
-        assertTrue(workspaceShellDescription().contains("shared Linux environment uses a files-only sandbox"))
-        assertTrue(workspaceShellDescription().contains("/workspace/.venv"))
-        assertTrue(workspaceShellDescription().contains("public environment maintenance UI"))
+        assertTrue(workspaceShellDescription().contains("Python"))
+        assertTrue(workspaceShellDescription().contains("pipelines"))
+        assertTrue(workspaceShellDescription().contains("not a complete Bash"))
+        assertFalse(workspaceShellDescription().contains("workspace_apt_plan"))
+        assertFalse(workspaceShellDescription().contains("PRoot"))
         assertFalse(workspaceShellDescription().contains("package mode"))
     }
 

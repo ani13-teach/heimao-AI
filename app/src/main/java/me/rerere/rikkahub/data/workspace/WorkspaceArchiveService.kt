@@ -3,7 +3,6 @@ package me.rerere.rikkahub.data.workspace
 import me.rerere.rikkahub.data.db.migrations.Migration_31_32
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
-import android.os.Build
 import android.util.Log
 import androidx.room.Room
 import androidx.room.RoomDatabase
@@ -46,10 +45,6 @@ import me.rerere.rikkahub.data.model.redactWorkspaceUrl
 import me.rerere.rikkahub.utils.JsonInstant
 import me.rerere.workspace.WorkspaceEnvironmentStore
 import me.rerere.workspace.WorkspaceShellStatus
-import me.rerere.workspace.hasUsableFullRootfs
-import me.rerere.workspace.detectRootfsArchitecture
-import me.rerere.workspace.isRootfsArchitectureCompatible
-import me.rerere.workspace.supportedRootfsAbis
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
@@ -73,46 +68,7 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
-internal fun preserveWorkspaceHomeFromSkippedRootfs(
-    workspaceStagingRoot: File,
-    workspaceRoot: File,
-    root: String,
-    extractedLinux: File,
-): File {
-    val extractedHome = File(extractedLinux, "root")
-    val externalHome = File(workspaceRoot, "home")
-    require(!Files.exists(externalHome.toPath(), LinkOption.NOFOLLOW_LINKS)) {
-        "Workspace restore HOME already exists: ${externalHome.path}"
-    }
-    if (Files.exists(extractedHome.toPath(), LinkOption.NOFOLLOW_LINKS)) {
-        require(Files.isDirectory(extractedHome.toPath(), LinkOption.NOFOLLOW_LINKS)) {
-            "Archived workspace HOME is not a directory: ${extractedHome.path}"
-        }
-        require(!Files.isSymbolicLink(extractedHome.toPath())) {
-            "Archived workspace HOME must not be a symbolic link: ${extractedHome.path}"
-        }
-        try {
-            Files.move(
-                extractedHome.toPath(),
-                externalHome.toPath(),
-                StandardCopyOption.ATOMIC_MOVE,
-            )
-        } catch (_: AtomicMoveNotSupportedException) {
-            Files.move(extractedHome.toPath(), externalHome.toPath())
-        }
-    }
-    WorkspaceEnvironmentStore(workspaceStagingRoot)
-        .initializePrivateWithExternalHome(root)
-    return externalHome
-}
-
-/**
- * The single archive implementation used by local export, WebDAV and S3.
- *
- * The portable plaintext is deliberately a ZIP container with uncompressed TAR payloads. The
- * returned transport file is a versioned AES-256-GCM envelope around that ZIP; TAR keeps
- * directory, executable, symlink and hardlink semantics for both user files and the Linux rootfs.
- */
+/** Portable plaintext ZIP containing user files and HOME TAR payloads. */
 class WorkspaceArchiveService(
     private val context: Context,
     private val json: Json,
@@ -122,19 +78,13 @@ class WorkspaceArchiveService(
     private val database: AppDatabase,
     private val bindingCoordinator: AssistantWorkspaceBindingCoordinator,
 ) {
-    /**
-     * The rootfs a workspace actually runs on. Every read below (placeholder repair, fingerprint,
-     * payload, directory validation) goes through this projection instead of `<root>/linux`.
-     */
-    private val environments by lazy {
-        WorkspaceEnvironmentStore(File(context.filesDir, "workspaces"))
+    private val runtimeManager by lazy {
+        me.rerere.workspace.WorkspaceManager(
+            File(context.filesDir, "workspaces"), portableRuntime = true,
+        )
     }
 
-    private fun effectiveLinux(root: String): File =
-        if (environments.isShared(root)) environments.sharedLinuxDir() else environments.privateLinuxDir(root)
-
-    private fun homeOverrides(root: String): Map<String, File> =
-        if (environments.hasExternalHome(root)) mapOf("root" to environments.homeDir(root)) else emptyMap()
+    private fun runtimePaths(root: String) = runtimeManager.runtimePaths(root)
 
     suspend fun createBackupFile(
         includeDatabase: Boolean,
@@ -196,15 +146,7 @@ class WorkspaceArchiveService(
             val sourceFingerprints = mutableMapOf<String, WorkspaceSourceFingerprint>()
             val payloads = workspaces.map { workspace ->
                 workspaceRepository.withWorkspaceArchiveLock(workspace.id) {
-                    // A PRoot placeholder left in the rootfs is unreadable, and an unreadable
-                    // directory aborts the fingerprint and TAR walks below. Repair it first so
-                    // both fingerprints and the payloads see the same directory tree.
-                    val repaired = repairProotRootfsPlaceholders(
-                        effectiveLinux(workspace.root)
-                    )
-                    if (repaired.isNotEmpty()) {
-                        Log.i(TAG, "Repaired rootfs placeholders: ${repaired.joinToString(",")}")
-                    }
+                    runtimePaths(workspace.root)
                     // DocumentsProvider/open-FD users cannot be strongly frozen by this mutex.
                     // The before/after fingerprint is a change detector, not a filesystem freeze.
                     val before = fingerprintWorkspaceSource(workspace)
@@ -254,7 +196,6 @@ class WorkspaceArchiveService(
                 appVersion = BuildConfig.VERSION_NAME,
                 databaseVersion = AppDatabase.CURRENT_VERSION,
                 createdAt = System.currentTimeMillis(),
-                createdAbi = currentAbis(),
                 databaseEntries = databaseFiles.map { it.archiveName },
                 databasePayloads = databaseFiles.map { source ->
                     WorkspaceArchivePayload(
@@ -303,11 +244,11 @@ class WorkspaceArchiveService(
                                 workspace.files.path,
                                 budget,
                             )
-                            workspace.linux?.let { linux ->
+                            workspace.home.let { home ->
                                 addFile(
                                     zipOut,
-                                    File(payloadDirectory, payloadFileName(linux)),
-                                    linux.path,
+                                    File(payloadDirectory, payloadFileName(home)),
+                                    home.path,
                                     budget,
                                 )
                             }
@@ -377,92 +318,14 @@ class WorkspaceArchiveService(
         require(Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS) && file.canRead()) {
             "Backup file does not exist or is unreadable"
         }
-        val inspection = WorkspaceArchiveEncryption.inspect(file)
-        // Only a plaintext archive without the portable manifest predates the current format and
-        // needs the legacy warning; a current plaintext archive is an ordinary backup.
-        val needsLegacyConfirmation = inspection.requiresLegacyConfirmation(hasPortableManifest(file))
-        val encryptedBudget = WorkspaceArchiveBudget()
-        if (inspection.isEncrypted) {
-            encryptedBudget.checkCompressedFile(file)
-            encryptedBudget.checkAvailableSpace(context.filesDir, file.length())
+        requireCurrentArchive(file)
+        val result = workspaceRepository.withWorkspaceCatalogArchiveLock {
+            restorePortableArchive(file, includeDatabase, includeFiles, archiveCleanupFile = null)
         }
-        if (needsLegacyConfirmation && !allowLegacy) {
-            throw LegacyWorkspaceArchiveRequiresConfirmationException()
+        require(!result.restartRequired && !result.databaseRestoreAttempted) {
+            "A database restore must not return before relaunch"
         }
-        val authenticatedZip = if (inspection.isEncrypted) {
-            val suppliedPassword = password ?: throw WorkspaceArchivePasswordRequiredException()
-            val decrypted = File(
-                context.filesDir,
-                ".workspace-decrypted-${UUID.randomUUID()}.zip.partial",
-            )
-            require(!Files.isSymbolicLink(context.filesDir.toPath())) {
-                "Application files directory is a symbolic link"
-            }
-            var decryptedSuccessfully = false
-            try {
-                // Authentication completes before any ZIP/manifest parser or restore staging is
-                // allowed to observe the plaintext file.
-                WorkspaceArchiveEncryption.decrypt(
-                    source = file,
-                    target = decrypted,
-                    password = suppliedPassword,
-                    onOutputBytes = { bytes ->
-                        encryptedBudget.recordStagingBytes(bytes, context.filesDir)
-                    },
-                )
-                decryptedSuccessfully = true
-                decrypted
-            } catch (error: Throwable) {
-                if (!decryptedSuccessfully) deleteIfPresent(decrypted)
-                throw error
-            }
-        } else {
-            file
-        }
-        val ownsDecryptedZip = authenticatedZip !== file
-        try {
-            val result = workspaceRepository.withWorkspaceCatalogArchiveLock {
-                if (!hasPortableManifest(authenticatedZip)) {
-                    restoreLegacyArchive(
-                        authenticatedZip,
-                        includeDatabase,
-                        includeFiles,
-                        archiveCleanupFile = authenticatedZip.takeIf { ownsDecryptedZip },
-                    )
-                } else {
-                    restorePortableArchive(
-                        authenticatedZip,
-                        includeDatabase,
-                        includeFiles,
-                        archiveCleanupFile = authenticatedZip.takeIf { ownsDecryptedZip },
-                    )
-                }
-            }
-            val markedResult = if (needsLegacyConfirmation) {
-                result.copy(
-                    legacy = true,
-                    warnings = (result.warnings + LEGACY_RESTORE_WARNING).distinct(),
-                )
-            } else {
-                result
-            }
-            // Database restores terminate from their closed-DB critical section. Returning here
-            // is reserved for files-only/incremental restores, which keep Room open.
-            require(!markedResult.restartRequired && !markedResult.databaseRestoreAttempted) {
-                "A database restore must not return before relaunch"
-            }
-            markedResult
-        } catch (error: WorkspaceArchiveRestartRequiredException) {
-            // A legacy caller may still surface this guard. Cleanup ownership remains with the
-            // next process; never return to a transport while Room is closed.
-            WorkspaceArchiveRestart.scheduleAndExit(context)
-        } finally {
-            // A full database restore may exit the process before this finally block. In that
-            // case the durable recovery journal/cleanup marker owns this exact filesDir artifact.
-            if (ownsDecryptedZip && !WorkspaceArchiveCleanup.isMarkerFor(context, authenticatedZip)) {
-                deleteIfPresent(authenticatedZip)
-            }
-        }
+        result
         }
     }
 
@@ -493,7 +356,7 @@ class WorkspaceArchiveService(
         require(workspaceDir.isDirectory && !Files.isSymbolicLink(workspaceDir.toPath())) {
             "Workspace directory is missing: ${workspace.id}"
         }
-        val filesDir = File(workspaceDir, "files")
+        val filesDir = runtimePaths(workspace.root).filesDir
         require(filesDir.isDirectory && !Files.isSymbolicLink(filesDir.toPath())) {
             "Workspace files directory is missing: ${workspace.id}"
         }
@@ -514,18 +377,14 @@ class WorkspaceArchiveService(
                 budget.recordStagingBytes(bytes, context.cacheDir)
             },
         )
-        val linuxDir = effectiveLinux(workspace.root)
-        val linuxPayloadFile = File(payloadDirectory, "${workspace.root}-linux.tar")
-        // An absent/disabled rootfs is represented by a validated empty TAR, so every manifest
-        // still has an explicit files and linux length/hash pair.
-        require(!Files.isSymbolicLink(linuxDir.toPath())) {
-            "Workspace Linux directory is a symbolic link: ${workspace.id}"
+        val homeDir = runtimePaths(workspace.root).homeDir
+        val homePayloadFile = File(payloadDirectory, "${workspace.root}-home.tar")
+        require(!Files.isSymbolicLink(homeDir.toPath())) {
+            "Workspace HOME directory is a symbolic link: ${workspace.id}"
         }
         WorkspaceArchiveTar.create(
-            sourceRoot = linuxDir,
-            output = linuxPayloadFile,
-            directoryOverrides = homeOverrides(workspace.root),
-            excludedPaths = setOf("tmp", "var/tmp"),
+            sourceRoot = homeDir,
+            output = homePayloadFile,
             limits = tarLimits,
             onEntry = budget::recordTarEntry,
             onFileBytes = budget::recordWorkspaceBytes,
@@ -534,10 +393,10 @@ class WorkspaceArchiveService(
                 budget.recordStagingBytes(bytes, context.cacheDir)
             },
         )
-        val linuxPayload = WorkspaceArchivePayload(
-            path = "workspaces/${workspace.root}/linux.tar",
-            length = linuxPayloadFile.length(),
-            sha256 = sha256(linuxPayloadFile),
+        val homePayload = WorkspaceArchivePayload(
+            path = "workspaces/${workspace.root}/home.tar",
+            length = homePayloadFile.length(),
+            sha256 = sha256(homePayloadFile),
         )
         return WorkspaceArchiveWorkspace(
             id = workspace.id,
@@ -553,7 +412,7 @@ class WorkspaceArchiveService(
                 length = filesPayloadFile.length(),
                 sha256 = sha256(filesPayloadFile),
             ),
-            linux = linuxPayload,
+            home = homePayload,
             toolApprovals = workspace.toolApprovals,
         )
     }
@@ -783,8 +642,8 @@ class WorkspaceArchiveService(
         require(workspace.root.isValidArchiveComponent()) { "Invalid workspace root: ${workspace.root}" }
         val workspaceDir = File(File(context.filesDir, "workspaces"), workspace.root)
         return WorkspaceSourceFingerprint(
-            entries = fingerprintTree(File(workspaceDir, "files"), "files") +
-                fingerprintTree(effectiveLinux(workspace.root), "linux", homeOverrides(workspace.root)),
+            entries = fingerprintTree(runtimePaths(workspace.root).filesDir, "files") +
+                fingerprintTree(runtimePaths(workspace.root).homeDir, "home"),
         )
     }
 
@@ -817,8 +676,8 @@ class WorkspaceArchiveService(
             require(filesDir.isDirectory && !Files.isSymbolicLink(filesDir.toPath())) {
                 "Workspace files directory changed while creating archive: ${workspace.id}"
             }
-            require(!Files.isSymbolicLink(effectiveLinux(workspace.root).toPath())) {
-                "Workspace Linux directory changed while creating archive: ${workspace.id}"
+            require(!Files.isSymbolicLink(runtimePaths(workspace.root).homeDir.toPath())) {
+                "Workspace HOME directory changed while creating archive: ${workspace.id}"
             }
         }
         return actualRoots
@@ -1046,47 +905,12 @@ class WorkspaceArchiveService(
         password: CharArray? = null,
         allowLegacy: Boolean = false,
     ) {
-        val inspection = inspectBackupFile(file)
-        if (inspection.isLegacy) {
-            val portable = hasPortableManifest(file)
-            require(!inspection.requiresLegacyConfirmation(portable) || allowLegacy) {
-                "Legacy archive verification requires explicit confirmation"
-            }
-            if (portable) {
-                verifyPortableArchive(file)
-            } else {
-                verifyLegacyArchive(file)
-            }
-            return
-        }
-
-        val suppliedPassword = password ?: throw WorkspaceArchivePasswordRequiredException()
-        val encryptedBudget = WorkspaceArchiveBudget()
-        encryptedBudget.checkCompressedFile(file)
-        encryptedBudget.checkAvailableSpace(context.cacheDir, file.length())
-        val decrypted = File(context.cacheDir, ".workspace-verify-decrypted-${UUID.randomUUID()}.zip")
-        var failure: Throwable? = null
-        try {
-            WorkspaceArchiveEncryption.decrypt(
-                source = file,
-                target = decrypted,
-                password = suppliedPassword,
-                onOutputBytes = { bytes ->
-                    encryptedBudget.recordStagingBytes(bytes, context.cacheDir)
-                },
-            )
-            if (hasPortableManifest(decrypted)) {
-                verifyPortableArchive(decrypted)
-            } else {
-                verifyLegacyArchive(decrypted)
-            }
-        } catch (error: Throwable) {
-            failure = error
-            throw error
-        } finally {
-            cleanupDirectory(decrypted, failure)
-        }
+        requireCurrentArchive(file)
+        verifyPortableArchive(file)
     }
+
+    private fun requireCurrentArchive(file: File) =
+        requireCurrentWorkspaceArchive(file, json, MAX_MANIFEST_BYTES)
 
     private fun verifyPortableArchive(file: File) {
         val budget = WorkspaceArchiveBudget()
@@ -1193,156 +1017,6 @@ class WorkspaceArchiveService(
         } finally {
             cleanupDirectory(verificationRoot, failure)
         }
-    }
-
-    private fun verifyLegacyArchive(file: File) {
-        val budget = WorkspaceArchiveBudget()
-        budget.checkCompressedFile(file)
-        val verificationRoot = File(context.cacheDir, ".legacy-verify-${UUID.randomUUID()}")
-        var failure: Throwable? = null
-        try {
-            budget.checkAvailableSpace(context.cacheDir, BUFFER_SIZE.toLong())
-            require(verificationRoot.mkdirs() || verificationRoot.isDirectory) {
-                "Unable to create archive verification staging"
-            }
-            val databaseDirectory = File(verificationRoot, "database")
-            val databaseParts = mutableSetOf<String>()
-            ZipInputStream(BufferedInputStream(FileInputStream(file))).use { zipIn ->
-                val seen = HashSet<String>()
-                while (true) {
-                    val entry = zipIn.nextEntry ?: break
-                    budget.recordZipEntry()
-                    require(!entry.isDirectory) { "Legacy archive contains a directory entry" }
-                    val name = WorkspaceArchivePathSafety.normalize(entry.name)
-                    require(seen.add(name)) { "Duplicate ZIP entry: $name" }
-                    val databasePart = legacyDatabasePart(name)
-                    when {
-                        databasePart != null -> {
-                            require(databaseParts.add(databasePart)) {
-                                "Legacy archive contains duplicate database $databasePart entries"
-                            }
-                            copyCurrentEntryToFile(
-                                zipIn,
-                                File(databaseDirectory, "rikka_hub$databasePart"),
-                                MAX_DATABASE_ENTRY_BYTES,
-                                budget,
-                                stagingRoot = verificationRoot,
-                            )
-                        }
-                        name == "settings.json" -> {
-                            copyCurrentEntry(zipIn, NullOutputStream, MAX_SETTINGS_BYTES, budget)
-                        }
-                        else -> copyCurrentEntry(zipIn, NullOutputStream, MAX_NON_PAYLOAD_BYTES, budget)
-                    }
-                    zipIn.closeEntry()
-                }
-            }
-            require(databaseParts.isEmpty() || "" in databaseParts) {
-                "Legacy archive contains database WAL/SHM without its main database"
-            }
-            if ("" in databaseParts) {
-                val stagedDatabase = upgradeLegacyDatabase(
-                    main = File(databaseDirectory, "rikka_hub"),
-                    wal = File(databaseDirectory, "rikka_hub-wal").takeIf { it.exists() },
-                    shm = File(databaseDirectory, "rikka_hub-shm").takeIf { it.exists() },
-                    stagingRoot = verificationRoot,
-                    budget = budget,
-                )
-                validateStagedDatabase(
-                    stagedDatabase,
-                    expectedVersion = AppDatabase.CURRENT_VERSION,
-                    expectedSnapshotsEmpty = true,
-                )
-            }
-        } catch (error: Throwable) {
-            failure = error
-            throw error
-        } finally {
-            cleanupDirectory(verificationRoot, failure)
-        }
-    }
-
-    /**
-     * Legacy transports used both `rikka_hub.db` and the live Room sidecar names. A database part
-     * is normalized to the basename used by SQLite in the isolated staging directory.
-     */
-    private fun legacyDatabasePart(name: String): String? = when {
-        name == "rikka_hub.db" || name == "database/rikka_hub.db" ||
-            name == "rikka_hub" || name == "database/rikka_hub" -> ""
-        name == "rikka_hub-wal" || name == "database/rikka_hub-wal" ||
-            name == "rikka_hub.db-wal" || name == "database/rikka_hub.db-wal" -> "-wal"
-        name == "rikka_hub-shm" || name == "database/rikka_hub-shm" ||
-            name == "rikka_hub.db-shm" || name == "database/rikka_hub.db-shm" -> "-shm"
-        else -> null
-    }
-
-    /**
-     * Upgrade a legacy main/WAL/SHM set without ever touching the live Room database.
-     *
-     * The input files already came from an archive staging directory. They are copied once more
-     * to a SQLite basename, checkpointed there, and only then opened by Room with the same
-     * migration chain as the application. The Room connection is closed before the final
-     * standalone checkpoint and schema gate, so no WAL/SHM sidecar can be activated by restore.
-     */
-    private fun upgradeLegacyDatabase(
-        main: File,
-        wal: File?,
-        shm: File?,
-        stagingRoot: File,
-        budget: WorkspaceArchiveBudget,
-    ): File {
-        require(Files.isRegularFile(main.toPath(), LinkOption.NOFOLLOW_LINKS)) {
-            "Legacy archive database main file is missing or unreadable"
-        }
-        val combinedDirectory = File(stagingRoot, "database-combined")
-        require(combinedDirectory.mkdirs() || combinedDirectory.isDirectory) {
-            "Unable to create legacy database staging directory"
-        }
-        val combinedMain = File(combinedDirectory, "rikka_hub")
-        copyStagedDatabaseFile(main, combinedMain, budget, stagingRoot)
-        wal?.let {
-            require(Files.isRegularFile(it.toPath(), LinkOption.NOFOLLOW_LINKS)) {
-                "Legacy archive database WAL is not a regular file"
-            }
-            copyStagedDatabaseFile(it, File(combinedDirectory, "rikka_hub-wal"), budget, stagingRoot)
-        }
-        shm?.let {
-            require(Files.isRegularFile(it.toPath(), LinkOption.NOFOLLOW_LINKS)) {
-                "Legacy archive database SHM is not a regular file"
-            }
-            copyStagedDatabaseFile(it, File(combinedDirectory, "rikka_hub-shm"), budget, stagingRoot)
-        }
-
-        checkpointLegacyDatabase(combinedMain)
-        val sourceVersion = readStandaloneUserVersion(combinedMain)
-        require(sourceVersion in 1..AppDatabase.CURRENT_VERSION) {
-            "Unsupported legacy database schema version: $sourceVersion; old data was not touched"
-        }
-
-        val stagedRoom = openStagedRoomDatabase(combinedMain)
-        try {
-            val staged = stagedRoom.openHelper.writableDatabase
-            // This mutation is still confined to the combined copy. Migration_29_30 creates the
-            // table for old databases before this statement is reached.
-            staged.execSQL("DELETE FROM workspace_snapshots")
-            // Restoring a database never restores permission to execute a prior apt approval.
-            staged.execSQL(
-                "UPDATE workspace_apt_plans SET state = 'EXPIRED', confirmed_tool_call_id = NULL " +
-                    "WHERE state IN ('PLANNED', 'CONFIRMED')",
-            )
-            rebuildMessageFts(staged)
-            checkpointSupportDatabase(staged)
-        } finally {
-            stagedRoom.close()
-        }
-        checkpointLegacyDatabase(combinedMain)
-        cleanupDatabaseSidecars(combinedMain)
-        validateStagedDatabase(
-            file = combinedMain,
-            expectedVersion = AppDatabase.CURRENT_VERSION,
-            expectedSnapshotsEmpty = true,
-        )
-        return combinedMain
     }
 
     private fun upgradePortableDatabaseIfNeeded(
@@ -1878,10 +1552,6 @@ class WorkspaceArchiveService(
         require(workspaceStagingRoot.mkdirs() || workspaceStagingRoot.isDirectory) {
             "Unable to create workspace restore staging root"
         }
-        val archiveAbis = prepared.manifest.createdAbi.mapNotNull(::canonicalAbi).toSet()
-        val deviceAbis = supportedRootfsAbis().mapNotNull(::canonicalAbi).toSet()
-        val abiCompatible = archiveAbis.isEmpty() || deviceAbis.isEmpty() ||
-            archiveAbis.intersect(deviceAbis).isNotEmpty()
         prepared.manifest.workspaces.forEach { manifestWorkspace ->
             val workspaceRoot = File(workspaceStagingRoot, manifestWorkspace.root)
             val filesRoot = File(workspaceRoot, "files")
@@ -1904,75 +1574,29 @@ class WorkspaceArchiveService(
             )
             budget.checkStagingDirectory(staging)
 
-            var linuxRoot: File? = null
-            var externalHome: File? = null
-            val linuxPayload = manifestWorkspace.linux
-            if (linuxPayload != null) {
-                val linuxPayloadFile = prepared.payloadFiles[linuxPayload.path]
-                    ?: error("Missing Linux payload: ${manifestWorkspace.id}")
-                val extractedLinux = File(workspaceRoot, "linux")
-                budget.recordTarBytes(linuxPayloadFile.length())
-                WorkspaceArchiveTar.extract(
-                    input = linuxPayloadFile,
-                    targetRoot = extractedLinux,
-                    limits = WorkspaceArchiveTar.Limits(
-                        maxEntries = MAX_TAR_ENTRIES,
-                        maxEntryBytes = MAX_PAYLOAD_BYTES,
-                        maxPayloadBytes = MAX_PAYLOAD_BYTES,
-                    ),
-                    onEntry = budget::recordTarEntry,
-                    onFileBytes = { bytes ->
-                        budget.recordWorkspaceBytes(bytes)
-                        budget.recordStagingBytes(bytes, staging)
-                    },
-                )
-                // /tmp and /var/tmp are intentionally not portable state; recreate the
-                // runtime directories after extraction instead of archiving their contents.
-                val tmp = File(extractedLinux, "tmp")
-                val varTmp = File(extractedLinux, "var/tmp")
-                require(tmp.mkdirs() || tmp.isDirectory) { "Unable to recreate Linux tmp" }
-                require(varTmp.mkdirs() || varTmp.isDirectory) { "Unable to recreate Linux var/tmp" }
-                WorkspaceArchiveTar.applyMode(tmp, 0x1c0) // 0700
-                WorkspaceArchiveTar.applyMode(varTmp, 0x1c0) // 0700
-                budget.checkStagingDirectory(staging)
-                val detected = detectRootfsArchitecture(extractedLinux)
-                val expected = manifestWorkspace.runtimeMetadata.detectedArchitecture
-                    ?: manifestWorkspace.runtimeMetadata.expectedArchitecture
-                    ?: prepared.manifest.createdAbi.firstOrNull()?.let(::canonicalAbi)
-                val skipReason = when {
-                    !abiCompatible ->
-                        "ABI mismatch"
-
-                    !extractedLinux.hasUsableFullRootfs() -> {
-                        if (manifestWorkspace.shellStatus == WorkspaceShellStatus.READY.name) {
-                            error("Workspace ${manifestWorkspace.name} Linux payload lacks required rootfs capabilities")
-                        }
-                        "Linux rootfs is unavailable"
-                    }
-
-                    !isRootfsArchitectureCompatible(expected, detected, supportedRootfsAbis()) ->
-                        "rootfs architecture mismatch"
-
-                    else -> null
-                }
-                if (skipReason != null) {
-                    externalHome = preserveWorkspaceHomeFromSkippedRootfs(
-                        workspaceStagingRoot = workspaceStagingRoot,
-                        workspaceRoot = workspaceRoot,
-                        root = manifestWorkspace.root,
-                        extractedLinux = extractedLinux,
-                    )
-                    require(extractedLinux.deleteRecursively()) {
-                        "Unable to remove skipped Linux rootfs staging: ${extractedLinux.path}"
-                    }
-                    warnings += "Workspace ${manifestWorkspace.name}: $skipReason; files and HOME restored, Linux skipped"
-                } else {
-                    linuxRoot = extractedLinux
-                }
-            } else {
-                warnings += "Workspace ${manifestWorkspace.name}: Linux payload is absent; files restored"
-            }
-            result += PreparedWorkspace(manifestWorkspace, workspaceRoot, linuxRoot, externalHome)
+            val homePayload = manifestWorkspace.home
+            val homePayloadFile = prepared.payloadFiles[homePayload.path]
+                ?: error("Missing HOME payload: ${manifestWorkspace.id}")
+            budget.recordTarBytes(homePayloadFile.length())
+            WorkspaceArchiveTar.extract(
+                input = homePayloadFile,
+                targetRoot = File(workspaceRoot, "home"),
+                limits = WorkspaceArchiveTar.Limits(
+                    maxEntries = MAX_TAR_ENTRIES,
+                    maxEntryBytes = MAX_PAYLOAD_BYTES,
+                    maxPayloadBytes = MAX_PAYLOAD_BYTES,
+                ),
+                onEntry = budget::recordTarEntry,
+                onFileBytes = { bytes ->
+                    budget.recordWorkspaceBytes(bytes)
+                    budget.recordStagingBytes(bytes, staging)
+                },
+            )
+            val paths = me.rerere.workspace.WorkspaceManager(
+                workspaceStagingRoot, portableRuntime = true,
+            ).runtimePaths(manifestWorkspace.root)
+            budget.checkStagingDirectory(staging)
+            result += PreparedWorkspace(manifestWorkspace, workspaceRoot, paths.homeDir)
         }
         return result
     }
@@ -1995,14 +1619,7 @@ class WorkspaceArchiveService(
         }
         preparedWorkspaces.forEach { candidate ->
             val workspaceRoot = File(stagingRoot, candidate.manifest.root)
-            val expectedChildren = buildSet {
-                add("files")
-                if (candidate.linuxRoot != null) add("linux")
-                if (candidate.externalHome != null) {
-                    add("home")
-                    add("environment")
-                }
-            }
+            val expectedChildren = setOf("files", "home", "tmp", "runtime")
             val actualChildren = workspaceRoot.listFiles().orEmpty().map { child ->
                 require(!Files.isSymbolicLink(child.toPath())) {
                     "Prepared workspace staging contains a symbolic link: ${child.path}"
@@ -2015,15 +1632,9 @@ class WorkspaceArchiveService(
             require(File(workspaceRoot, "files").isDirectory) {
                 "Prepared workspace files directory is missing: ${candidate.manifest.id}"
             }
-            if (candidate.externalHome != null) {
-                require(File(workspaceRoot, "home").isDirectory) {
-                    "Prepared workspace HOME directory is missing: ${candidate.manifest.id}"
-                }
-                val stagedEnvironments = WorkspaceEnvironmentStore(stagingRoot)
-                require(!stagedEnvironments.isShared(candidate.manifest.root) &&
-                    stagedEnvironments.hasExternalHome(candidate.manifest.root)) {
-                    "Prepared workspace HOME is not marked private: ${candidate.manifest.id}"
-                }
+            require(candidate.homeRoot.isDirectory) { "Prepared workspace HOME directory is missing" }
+            require(File(workspaceRoot, "runtime").readText() == "portable-v1") {
+                "Prepared workspace runtime marker is invalid"
             }
         }
     }
@@ -2323,321 +1934,6 @@ class WorkspaceArchiveService(
         }
     }
 
-    private suspend fun restoreLegacyArchive(
-        file: File,
-        includeDatabase: Boolean,
-        includeFiles: Boolean,
-        archiveCleanupFile: File? = null,
-    ): WorkspaceArchiveRestoreResult {
-        val staging = File(context.filesDir, ".legacy-restore-${UUID.randomUUID()}.partial")
-        val budget = WorkspaceArchiveBudget()
-        budget.checkAvailableSpace(context.filesDir, BUFFER_SIZE.toLong())
-        require(staging.mkdirs() || staging.isDirectory) { "Unable to create legacy restore staging" }
-        var failure: Throwable? = null
-        var restoreResult: WorkspaceArchiveRestoreResult? = null
-        try {
-            budget.checkCompressedFile(file)
-            val settingsFile = File(staging, "settings.json")
-            val databaseDirectory = File(staging, "database-input")
-            val legacyDirectory = File(staging, "legacy")
-            val databaseParts = mutableSetOf<String>()
-            val seen = HashSet<String>()
-            var count = 0
-            ZipInputStream(BufferedInputStream(FileInputStream(file))).use { zipIn ->
-                while (true) {
-                    val entry = zipIn.nextEntry ?: break
-                    count++
-                    budget.recordZipEntry()
-                    require(count <= MAX_ZIP_ENTRIES) { "Too many ZIP entries" }
-                    val name = WorkspaceArchivePathSafety.normalize(entry.name)
-                    require(!entry.isDirectory) { "Legacy archive contains a directory entry: $name" }
-                    require(seen.add(name)) { "Duplicate ZIP entry: $name" }
-                    when {
-                        name == "settings.json" -> {
-                            copyCurrentEntryToFile(
-                                zipIn,
-                                settingsFile,
-                                MAX_SETTINGS_BYTES,
-                                budget,
-                                stagingRoot = staging,
-                            )
-                        }
-
-                        legacyDatabasePart(name) != null -> {
-                            val databasePart = requireNotNull(legacyDatabasePart(name))
-                            require(databaseParts.add(databasePart)) {
-                                "Legacy archive contains duplicate database $databasePart entries"
-                            }
-                            if (includeDatabase) {
-                                copyCurrentEntryToFile(
-                                    zipIn,
-                                    File(databaseDirectory, "rikka_hub$databasePart"),
-                                    MAX_DATABASE_ENTRY_BYTES,
-                                    budget,
-                                    stagingRoot = staging,
-                                )
-                            } else {
-                                copyCurrentEntry(zipIn, NullOutputStream, MAX_DATABASE_ENTRY_BYTES, budget)
-                            }
-                        }
-
-                        name.startsWith("${FileFolders.UPLOAD}/") ||
-                            name.startsWith("${FileFolders.SKILLS}/") ||
-                            name.startsWith("${FileFolders.FONTS}/") -> {
-                            if (includeFiles) {
-                                val target = WorkspaceArchivePathSafety.resolve(legacyDirectory, name)
-                                copyCurrentEntryToFile(
-                                    zipIn,
-                                    target,
-                                    MAX_NON_PAYLOAD_BYTES,
-                                    budget,
-                                    stagingRoot = staging,
-                                )
-                            } else {
-                                copyCurrentEntry(zipIn, NullOutputStream, MAX_NON_PAYLOAD_BYTES, budget)
-                            }
-                        }
-
-                        else -> copyCurrentEntry(zipIn, NullOutputStream, MAX_NON_PAYLOAD_BYTES, budget)
-                    }
-                    zipIn.closeEntry()
-                }
-            }
-            require(databaseParts.isEmpty() || "" in databaseParts) {
-                "Legacy archive contains database WAL/SHM without its main database"
-            }
-            budget.checkStagingDirectory(staging)
-            val currentSettings = settingsStore.readPersistedSettingsFailFast()
-            val restoredSettings = if (settingsFile.isFile) {
-                decodeArchiveSettings(settingsFile.readText(Charsets.UTF_8))
-            } else null
-            val stagedDatabase = if (includeDatabase && "" in databaseParts) {
-                val upgraded = upgradeLegacyDatabase(
-                    main = File(databaseDirectory, "rikka_hub"),
-                    wal = File(databaseDirectory, "rikka_hub-wal").takeIf { it.exists() },
-                    shm = File(databaseDirectory, "rikka_hub-shm").takeIf { it.exists() },
-                    stagingRoot = staging,
-                    budget = budget,
-                )
-                mapOf("database/rikka_hub.db" to upgraded)
-            } else {
-                emptyMap()
-            }
-            stagedDatabase["database/rikka_hub.db"]?.let {
-                validateStagedDatabase(
-                    it,
-                    expectedVersion = AppDatabase.CURRENT_VERSION,
-                    expectedSnapshotsEmpty = true,
-                )
-            }
-
-            val databaseRestoreRequested = includeDatabase &&
-                stagedDatabase.containsKey("database/rikka_hub.db")
-            val databaseRecoveryRoot = File(context.filesDir, ".legacy-restore-recovery-${UUID.randomUUID()}")
-            val databaseRecoveryDirectory = File(context.filesDir, ".database-recovery-${UUID.randomUUID()}")
-            val legacyMoves = mutableListOf<MovedPath>()
-            var settingsApplied = false
-            var databaseCloseAttempted = false
-            var cleanupMarker: File? = null
-            var recoveryJournal: WorkspaceArchiveRecoveryJournal? = null
-            val replacementSettings = restoredSettings
-                ?.let { mergeLocalCredentials(currentSettings, it) }
-                ?: currentSettings
-            val fullRestoreAssistantIds = if (databaseRestoreRequested) {
-                (currentSettings.assistants + replacementSettings.assistants)
-                    .map { it.id.toString() }
-            } else {
-                emptyList()
-            }
-            return bindingCoordinator.quiesceForSettingsReplacementWhileLocked(
-                replacement = replacementSettings,
-                additionalAssistantIds = fullRestoreAssistantIds,
-            ) restore@{ _ ->
-                settingsStore.withAuthoritativeRestoreTransaction { gatedCurrentSettings ->
-                val gatedReplacementSettings = restoredSettings
-                    ?.let { mergeLocalCredentials(gatedCurrentSettings, it) }
-                    ?: gatedCurrentSettings
-                try {
-                // Validate and prepare all legacy folders/settings before Room is closed. Legacy
-                // archives have no workspace catalog, so only their historical folder strategy is
-                // applied here; database compatibility is enforced by the isolated Room upgrade above.
-                val stagedMainDatabase = stagedDatabase["database/rikka_hub.db"]
-                if (databaseRestoreRequested) {
-                    require(stagedMainDatabase != null) {
-                        "Requested database restore has no staged main database"
-                    }
-                    validateStagedDatabase(
-                        file = stagedMainDatabase,
-                        expectedVersion = AppDatabase.CURRENT_VERSION,
-                        expectedSnapshotsEmpty = true,
-                    )
-                }
-                require(databaseRecoveryRoot.mkdirs() || databaseRecoveryRoot.isDirectory) {
-                    "Unable to create legacy restore recovery directory"
-                }
-                if (databaseRestoreRequested) {
-                    require(databaseRecoveryDirectory.mkdirs() || databaseRecoveryDirectory.isDirectory) {
-                        "Unable to create database recovery directory"
-                    }
-                }
-                recoveryJournal = beginRecoveryJournal(
-                    currentSettings = gatedCurrentSettings,
-                    recoveryRoot = databaseRecoveryRoot,
-                    databaseRecoveryDirectory = databaseRecoveryDirectory.takeIf { databaseRestoreRequested },
-                    workspacesRoot = null,
-                    legacyStaging = legacyDirectory,
-                    includeFiles = includeFiles,
-                    cleanupArtifacts = listOf(
-                        staging,
-                        databaseRecoveryRoot,
-                    ) + listOfNotNull(
-                        databaseRecoveryDirectory.takeIf { databaseRestoreRequested },
-                        archiveCleanupFile,
-                    ),
-                )
-                if (includeFiles) {
-                    legacyMoves += replaceLegacyDirectories(legacyDirectory, databaseRecoveryRoot)
-                    recoveryJournal?.let { journal ->
-                        val updated = journal.copy(phase = WorkspaceArchiveRecoveryPhase.WORKSPACES_ACTIVATED)
-                        WorkspaceArchiveRecovery.writeJournal(
-                            WorkspaceArchiveRecovery.journalFile(context),
-                            updated,
-                        )
-                        recoveryJournal = updated
-                    }
-                }
-                restoredSettings?.let {
-                    recoveryJournal?.let { journal ->
-                        val applying = journal.copy(
-                            phase = WorkspaceArchiveRecoveryPhase.SETTINGS_APPLYING,
-                            settingsApplied = true,
-                            settingsNeedsCompensation = true,
-                        )
-                        WorkspaceArchiveRecovery.writeJournal(
-                            WorkspaceArchiveRecovery.journalFile(context),
-                            applying,
-                        )
-                        recoveryJournal = applying
-                    }
-                    settingsApplied = true
-                    this@withAuthoritativeRestoreTransaction.replace(gatedReplacementSettings)
-                    recoveryJournal?.let { journal ->
-                        val applied = journal.copy(phase = WorkspaceArchiveRecoveryPhase.SETTINGS_APPLIED)
-                        WorkspaceArchiveRecovery.writeJournal(
-                            WorkspaceArchiveRecovery.journalFile(context),
-                            applied,
-                        )
-                        recoveryJournal = applied
-                    }
-                }
-
-                if (databaseRestoreRequested) {
-                    cleanupMarker = WorkspaceArchiveCleanup.createMarker(
-                        context,
-                        listOf(staging, databaseRecoveryRoot, databaseRecoveryDirectory) +
-                            listOfNotNull(archiveCleanupFile),
-                    )
-                    val journal = recoveryJournal ?: error("Full restore recovery journal is missing")
-                    val closing = journal.copy(phase = WorkspaceArchiveRecoveryPhase.ROOM_CLOSE_PENDING)
-                    WorkspaceArchiveRecovery.writeJournal(
-                        WorkspaceArchiveRecovery.journalFile(context),
-                        closing,
-                    )
-                    recoveryJournal = closing
-                    databaseCloseAttempted = true
-                    closeDatabaseAndExitAfterSwap(
-                        staged = stagedDatabase,
-                        recovery = databaseRecoveryDirectory,
-                        journal = closing,
-                    )
-                }
-
-                val committedJournal = requireNotNull(recoveryJournal).copy(
-                    phase = WorkspaceArchiveRecoveryPhase.COMMITTED,
-                    commitState = WorkspaceArchiveCommitState.COMMITTED,
-                    settingsNeedsCompensation = false,
-                )
-                WorkspaceArchiveRecovery.writeJournal(
-                    WorkspaceArchiveRecovery.journalFile(context),
-                    committedJournal,
-                )
-                recoveryJournal = committedJournal
-                val warnings = legacyMoves.flatMap { it.commitBestEffort("legacy") }.toMutableList()
-                cleanupRecoveryRoot(databaseRecoveryRoot, warnings)
-                WorkspaceArchiveRecovery.finishCommitted(context)
-                val result = WorkspaceArchiveRestoreResult(
-                    portable = false,
-                    warnings = warnings.distinct(),
-                    restartRequired = false,
-                    databaseRestoreAttempted = false,
-                    databaseRestoreStatus = WorkspaceArchiveDatabaseRestoreStatus.NOT_REQUESTED,
-                )
-                restoreResult = result
-                return@withAuthoritativeRestoreTransaction result
-            } catch (error: Throwable) {
-                if (recoveryJournal?.commitState == WorkspaceArchiveCommitState.COMMITTED) {
-                    // The durable decision is authoritative. Startup will retry cleanup.
-                    throw error
-                }
-                if (databaseCloseAttempted) {
-                    WorkspaceArchiveRestart.scheduleAndExit(context)
-                }
-                val compensationFailures = mutableListOf<Throwable>()
-                withContext(NonCancellable) {
-                    suspend fun compensate(action: suspend () -> Unit) {
-                        try {
-                            action()
-                        } catch (rollbackError: Throwable) {
-                            compensationFailures += rollbackError
-                        }
-                    }
-                    if (settingsApplied) compensate {
-                        this@withAuthoritativeRestoreTransaction.replace(gatedCurrentSettings)
-                    }
-                    legacyMoves.asReversed().forEach { moved -> compensate { moved.rollback() } }
-                    cleanupMarker?.let { marker ->
-                        if (marker.exists()) compensate { WorkspaceArchiveCleanup.removeMarker(marker) }
-                    }
-                    if (cleanupMarker == null) {
-                        compensate { deleteDirectoryIfPresent(databaseRecoveryDirectory) }
-                    }
-                    if (
-                        recoveryJournal != null &&
-                        !databaseCloseAttempted &&
-                        compensationFailures.isEmpty() &&
-                        error.suppressed.isEmpty()
-                    ) {
-                        val rolledBack = recoveryJournal!!.copy(
-                            phase = WorkspaceArchiveRecoveryPhase.ROLLED_BACK,
-                            commitState = WorkspaceArchiveCommitState.ROLLED_BACK,
-                            settingsApplied = false,
-                            settingsNeedsCompensation = false,
-                        )
-                        compensate {
-                            WorkspaceArchiveRecovery.writeJournal(
-                                WorkspaceArchiveRecovery.journalFile(context),
-                                rolledBack,
-                            )
-                            recoveryJournal = rolledBack
-                            WorkspaceArchiveRecovery.finishRolledBack(context)
-                        }
-                    }
-                }
-                compensationFailures.forEach(error::addSuppressed)
-                throw error
-            }
-            }
-            }
-        } catch (error: Throwable) {
-            failure = error
-            throw error
-        } finally {
-            withContext(NonCancellable) {
-                cleanupRestoreStaging(staging, failure, restoreResult)
-            }
-        }
-    }
-
     private fun beginRecoveryJournal(
         currentSettings: Settings,
         recoveryRoot: File,
@@ -2877,7 +2173,7 @@ class WorkspaceArchiveService(
     }
 
     private fun sanitizeRuntimeMetadata(metadata: WorkspaceRuntimeMetadata): WorkspaceRuntimeMetadata =
-        metadata.copy(sourceUrl = redactWorkspaceUrl(metadata.sourceUrl))
+        WorkspaceRuntimeMetadata()
 
     private fun decodeArchiveSettings(raw: String): Settings {
         val migrated = SettingsJsonMigrator.migrate(raw)
@@ -2901,19 +2197,6 @@ class WorkspaceArchiveService(
         }
     }
 
-    private fun currentAbis(): List<String> = runCatching {
-        Build.SUPPORTED_ABIS.toList().filter { it.isNotBlank() }
-    }.getOrElse { supportedRootfsAbis() }
-
-    private fun canonicalAbi(value: String): String? = when (value.lowercase()) {
-        "arm64-v8a", "aarch64", "arm64" -> "arm64"
-        "armeabi-v7a", "arm", "armv7", "armv7l", "armhf" -> "arm"
-        "x86_64", "amd64", "x86-64" -> "x86_64"
-        "x86", "i386", "i686" -> "x86"
-        "riscv64" -> "riscv64"
-        else -> null
-    }
-
     private fun expectedPortableEntries(manifest: WorkspaceArchiveManifest): Set<String> = buildSet {
         add("manifest.json")
         add(WorkspaceArchiveManifest.SETTINGS_PATH)
@@ -2925,7 +2208,7 @@ class WorkspaceArchiveService(
     private fun WorkspaceArchiveManifest.workspacePayloadPaths(): Set<String> = buildSet {
         workspaces.forEach { workspace ->
             add(workspace.files.path)
-            workspace.linux?.let { add(it.path) }
+            workspace.home?.let { add(it.path) }
         }
     }
 
@@ -2933,7 +2216,7 @@ class WorkspaceArchiveService(
         workspaces.firstNotNullOfOrNull { workspace ->
             when {
                 workspace.files.path == path -> workspace.files
-                workspace.linux?.path == path -> workspace.linux
+                workspace.home?.path == path -> workspace.home
                 else -> null
             }
         } ?: error("Payload not declared in manifest: $path")
@@ -3580,18 +2863,12 @@ class WorkspaceArchiveService(
     }
 
     private fun PreparedWorkspace.toEntity(json: Json): WorkspaceEntity {
-        val linuxActive = linuxRoot != null
-        val warnings = if (linuxActive) {
-            manifest.runtimeMetadata.warnings
-        } else {
-            manifest.runtimeMetadata.warnings + "Linux rootfs was not activated during restore"
-        }
-        val metadata = manifest.runtimeMetadata.copy(warnings = warnings.distinct())
+        val metadata = manifest.runtimeMetadata
         return WorkspaceEntity(
             id = manifest.id,
             name = manifest.name,
             root = manifest.root,
-            shellStatus = if (linuxActive) manifest.shellStatus else WorkspaceShellStatus.DISABLED.name,
+            shellStatus = WorkspaceShellStatus.READY.name,
             createdAt = manifest.createdAt,
             updatedAt = manifest.updatedAt,
             lastAccessAt = manifest.lastAccessAt,
@@ -3668,8 +2945,7 @@ class WorkspaceArchiveService(
     private data class PreparedWorkspace(
         val manifest: WorkspaceArchiveWorkspace,
         val stagingRoot: File,
-        val linuxRoot: File?,
-        val externalHome: File?,
+        val homeRoot: File,
     )
 
     private data class MessageFtsSchemaObject(

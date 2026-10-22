@@ -30,9 +30,6 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         workspace.cpp
         codemode_quickjs.cpp)
 
-add_library(termux SHARED
-        termux_pty.cpp)
-
 # Specifies libraries CMake should link to your target library. You
 # can link libraries from various origins, such as libraries defined in this
 # build script, prebuilt third-party libraries, or Android system libraries.
@@ -41,6 +38,3 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
         android
         log
         dl)
-
-target_link_libraries(termux
-        log)

@@ -59,6 +59,15 @@ class RikkaHubApp : Application() {
         // 必须在 super.onCreate() 之前设置: Compose UI 可能在此之前被初始化.
         ComposeUiFlags.isBypassUnfocusableComposeViewEnabled = false
         super.onCreate()
+        // The disposable interpreter must not open Room or run restore/cleanup transactions.
+        val processName = if (android.os.Build.VERSION.SDK_INT >= 28) {
+            Application.getProcessName()
+        } else {
+            File("/proc/self/cmdline").inputStream().use { input ->
+                input.readBytes().toString(Charsets.UTF_8).substringBefore('\u0000')
+            }
+        }
+        if (processName == "$packageName:workspace_python") return
 
         // Recover the database and workspace root before Koin can open a half-restored Room
         // graph. A failure is intentionally allowed to escape and stop normal startup.
@@ -104,9 +113,7 @@ class RikkaHubApp : Application() {
         // Init QuickJS native library
         QuickJSLoader.init()
 
-        // Both of these must observe the filesystem before any temp cleanup runs: a shared install
-        // keeps its journal in the environment, and a private install keeps the previous rootfs in
-        // the workspace temp area that cleanupAllTempDirs() deletes.
+        // Migrate user data before any cleanup can remove legacy runtime directories.
         val workspaceRecoverySucceeded = recoverWorkspaceStateBeforeCleanup()
 
         // Restore closes Room and exits before it can remove large recovery/staging trees. The
@@ -122,7 +129,7 @@ class RikkaHubApp : Application() {
         // 清掉过期的运行日志（只留 24 小时）
         pruneExpiredChatLogs()
 
-        // cleanup workspace temp dirs (proot + rootfs /tmp)
+        // Clean runtime temporary files only after every workspace migrated.
         if (workspaceRecoverySucceeded) cleanupWorkspaceTempDirs()
 
         // sync upload files to DB
@@ -168,37 +175,15 @@ class RikkaHubApp : Application() {
         }
     }
 
-    /**
-     * Settles a journaled shared-rootfs exchange and repairs private rootfs swaps.
-     *
-     * Synchronous, and before any temp cleanup: `cleanupAllTempDirs()` deletes the temp area a
-     * private install keeps its previous rootfs in, so an integrity pass that ran later would find
-     * nothing to recover and would then delete the only good copy.
-     *
-     * It stays a direct call rather than a launch, so the two also cannot race each other.
-     */
+    /** Migrates workspace data synchronously before runtime cleanup and tool exposure. */
     private fun recoverWorkspaceStateBeforeCleanup(): Boolean =
         runBlocking(Dispatchers.IO) {
             val repository = get<WorkspaceRepository>()
-            val shared = runCatching {
-                repository.recoverSharedEnvironmentTransaction()
-            }.onFailure {
-                Log.e(TAG, "recoverSharedEnvironmentTransaction failed", it)
-            }
-            // A plan left in EXECUTING/UNKNOWN/RECOVERY_REQUIRED keeps the shared environment
-            // fail-closed: the apt process must not be assumed dead, so no session may start in it
-            // until the plan is resolved explicitly. An unreadable plan table fails closed too.
             runCatching {
-                repository.refreshSharedAptGate()
+                repository.migratePortableWorkspaces()
             }.onFailure {
-                Log.e(TAG, "refreshSharedAptGate failed", it)
-            }
-            val private = runCatching {
-                repository.checkIntegrity()
-            }.onFailure {
-                Log.e(TAG, "checkWorkspaceIntegrity failed", it)
-            }
-            shared.isSuccess && private.isSuccess
+                Log.e(TAG, "migratePortableWorkspaces failed", it)
+            }.getOrDefault(false)
         }
 
     private fun deleteTempFiles() {

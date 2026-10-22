@@ -26,19 +26,24 @@ fun createWorkspaceCodemodeTool(workspaceTools: List<Tool>): Tool {
     val allowed = workspaceTools.filter { it.name in allowedCodemodeTools }.associateBy { it.name }
     return Tool(
         name = "codemode",
-        description = "Run JavaScript to batch workspace operations and filter results. " +
-            "Prefer Codemode when a task needs multiple workspace operations, or when results must be filtered or " +
-            "processed into statistics before returning them. For a single simple workspace operation, call the " +
-            "corresponding workspace tool directly. Use await tools.workspace_read_file, " +
-            "workspace_write_file, workspace_edit_file or workspace_shell with their normal arguments. " +
-            "Calls execute serially, including Promise.all. Only text(value) output is returned to the model. " +
+        description = "Run JavaScript to orchestrate workspace tools in one call and return concise results. " +
+            "Use Codemode by default for multi-step file tasks, batch reads or edits, repeated shell commands, " +
+            "and workflows that filter, aggregate or calculate statistics from tool results. Keep intermediate " +
+            "results in JavaScript variables and emit only the needed findings with text(value). " +
+            "For one simple workspace operation, call its workspace tool directly. " +
+            "Call await tools.workspace_read_file(args), await tools.workspace_write_file(args), " +
+            "await tools.workspace_edit_file(args) or await tools.workspace_shell(args) with their normal arguments. " +
+            "Use JavaScript loops and conditionals to choose subsequent calls from earlier results. " +
+            "Calls execute serially, including Promise.all; it does not provide parallel execution. " +
+            "Only text(value) output is returned to the model. " +
             "No network, filesystem, timers, imports or host objects are available to JavaScript. " +
             "Text files only; image attachments are unsupported. Shell commands that finish without timing out return " +
             "their original JSON even for nonzero exit codes; check exitCode and stderr. Nonzero exits mark the " +
             "operation failed but allow further calls; batch success depends on JavaScript completing. " +
             "Timeouts, invalid shell results and tool exceptions stop execution; completed writes are not rolled back. " +
             "Limits: 32 KiB code, 64 calls, 64 KiB per argument/result, 32 KiB total output, 120 seconds. " +
-            "Example: const r = await tools.workspace_read_file({path:'/workspace/a.txt'}); text(r.text); " +
+            "Example: const rows = []; for (const path of ['/workspace/a.txt','/workspace/b.txt']) { " +
+            "const r = await tools.workspace_read_file({path}); rows.push({path, chars:r.text.length}); } text(rows); " +
             "Available tools: " + allowed.keys.joinToString(", "),
         parameters = {
             InputSchema.Obj(buildJsonObject {

@@ -1,7 +1,6 @@
 package me.rerere.rikkahub.data.workspace
 
 import android.content.Context
-import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -18,10 +17,6 @@ import me.rerere.rikkahub.utils.JsonInstant
 import me.rerere.workspace.WorkspaceEnvironmentStore
 import me.rerere.workspace.WorkspaceManager
 import me.rerere.workspace.WorkspaceShellStatus
-import me.rerere.workspace.detectRootfsArchitecture
-import me.rerere.workspace.hasUsableFullRootfs
-import me.rerere.workspace.isRootfsArchitectureCompatible
-import me.rerere.workspace.supportedRootfsAbis
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -38,7 +33,7 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
-/** Application-side soft limits. They never delete workspace files or Linux rootfs data. */
+/** Application-side soft limits. They never delete workspace files or HOME data. */
 data class WorkspaceSnapshotLimits(
     val maxPerWorkspace: Int = MAX_WORKSPACE_SNAPSHOTS_PER_WORKSPACE,
     val maxTotalBytes: Long = MAX_WORKSPACE_SNAPSHOT_TOTAL_BYTES,
@@ -163,15 +158,14 @@ class WorkspaceSnapshotService(
     private val snapshotDao: WorkspaceSnapshotDAO,
     private val limits: WorkspaceSnapshotLimits = WorkspaceSnapshotLimits(),
 ) {
-    private val environments by lazy {
-        WorkspaceEnvironmentStore(File(context.filesDir, "workspaces"))
+    private val runtimeManager by lazy {
+        me.rerere.workspace.WorkspaceManager(
+            File(context.filesDir, "workspaces"), portableRuntime = true,
+        )
     }
 
-    private fun effectiveLinux(root: String): File =
-        if (environments.isShared(root)) environments.sharedLinuxDir() else environments.privateLinuxDir(root)
+    private fun runtimePaths(root: String) = runtimeManager.runtimePaths(root)
 
-    private fun homeOverrides(root: String): Map<String, File> =
-        if (environments.hasExternalHome(root)) mapOf("root" to environments.homeDir(root)) else emptyMap()
     fun listFlow(workspaceId: String): Flow<List<WorkspaceSnapshotEntity>> =
         snapshotDao.listReadyFlow(workspaceId)
 
@@ -338,7 +332,7 @@ class WorkspaceSnapshotService(
             val snapshotCount = snapshotDao.countReady(workspaceId)
             WorkspaceStorageStats(
                 filesBytes = safeDirectorySize(workspaceDirectory(workspace).resolve("files")),
-                linuxBytes = projectedDirectorySize(effectiveLinux(workspace.root), homeOverrides(workspace.root)),
+                linuxBytes = safeDirectorySize(runtimePaths(workspace.root).homeDir),
                 snapshotsBytes = safeDirectorySize(snapshotDirectory()),
                 snapshotCount = snapshotCount,
                 maxSnapshotsPerWorkspace = limits.maxPerWorkspace,
@@ -363,20 +357,13 @@ class WorkspaceSnapshotService(
         val workspace = workspaceRepository.getById(workspaceId)
             ?: error("Workspace not found: $workspaceId")
         val sourceDirectory = validateWorkspaceSource(workspace)
-        // Snapshots walk the same rootfs the archive does, so heal a PRoot placeholder before
-        // anything reads the tree (fingerprints, size estimate, TAR walk).
-        val linuxSource = effectiveLinux(workspace.root)
-        val overrides = homeOverrides(workspace.root)
-        val repaired = repairProotRootfsPlaceholders(linuxSource)
-        if (repaired.isNotEmpty()) {
-            Log.i(TAG, "Repaired rootfs placeholders: ${repaired.joinToString(",")}")
-        }
+        val homeSource = runtimePaths(workspace.root).homeDir
         val currentCount = snapshotDao.countReady(workspaceId)
         val currentTotalBytes = snapshotDao.totalReadySize()
         val estimatedBytes = Math.addExact(
             Math.addExact(
                 safeDirectorySize(File(sourceDirectory, "files")),
-                projectedDirectorySize(linuxSource, overrides),
+                safeDirectorySize(homeSource),
             ),
             SNAPSHOT_OVERHEAD_BYTES,
         )
@@ -458,12 +445,10 @@ class WorkspaceSnapshotService(
                     budget.recordStagingBytes(bytes, snapshotRoot)
                 },
             )
-            val linuxTar = File(payloadDirectory, "linux.tar")
-            val linuxSummary = WorkspaceArchiveTar.create(
-                sourceRoot = linuxSource,
-                output = linuxTar,
-                directoryOverrides = overrides,
-                excludedPaths = setOf("tmp", "var/tmp"),
+            val homeTar = File(payloadDirectory, "home.tar")
+            val homeSummary = WorkspaceArchiveTar.create(
+                sourceRoot = homeSource,
+                output = homeTar,
                 limits = tarLimits,
                 onEntry = budget::recordTarEntry,
                 onFileBytes = budget::recordWorkspaceBytes,
@@ -478,17 +463,16 @@ class WorkspaceSnapshotService(
             }
             val manifest = WorkspaceSnapshotManifest(
                 createdAt = createdAt,
-                createdAbi = currentAbis(),
                 workspace = workspace.toSnapshotWorkspace(
                     files = WorkspaceArchivePayload(
                         path = "workspaces/${workspace.root}/files.tar",
                         length = filesSummary.length,
                         sha256 = filesSummary.sha256,
                     ),
-                    linux = WorkspaceArchivePayload(
-                        path = "workspaces/${workspace.root}/linux.tar",
-                        length = linuxSummary.length,
-                        sha256 = linuxSummary.sha256,
+                    home = WorkspaceArchivePayload(
+                        path = "workspaces/${workspace.root}/home.tar",
+                        length = homeSummary.length,
+                        sha256 = homeSummary.sha256,
                     ),
                 ),
             )
@@ -500,7 +484,7 @@ class WorkspaceSnapshotService(
                 manifestBytes = manifestBytes,
                 manifest = manifest,
                 filesTar = filesTar,
-                linuxTar = linuxTar,
+                homeTar = homeTar,
                 budget = budget,
                 snapshotRoot = snapshotRoot,
             )
@@ -611,7 +595,6 @@ class WorkspaceSnapshotService(
     ): WorkspaceSnapshotRestoreResult {
         val current = workspaceRepository.getById(workspaceId)
             ?: error("Workspace not found: $workspaceId")
-        validateWorkspaceSource(current)
         val selected = snapshotDao.getById(snapshotId)
             ?: error("Workspace snapshot not found: $snapshotId")
         require(selected.workspaceId == workspaceId) {
@@ -629,6 +612,7 @@ class WorkspaceSnapshotService(
             expectedEntityPath = selected.path,
         ).manifest
 
+        validateWorkspaceSource(current)
         // This is intentionally before any directory exchange. If soft limits reject it, the
         // restore is refused and the current workspace remains untouched.
         val preRestore = createSnapshotLocked(workspaceId, WorkspaceSnapshotReason.PRE_RESTORE)
@@ -827,6 +811,7 @@ class WorkspaceSnapshotService(
                 require(sha256(manifestBytes) == expectedManifestHash.lowercase(Locale.US)) {
                     "Workspace snapshot manifest hash mismatch"
                 }
+                requireWorkspaceManifestVersion(manifestBytes.toString(Charsets.UTF_8), json, WorkspaceSnapshotManifest.FORMAT)
                 val parsedManifest = json.decodeFromString<WorkspaceSnapshotManifest>(
                     manifestBytes.toString(Charsets.UTF_8),
                 ).also { snapshotManifest ->
@@ -842,7 +827,7 @@ class WorkspaceSnapshotService(
                 seen += WorkspaceSnapshotManifest.MANIFEST_PATH
                 val expected = setOf(
                     parsedManifest.workspace.files.path,
-                    requireNotNull(parsedManifest.workspace.linux).path,
+                    requireNotNull(parsedManifest.workspace.home).path,
                 )
                 while (true) {
                     val entry = zipIn.nextEntry ?: break
@@ -857,8 +842,8 @@ class WorkspaceSnapshotService(
                     val digest = copyEntryToFile(zipIn, target, MAX_PAYLOAD_BYTES)
                     val descriptor = when {
                         name == parsedManifest.workspace.files.path -> parsedManifest.workspace.files
-                        name == requireNotNull(parsedManifest.workspace.linux).path ->
-                            requireNotNull(parsedManifest.workspace.linux)
+                        name == requireNotNull(parsedManifest.workspace.home).path ->
+                            requireNotNull(parsedManifest.workspace.home)
                         else -> error("Unknown workspace snapshot payload: $name")
                     }
                     require(digest.length == descriptor.length) { "Snapshot payload length mismatch: $name" }
@@ -874,24 +859,23 @@ class WorkspaceSnapshotService(
             }
             val validManifest = manifest ?: error("Workspace snapshot manifest is missing")
             val filesRoot = File(workspaceRoot, "files")
-            val linuxRoot = File(workspaceRoot, "linux")
+            val homeRoot = File(workspaceRoot, "home")
             val filesPayload = payloadFiles[validManifest.workspace.files.path]
                 ?: error("Workspace snapshot files payload is missing")
-            val linuxPayload = payloadFiles[requireNotNull(validManifest.workspace.linux).path]
-                ?: error("Workspace snapshot Linux payload is missing")
+            val homePayload = payloadFiles[requireNotNull(validManifest.workspace.home).path]
+                ?: error("Workspace snapshot HOME payload is missing")
             WorkspaceArchiveTar.extract(
                 input = filesPayload,
                 targetRoot = filesRoot,
                 limits = tarLimits(),
             )
             WorkspaceArchiveTar.extract(
-                input = linuxPayload,
-                targetRoot = linuxRoot,
+                input = homePayload,
+                targetRoot = homeRoot,
                 limits = tarLimits(),
             )
-            recreateLinuxTempDirectories(linuxRoot)
+            preparePortableWorkspace(workspaceRoot)
             validatePreparedWorkspaceRoot(workspaceRoot)
-            validateSnapshotAbi(validManifest, linuxRoot)
             // Move only the extracted workspace directory into the transaction. Its parent is the
             // private staging root so the caller can safely remove the payload copies afterwards.
             require(workspaceRoot.renameTo(targetStaging)) {
@@ -939,6 +923,7 @@ class WorkspaceSnapshotService(
                 require(sha256(manifestBytes) == expectedManifestHash.lowercase(Locale.US)) {
                     "Workspace snapshot manifest hash mismatch"
                 }
+                requireWorkspaceManifestVersion(manifestBytes.toString(Charsets.UTF_8), json, WorkspaceSnapshotManifest.FORMAT)
                 val parsedManifest = json.decodeFromString<WorkspaceSnapshotManifest>(
                     manifestBytes.toString(Charsets.UTF_8),
                 ).also {
@@ -954,7 +939,7 @@ class WorkspaceSnapshotService(
                 seen += WorkspaceSnapshotManifest.MANIFEST_PATH
                 val expected = setOf(
                     parsedManifest.workspace.files.path,
-                    requireNotNull(parsedManifest.workspace.linux).path,
+                    requireNotNull(parsedManifest.workspace.home).path,
                 )
                 while (true) {
                     val entry = zipIn.nextEntry ?: break
@@ -969,8 +954,8 @@ class WorkspaceSnapshotService(
                     val digest = copyEntryToFile(zipIn, target, MAX_PAYLOAD_BYTES)
                     val descriptor = when {
                         name == parsedManifest.workspace.files.path -> parsedManifest.workspace.files
-                        name == requireNotNull(parsedManifest.workspace.linux).path ->
-                            requireNotNull(parsedManifest.workspace.linux)
+                        name == requireNotNull(parsedManifest.workspace.home).path ->
+                            requireNotNull(parsedManifest.workspace.home)
                         else -> error("Unknown workspace snapshot payload: $name")
                     }
                     require(digest.length == descriptor.length) { "Snapshot payload length mismatch: $name" }
@@ -987,7 +972,7 @@ class WorkspaceSnapshotService(
             val validManifest = manifest ?: error("Workspace snapshot manifest is missing")
             val extractedRoot = File(verificationRoot, "extracted")
             val filesRoot = File(extractedRoot, "files")
-            val linuxRoot = File(extractedRoot, "linux")
+            val homeRoot = File(extractedRoot, "home")
             WorkspaceArchiveTar.extract(
                 input = payloadFiles[validManifest.workspace.files.path]
                     ?: error("Workspace snapshot files payload is missing"),
@@ -995,14 +980,13 @@ class WorkspaceSnapshotService(
                 limits = tarLimits(),
             )
             WorkspaceArchiveTar.extract(
-                input = payloadFiles[requireNotNull(validManifest.workspace.linux).path]
-                    ?: error("Workspace snapshot Linux payload is missing"),
-                targetRoot = linuxRoot,
+                input = payloadFiles[requireNotNull(validManifest.workspace.home).path]
+                    ?: error("Workspace snapshot HOME payload is missing"),
+                targetRoot = homeRoot,
                 limits = tarLimits(),
             )
-            recreateLinuxTempDirectories(linuxRoot)
+            preparePortableWorkspace(extractedRoot)
             validatePreparedWorkspaceRoot(extractedRoot)
-            validateSnapshotAbi(validManifest, linuxRoot)
             return SnapshotVerification(validManifest)
         } finally {
             deleteNoFollow(verificationRoot)
@@ -1014,7 +998,7 @@ class WorkspaceSnapshotService(
         manifestBytes: ByteArray,
         manifest: WorkspaceSnapshotManifest,
         filesTar: File,
-        linuxTar: File,
+        homeTar: File,
         budget: WorkspaceArchiveBudget,
         snapshotRoot: File,
     ) {
@@ -1037,8 +1021,8 @@ class WorkspaceSnapshotService(
                 )
                 writeZipPayload(
                     zipOut,
-                    requireNotNull(manifest.workspace.linux).path,
-                    linuxTar,
+                    requireNotNull(manifest.workspace.home).path,
+                    homeTar,
                     budget,
                 )
                 zipOut.finish()
@@ -1102,8 +1086,8 @@ class WorkspaceSnapshotService(
         require(File(root, "files").isDirectory && !Files.isSymbolicLink(File(root, "files").toPath())) {
             "Workspace files directory is missing: ${workspace.id}"
         }
-        require(!Files.isSymbolicLink(effectiveLinux(workspace.root).toPath())) {
-            "Workspace Linux directory is a symbolic link: ${workspace.id}"
+        require(!Files.isSymbolicLink(runtimePaths(workspace.root).homeDir.toPath())) {
+            "Workspace HOME directory is a symbolic link: ${workspace.id}"
         }
         runCatching { WorkspaceShellStatus.valueOf(workspace.shellStatus) }
             .getOrElse { error("Unknown workspace shell status: ${workspace.shellStatus}") }
@@ -1155,58 +1139,17 @@ class WorkspaceSnapshotService(
             }
             child.name
         }.toSet()
-        require(children == setOf("files", "linux")) {
+        require(children == setOf("files", "home", "tmp", "runtime")) {
             "Prepared workspace root contains unexpected entries"
         }
         require(File(root, "files").isDirectory) { "Prepared workspace files directory is missing" }
-        require(File(root, "linux").isDirectory) { "Prepared workspace Linux directory is missing" }
+        require(File(root, "home").isDirectory) { "Prepared workspace HOME directory is missing" }
     }
 
-    private fun recreateLinuxTempDirectories(linuxRoot: File) {
-        val tmp = File(linuxRoot, "tmp")
-        val varTmp = File(linuxRoot, "var/tmp")
-        require(tmp.mkdirs() || tmp.isDirectory) { "Unable to recreate Linux tmp" }
-        require(varTmp.mkdirs() || varTmp.isDirectory) { "Unable to recreate Linux var/tmp" }
-        WorkspaceArchiveTar.applyMode(tmp, 0x1c0)
-        WorkspaceArchiveTar.applyMode(varTmp, 0x1c0)
-    }
-
-    private fun validateSnapshotAbi(
-        manifest: WorkspaceSnapshotManifest,
-        linuxRoot: File,
-    ) {
-        val archiveAbis = manifest.createdAbi.mapNotNull(::canonicalAbi).toSet()
-        val deviceAbis = supportedRootfsAbis().mapNotNull(::canonicalAbi).toSet()
-        require(
-            archiveAbis.isEmpty() || deviceAbis.isEmpty() || archiveAbis.intersect(deviceAbis).isNotEmpty()
-        ) {
-            "Workspace snapshot ABI is incompatible with this device"
-        }
-        val expected = manifest.workspace.runtimeMetadata.expectedArchitecture
-            ?: manifest.workspace.runtimeMetadata.detectedArchitecture
-            ?: manifest.createdAbi.firstOrNull()?.let(::canonicalAbi)
-        val detected = detectRootfsArchitecture(linuxRoot)
-        require(isRootfsArchitectureCompatible(expected, detected, supportedRootfsAbis())) {
-            "Workspace snapshot Linux architecture is incompatible"
-        }
-        if (manifest.workspace.shellStatus == WorkspaceShellStatus.READY.name) {
-            require(linuxRoot.hasUsableFullRootfs()) {
-                "Workspace snapshot marked READY but Linux rootfs is incomplete"
-            }
-        }
-    }
-
-    private fun currentAbis(): List<String> = runCatching {
-        Build.SUPPORTED_ABIS.toList().filter { it.isNotBlank() }
-    }.getOrElse { supportedRootfsAbis() }
-
-    private fun canonicalAbi(value: String): String? = when (value.lowercase(Locale.US)) {
-        "arm64-v8a", "aarch64", "arm64" -> "arm64"
-        "armeabi-v7a", "arm", "armv7", "armv7l", "armhf" -> "arm"
-        "x86_64", "amd64", "x86-64" -> "x86_64"
-        "x86", "i386", "i686" -> "x86"
-        "riscv64" -> "riscv64"
-        else -> null
+    private fun preparePortableWorkspace(root: File) {
+        me.rerere.workspace.WorkspaceManager(
+            requireNotNull(root.parentFile), portableRuntime = true,
+        ).runtimePaths(root.name)
     }
 
     private fun tarLimits() = WorkspaceArchiveTar.Limits(
@@ -1218,7 +1161,7 @@ class WorkspaceSnapshotService(
     private fun fingerprintWorkspaceSource(root: File): WorkspaceSourceFingerprint =
         WorkspaceSourceFingerprint(
             entries = fingerprintTree(File(root, "files"), "files") +
-                fingerprintTree(effectiveLinux(root.name), "linux", homeOverrides(root.name)),
+                fingerprintTree(runtimePaths(root.name).homeDir, "home"),
         )
 
     private fun fingerprintTree(root: File, label: String, overrides: Map<String, File> = emptyMap()): List<WorkspaceSourceFingerprintEntry> {
@@ -1403,18 +1346,18 @@ class WorkspaceSnapshotService(
 
     private fun WorkspaceEntity.toSnapshotWorkspace(
         files: WorkspaceArchivePayload,
-        linux: WorkspaceArchivePayload,
+        home: WorkspaceArchivePayload,
     ) = WorkspaceArchiveWorkspace(
         id = id,
         name = name,
         root = root,
-        shellStatus = shellStatus,
+        shellStatus = WorkspaceShellStatus.READY.name,
         createdAt = createdAt,
         updatedAt = updatedAt,
         lastAccessAt = lastAccessAt,
-        runtimeMetadata = runtimeMetadataOrDefault(),
+        runtimeMetadata = me.rerere.rikkahub.data.model.WorkspaceRuntimeMetadata(),
         files = files,
-        linux = linux,
+        home = home,
         toolApprovals = toolApprovals,
     )
 
@@ -1422,7 +1365,7 @@ class WorkspaceSnapshotService(
         id = id,
         name = name,
         root = root,
-        shellStatus = shellStatus,
+        shellStatus = WorkspaceShellStatus.READY.name,
         createdAt = createdAt,
         updatedAt = updatedAt,
         lastAccessAt = lastAccessAt,

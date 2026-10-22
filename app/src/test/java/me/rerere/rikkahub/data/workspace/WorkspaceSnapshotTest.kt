@@ -19,28 +19,27 @@ class WorkspaceSnapshotTest {
     val temporaryFolder = TemporaryFolder()
 
     @Test
-    fun `single workspace snapshot round trips only metadata files and linux payloads`() {
+    fun `single workspace snapshot round trips only metadata files and home payloads`() {
         val source = temporaryFolder.newFolder("source")
         val files = File(source, "files").apply { mkdirs() }
-        val linux = File(source, "linux").apply { mkdirs() }
+        val home = File(source, "home").apply { mkdirs() }
         File(files, "state.txt").writeText("before")
-        File(linux, "tool").writeText("tool")
+        File(home, "tool").writeText("tool")
         val filesTar = temporaryFolder.newFile("files.tar")
-        val linuxTar = temporaryFolder.newFile("linux.tar")
+        val homeTar = temporaryFolder.newFile("home.tar")
         val filesSummary = WorkspaceArchiveTar.create(files, filesTar)
-        val linuxSummary = WorkspaceArchiveTar.create(linux, linuxTar)
+        val homeSummary = WorkspaceArchiveTar.create(home, homeTar)
         val manifest = WorkspaceSnapshotManifest(
             createdAt = 1,
-            createdAbi = listOf("arm64-v8a"),
             workspace = WorkspaceArchiveWorkspace(
                 id = "workspace-id",
                 name = "One workspace",
                 root = "workspace-root",
                 files = filesPayload(filesSummary),
-                linux = WorkspaceArchivePayload(
-                    path = "workspaces/workspace-root/linux.tar",
-                    length = linuxSummary.length,
-                    sha256 = linuxSummary.sha256,
+                home = WorkspaceArchivePayload(
+                    path = "workspaces/workspace-root/home.tar",
+                    length = homeSummary.length,
+                    sha256 = homeSummary.sha256,
                 ),
                 toolApprovals = "{}",
             ),
@@ -55,8 +54,8 @@ class WorkspaceSnapshotTest {
             zip.putNextEntry(ZipEntry(manifest.workspace.files.path))
             zip.write(filesTar.readBytes())
             zip.closeEntry()
-            zip.putNextEntry(ZipEntry(requireNotNull(manifest.workspace.linux).path))
-            zip.write(linuxTar.readBytes())
+            zip.putNextEntry(ZipEntry(requireNotNull(manifest.workspace.home).path))
+            zip.write(homeTar.readBytes())
             zip.closeEntry()
         }
 
@@ -71,7 +70,7 @@ class WorkspaceSnapshotTest {
             setOf(
                 WorkspaceSnapshotManifest.MANIFEST_PATH,
                 "workspaces/workspace-root/files.tar",
-                "workspaces/workspace-root/linux.tar",
+                "workspaces/workspace-root/home.tar",
             ),
             entries.toSet(),
         )
@@ -79,9 +78,9 @@ class WorkspaceSnapshotTest {
 
         val restored = temporaryFolder.newFolder("restored")
         WorkspaceArchiveTar.extract(filesTar, File(restored, "files"))
-        WorkspaceArchiveTar.extract(linuxTar, File(restored, "linux"))
+        WorkspaceArchiveTar.extract(homeTar, File(restored, "home"))
         assertEquals("before", File(restored, "files/state.txt").readText())
-        assertEquals("tool", File(restored, "linux/tool").readText())
+        assertEquals("tool", File(restored, "home/tool").readText())
     }
 
     @Test
@@ -168,7 +167,7 @@ class WorkspaceSnapshotTest {
             parentFile!!.mkdirs()
             writeText("old")
         }
-        File(target, "linux/rootfs.txt").apply {
+        File(target, "home/rootfs.txt").apply {
             parentFile!!.mkdirs()
             writeText("old-rootfs")
         }
@@ -177,7 +176,7 @@ class WorkspaceSnapshotTest {
             parentFile!!.mkdirs()
             writeText("new")
         }
-        File(staging, "linux/rootfs.txt").apply {
+        File(staging, "home/rootfs.txt").apply {
             parentFile!!.mkdirs()
             writeText("new-rootfs")
         }
@@ -193,7 +192,7 @@ class WorkspaceSnapshotTest {
         }
 
         assertEquals("old", File(target, "files/state.txt").readText())
-        assertEquals("old-rootfs", File(target, "linux/rootfs.txt").readText())
+        assertEquals("old-rootfs", File(target, "home/rootfs.txt").readText())
         assertFalse(recovery.exists())
     }
 

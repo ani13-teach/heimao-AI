@@ -43,7 +43,7 @@
 | --- | --- |
 | `app` | Compose UI、ViewModel、生成服务、工具编排、Repository 与持久化 |
 | `ai` | 模型供应商协议、消息抽象、流式响应与工具调用 |
-| `workspace` | 工作区文件、PRoot、Shell、共享/私有 Linux 与 native 实现 |
+| `workspace` | 工作区文件、独立 HOME、Kotlin 有限命令、便携迁移与 native 实现 |
 | `search` | 多供应商搜索接口 |
 | `document` | PDF、DOCX、PPTX、EPUB 等附件解析 |
 | `common` | 通用工具与扩展 |
@@ -82,24 +82,25 @@
 - 总结来源必须属于来源助手；保留可见分支选择、取消、分块和上下文缓存语义。
 - Room 结构变更同步实体、数据库版本、迁移实现与注册、`project/app/schemas/`、备份恢复 schema gate 和迁移测试。不得靠删除数据库或工作区解决兼容问题。
 
-### 应用内 Linux 工作区
+### 应用内便携工作区
 
 - AI 文件工具只接受 `/workspace` 及其子路径，保留路径规范化、越界与符号链接检查，以及助手/会话归属校验。这里的 `/workspace` 是应用运行时路径，不是本地源码目录。
-- 共享 Linux 的 AI Shell 使用 `WORKSPACE_ONLY`，私有 Linux 使用 `WORKSPACE_PACKAGE`，人工终端使用 `FULL_ROOTFS`；修改时覆盖三种模式，不统一退回旧的文件区模型。
-- PRoot 不是内核级恶意代码沙箱，不以界面说明或用户审批替代实际访问控制。
-- 公共 apt 保持“模拟计划 → 计划 ID/指纹 → 明确审批 → 排他执行”的链路；不借普通 Shell 绕过，不强杀任务或删除目录来解除占用。
+- 应用 DI 默认 `portableRuntime=true`，`KotlinWorkspaceShellRunner` 仅支持有限命令、管道、重定向、`&&` 与本地 Python，不是完整 Bash/apt。默认 UI 无 Linux 安装/环境切换/apt，终端为命令输入、执行与取消。
+- Python 通过同 UID、非导出的 `:workspace_python` 工作进程运行，每次执行后终止并确认退出。路径映射不是安全隔离，不承诺阻止 Python 访问应用数据或联网；AI 文件工具边界不变。
+- 独立 HOME 迁移先校验并 fsync 文件、目录及 marker，再删除旧 linux；失败保留源，全部工作区成功后才删 shared-linux，不靠删目录绕过错误。
+- PRoot 与 termux native 库已从打包排除，QuickJS/libworkspace 保留；旧 Linux/apt 源码不代表默认运行能力。
 
 ### 凭据与用户数据
 
 - `local.properties`、私有 `google-services.json`、签名文件、口令、API Key、MCP token、真实数据库与敏感备份不进 Git，不复制进公开交付物或日志。
-- 当前新备份为可能含凭据的明文 ZIP；旧格式解密支持不代表新导出自动加密，SHA-256 不代表保密或来源认证。
+- 当前备份/快照 v2 使用 `files.tar` + `home.tar`，无 Linux 或源设备 ABI 依赖，拒绝 v1、旧加密包和无 manifest 归档。新备份仍为可能含凭据的明文 ZIP，SHA-256 不代表保密或来源认证。
 - 测试使用隔离 Debug 包与测试数据；不得覆盖正式应用数据或为验证覆盖安装而擅自卸载正式应用。
 
 ## 6. 构建与验证
 
 先在总目录使用 PowerShell 执行 `./tools/check-environment.ps1`。脚本与 `environment/local.properties.template` 含旧机器的路径候选值，应核对本机环境，不直接照搬。维护指南推荐本机 JDK 21；应用 JVM target 为 17，两者不同。
 
-构建要求以这些文件为准：`project/gradle/wrapper/gradle-wrapper.properties`、`project/gradle/libs.versions.toml`、`project/app/build.gradle.kts`、`project/workspace/build.gradle.kts`。使用仓库 Gradle Wrapper，不用全局 Gradle 替代；不要因依赖下载失败擅自更换仓库来源。
+构建要求以这些文件为准：`project/gradle/wrapper/gradle-wrapper.properties`、`project/gradle/libs.versions.toml`、`project/app/build.gradle.kts`、`project/workspace/build.gradle.kts`。Chaquopy 17.1.0 / Python 3.13 要求构建机 `python` 同主次版本；固定 numpy 1.26.2、pandas 2.1.3、matplotlib 3.8.4、openpyxl 3.1.5。使用仓库 Gradle Wrapper，不用全局 Gradle 替代；不要因依赖下载失败擅自更换仓库来源。
 
 以下命令均从 `project/` 执行，按修改范围选择，不要求每次全部运行。Git Bash/Linux 使用 `./gradlew`；PowerShell 改用 `.\gradlew.bat`。
 
@@ -114,7 +115,7 @@ git diff --check
 
 - 完整 APK 构建需要维护者提供正确的 `project/app/google-services.json`；禁止生成随机私有配置来掩盖缺失。
 - `-x :app:processDebugGoogleServices` 仅用于相关测试/编译任务，不作为完整 APK 或运行时 Firebase 配置方案。
-- 安装包默认构建并交付使用正式签名的 Release 版，输出位于 `project/app/build/outputs/apk/release/`，包名为 `me.rerere.rikkahub`。
+- 仅开发或模拟器验证不自动构建/发布 Release；用户要求交付安装包时默认使用正式签名的 Release 版，输出位于 `project/app/build/outputs/apk/release/`，包名为 `me.rerere.rikkahub`。
 - Debug 构建仅用于开发验证，默认不发布、不交付 Debug 安装包；仅在用户明确要求时交付。
 - 设备测试入口为 `:app:connectedDebugAndroidTest`、`:workspace:connectedDebugAndroidTest`；只对已授权的测试设备/模拟器执行，事先确认目标设备。
 - 工作区权限、数据库迁移、备份恢复和流式协议变更，分别检查对应模块的 `src/test/`、`src/androidTest/` 与协议测试夹具；详细测试地图见维护指南。
