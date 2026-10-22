@@ -456,7 +456,8 @@ class ProotShellRunner(
             "/system/lib64" to "/system/lib64",
             "/apex/com.android.runtime/lib" to "/apex/com.android.runtime/lib",
             "/apex/com.android.runtime/lib64" to "/apex/com.android.runtime/lib64",
-            "/linkerconfig" to "/linkerconfig",
+            // Android may deny access to the directory while allowing the generated file.
+            "/linkerconfig/ld.config.txt" to "/linkerconfig/ld.config.txt",
         )
         private val AI_TOYBOX_COMMANDS = listOf(
             "base64",

@@ -221,7 +221,7 @@ class WorkspaceArchiveSecurityTest {
         )
         val oldVersion = WorkspaceArchiveManifest(
             createdAt = 1,
-            databaseVersion = AppDatabase.CURRENT_VERSION - 1,
+            databaseVersion = 30,
             workspaces = listOf(WorkspaceArchiveWorkspace("id", "one", "id", files = payload)),
         )
         assertTrue(runCatching { oldVersion.validate() }.isFailure)

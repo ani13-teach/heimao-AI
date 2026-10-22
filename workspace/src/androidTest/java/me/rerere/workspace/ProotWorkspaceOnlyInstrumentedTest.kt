@@ -42,6 +42,7 @@ class ProotWorkspaceOnlyInstrumentedTest {
             }
         }
         File(filesDir, "input.txt").writeText("workspace-data")
+        val linkerConfigReadable = File("/linkerconfig/ld.config.txt").canRead()
 
         try {
             val result = ProotShellRunner(File(context.applicationInfo.nativeLibraryDir)).execute(
@@ -67,6 +68,7 @@ class ProotWorkspaceOnlyInstrumentedTest {
                         [ ! -e /skills/$sharedMarker ] || exit 102
                         [ ! -e /upload/$sharedMarker ] || exit 103
                         [ ! -e /tool_outputs/$sharedMarker ] || exit 104
+                        ${if (linkerConfigReadable) "cat /linkerconfig/ld.config.txt > /dev/null || exit 105" else ":"}
                     """.trimIndent(),
                     cwd = "",
                     filesDir = filesDir,
@@ -83,6 +85,10 @@ class ProotWorkspaceOnlyInstrumentedTest {
 
             assertEquals(result.stderr, 0, result.exitCode)
             assertFalse(result.timedOut)
+            if (linkerConfigReadable) {
+                assertFalse(result.stderr, result.stderr.contains("failed to find generated linker configuration"))
+            }
+            assertFalse(result.stderr, result.stderr.contains("can\'t sanitize binding \"/linkerconfig\""))
             assertTrue(
                 "Expected direct and xargs workspace output; stdout=${result.stdout}; stderr=${result.stderr}",
                 result.stdout.contains("workspace-data\n--xargs--\nworkspace-data"),

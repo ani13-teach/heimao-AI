@@ -1,6 +1,5 @@
 package me.rerere.rikkahub.data.repository
 
-import android.database.sqlite.SQLiteBlobTooBigException
 import androidx.paging.Pager
 import androidx.paging.PagingConfig
 import androidx.paging.PagingData
@@ -22,6 +21,7 @@ import me.rerere.rikkahub.data.db.entity.ConversationEntity
 import me.rerere.rikkahub.data.db.entity.MessageNodeEntity
 import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.model.Conversation
+import me.rerere.rikkahub.data.model.ContextBlock
 import me.rerere.rikkahub.data.model.MessageNode
 import me.rerere.rikkahub.utils.JsonInstant
 import java.time.Instant
@@ -36,6 +36,16 @@ internal fun mergeConversationForRegularUpdate(
     conversationNumber = existing.conversationNumber,
     workspaceCwd = existing.workspaceCwd.ifEmpty { null },
 )
+
+/** Shared by checkpoints and their NonCancellable compensation within one generation. */
+internal class GenerationConversationCommitState(initiallyPersisted: Boolean) {
+    var requiresExisting: Boolean = initiallyPersisted
+        private set
+
+    fun recordPersisted() {
+        requiresExisting = true
+    }
+}
 
 class ConversationRepository(
     private val conversationDAO: ConversationDAO,
@@ -414,11 +424,8 @@ class ConversationRepository(
     suspend fun updateConversation(conversation: Conversation): Conversation {
         val persistedConversation = database.withTransaction {
             val existing = conversationDAO.getConversationById(conversation.id.toString())
-            val numberedConversation = if (existing != null) {
-                mergeConversationForRegularUpdate(conversation, existing)
-            } else {
-                assignConversationNumber(conversation.copy(workspaceCwd = null))
-            }
+                ?: error("Conversation no longer exists")
+            val numberedConversation = mergeConversationForRegularUpdate(conversation, existing)
             conversationDAO.update(
                 conversationToConversationEntity(numberedConversation)
             )
@@ -429,6 +436,45 @@ class ConversationRepository(
         }
         messageFtsManager.indexConversation(persistedConversation)
         return persistedConversation
+    }
+
+    /** Existence, owner, originals and immutable blocks are checked/written in one transaction. */
+    internal suspend fun commitGenerationConversation(
+        conversation: Conversation,
+        commitState: GenerationConversationCommitState,
+        contextBlocks: List<ContextBlock> = emptyList(),
+    ): Conversation {
+        val persisted = database.withTransaction {
+            val existing = conversationDAO.getConversationById(conversation.id.toString())
+            check(existing != null || (!commitState.requiresExisting &&
+                conversation.newConversation && conversation.conversationNumber == 0L)) {
+                "Generation conversation no longer exists"
+            }
+            check(existing == null || existing.assistantId == conversation.assistantId.toString()) {
+                "Generation conversation owner changed"
+            }
+            val value = if (existing == null) {
+                assignConversationNumber(conversation.copy(workspaceCwd = null))
+            } else mergeConversationForRegularUpdate(conversation, existing)
+            if (existing == null) conversationDAO.insert(conversationToConversationEntity(value))
+            else conversationDAO.update(conversationToConversationEntity(value))
+            messageNodeDAO.deleteByConversation(value.id.toString())
+            saveMessageNodes(value.id.toString(), value.messageNodes)
+            require(contextBlocks.all { it.conversationId == value.id && it.assistantId == value.assistantId }) {
+                "Context block does not belong to generation conversation"
+            }
+            val blocks = ContextBlockRepository(database)
+            val stored = blocks.getBlocks(value.id).associateBy { it.id }
+            check(contextBlocks.all { block -> stored[block.id]?.let { it == block } ?: true }) {
+                "Stored context block differs from request"
+            }
+            blocks.insertBlocks(contextBlocks.filterNot { it.id in stored })
+            value
+        }
+        // Record before indexing: even an indexing failure must never grant another first insert.
+        commitState.recordPersisted()
+        messageFtsManager.indexConversation(persisted)
+        return persisted
     }
 
     private suspend fun assignConversationNumber(conversation: Conversation): Conversation {
@@ -648,17 +694,7 @@ class ConversationRepository(
             var offset = 0
             val pageSize = 64
             while (true) {
-                val page = try {
-                    messageNodeDAO.getNodesOfConversationPaged(conversationId, pageSize, offset)
-                } catch (e: SQLiteBlobTooBigException) {
-                    e.printStackTrace()
-                    offset += pageSize
-                    continue
-                } catch (e: IllegalStateException) {
-                    e.printStackTrace()
-                    offset += pageSize
-                    continue
-                }
+                val page = messageNodeDAO.getNodesOfConversationPaged(conversationId, pageSize, offset)
                 if (page.isEmpty()) break
                 page.forEach { entity ->
                     val messages = JsonInstant.decodeFromString<List<UIMessage>>(entity.messages)

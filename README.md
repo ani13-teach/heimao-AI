@@ -21,7 +21,7 @@ An independently maintained Android fork of [RikkaHub](https://github.com/rikkah
 
 Removed features include the local Web server/Web UI, ASR/TTS, quick messages, SillyTavern character-card import, Lorebook, and old update/sponsor/about entries. In-app WebView previews and ordinary file imports/exports remain available.
 
-Automatic context compression summarizes older history before requests without deleting chat records. The trigger and target lengths are configured in model settings; defaults are 100,000 and 10,000 estimated tokens. Set the trigger to 0 to disable it.
+Automatic context compression summarizes older completed user turns into separate, persistent blocks without deleting chat records or rewriting existing summaries. The current turn and the most recent completed turn stay in full. The trigger and target lengths are configured in model settings; defaults are 100,000 and 10,000 estimated tokens. Set the trigger to 0 to stop creating new blocks; existing blocks still apply. Models with tool support can search summaries or saved originals using `context_search` and read individual blocks in pages using `context_read`. These tools stay within the current conversation and selected branch; reading originals does not undo compression. Binary attachments and hidden reasoning are excluded. Context blocks are included in database backups; editing sources, switching branches, or moving a conversation to another assistant invalidates affected blocks.
 
 ## Download and setup
 

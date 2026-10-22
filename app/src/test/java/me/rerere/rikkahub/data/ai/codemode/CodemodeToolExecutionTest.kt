@@ -8,6 +8,7 @@ import me.rerere.ai.core.Tool
 import me.rerere.ai.ui.CodemodeExecution
 import me.rerere.ai.ui.CodemodeStatus
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.rikkahub.data.ai.CodemodeCheckpointException
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -47,19 +48,95 @@ class CodemodeToolExecutionTest {
     }
 
     @Test
-    fun `failed shell retains result and stops all following calls`() = runBlocking {
-        var calls = 0
-        val t = tool(name = "workspace_shell") {
-            calls++
-            listOf(UIMessagePart.Text("{\"exitCode\":2,\"stdout\":\"\",\"stderr\":\"bad\",\"timedOut\":false}"))
+    fun `shell exit codes return original results and allow following calls with accurate trace`() = runBlocking {
+        for (exitCode in listOf(0, 1, 2, 127, 130)) {
+            val result = buildJsonObject {
+                put("exitCode", exitCode); put("stdout", "out"); put("stderr", "err"); put("timedOut", false)
+                put("extra", "preserved")
+            }
+            val shell = tool(name = "workspace_shell") { listOf(UIMessagePart.Text(result.toString())) }
+            var reads = 0
+            val read = tool { reads++; listOf(UIMessagePart.Text("{\"text\":\"after\"}")) }
+            val trace = mutableListOf<CodemodeExecution>()
+            val execution = CodemodeToolExecution(mapOf(shell.name to shell, read.name to read), "parent", trace::add)
+            assertEquals(result, execution.invoke(shell.name, args))
+            val operation = trace.last().operations.single()
+            assertEquals(if (exitCode == 0) CodemodeStatus.SUCCEEDED else CodemodeStatus.FAILED, operation.status)
+            assertEquals(result, operation.result)
+            if (exitCode == 0) assertNull(operation.error)
+            else assertTrue(operation.error!!.contains("exitCode=$exitCode"))
+            assertEquals(buildJsonObject { put("text", "after") }, execution.invoke(read.name, args))
+            assertEquals(1, reads)
+            assertEquals(CodemodeStatus.SUCCEEDED, trace.last().operations.last().status)
         }
+    }
+
+    @Test
+    fun `timeouts and invalid shell results stop all following calls`() = runBlocking {
+        for (result in listOf(
+            "{\"exitCode\":0,\"timedOut\":true}",
+            "{\"exitCode\":127,\"timedOut\":true}",
+            "{}", "[]", "null",
+            "{\"timedOut\":false}", "{\"exitCode\":0}",
+            "{\"exitCode\":\"1\",\"timedOut\":false}",
+            "{\"exitCode\":1.5,\"timedOut\":false}",
+            "{\"exitCode\":true,\"timedOut\":false}",
+            "{\"exitCode\":2147483648,\"timedOut\":false}",
+            "{\"exitCode\":null,\"timedOut\":false}",
+            "{\"exitCode\":-1,\"timedOut\":false}",
+            "{\"exitCode\":0,\"timedOut\":\"false\"}",
+            "{\"exitCode\":0,\"timedOut\":0}",
+            "{\"exitCode\":0,\"timedOut\":null}",
+        )) {
+            val shell = tool(name = "workspace_shell") { listOf(UIMessagePart.Text(result)) }
+            var reads = 0
+            val read = tool { reads++; emptyList() }
+            val trace = mutableListOf<CodemodeExecution>()
+            val execution = CodemodeToolExecution(mapOf(shell.name to shell, read.name to read), "parent", trace::add)
+            assertTrue(result, runCatching { execution.invoke(shell.name, args) }.isFailure)
+            assertEquals(CodemodeStatus.FAILED, trace.last().operations.single().status)
+            assertEquals(Json.parseToJsonElement(result), trace.last().operations.single().result)
+            assertTrue(runCatching { execution.invoke(read.name, args) }.isFailure)
+            assertEquals(0, reads)
+            assertEquals(1, trace.last().operations.size)
+        }
+    }
+
+    @Test
+    fun `tool exceptions remain fatal and block following calls`() = runBlocking {
+        val failure = IllegalStateException("tool failed")
+        val shell = tool(name = "workspace_shell") { throw failure }
+        var reads = 0
+        val read = tool { reads++; emptyList() }
         val trace = mutableListOf<CodemodeExecution>()
-        val execution = CodemodeToolExecution(mapOf(t.name to t), "parent", trace::add)
-        assertTrue(runCatching { execution.invoke(t.name, args) }.isFailure)
+        val execution = CodemodeToolExecution(mapOf(shell.name to shell, read.name to read), "parent", trace::add)
+        val errors = listOf(
+            runCatching { execution.invoke(shell.name, args) }.exceptionOrNull(),
+            runCatching { execution.invoke(read.name, args) }.exceptionOrNull(),
+        )
+        errors.forEach { error ->
+            assertEquals(failure.javaClass, error?.javaClass)
+            assertEquals(failure.message, error?.message)
+            assertTrue(generateSequence(error) { it.cause }.any { it === failure })
+        }
+        assertEquals(0, reads)
         assertEquals(CodemodeStatus.FAILED, trace.last().operations.single().status)
-        assertEquals(2, trace.last().operations.single().result!!.jsonObject["exitCode"]!!.jsonPrimitive.int)
-        assertTrue(runCatching { execution.invoke(t.name, args) }.isFailure)
-        assertEquals(1, calls)
+        assertEquals("tool failed", trace.last().operations.single().error)
+    }
+
+    @Test
+    fun `nonzero completion checkpoint failure propagates without completing twice`() = runBlocking {
+        val shell = tool(name = "workspace_shell") {
+            listOf(UIMessagePart.Text("{\"exitCode\":1,\"timedOut\":false}"))
+        }
+        val failure = CodemodeCheckpointException(IllegalStateException("checkpoint failed"))
+        var checkpoints = 0
+        val execution = CodemodeToolExecution(mapOf(shell.name to shell), "parent") { trace ->
+            checkpoints++
+            if (trace.operations.last().status == CodemodeStatus.FAILED) throw failure
+        }
+        assertSame(failure, runCatching { execution.invoke(shell.name, args) }.exceptionOrNull())
+        assertEquals(2, checkpoints)
     }
 
     @Test

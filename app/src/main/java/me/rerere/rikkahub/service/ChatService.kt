@@ -5,11 +5,14 @@ import android.content.Context
 import android.util.Log
 import androidx.core.net.toUri
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -64,6 +67,8 @@ import me.rerere.rikkahub.data.ai.mcp.McpManager
 import me.rerere.rikkahub.data.ai.runWithModelFallback
 import me.rerere.rikkahub.data.ai.toRetryPolicy
 import me.rerere.rikkahub.data.ai.tools.createConversationTools
+import me.rerere.rikkahub.data.ai.tools.createContextTools
+import me.rerere.rikkahub.data.ai.activeContextBlocks
 import me.rerere.rikkahub.data.ai.tools.local.LocalTools
 import me.rerere.rikkahub.data.ai.tools.createSearchTools
 import me.rerere.rikkahub.data.ai.tools.createSkillTools
@@ -89,6 +94,9 @@ import me.rerere.rikkahub.data.datastore.getAssistantById
 import me.rerere.rikkahub.data.datastore.getCurrentAssistant
 import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.model.Conversation
+import me.rerere.rikkahub.data.model.ContextBlock
+import me.rerere.rikkahub.data.model.GenerationMessageSnapshot
+import me.rerere.rikkahub.data.model.commitGenerationMessages
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.memoryMode
 import me.rerere.rikkahub.data.model.AssistantAffectScope
@@ -96,6 +104,8 @@ import me.rerere.rikkahub.data.model.localFileUrls
 import me.rerere.rikkahub.data.model.replaceRegexes
 import me.rerere.rikkahub.data.model.toMessageNode
 import me.rerere.rikkahub.data.repository.ConversationRepository
+import me.rerere.rikkahub.data.repository.GenerationConversationCommitState
+import me.rerere.rikkahub.data.repository.ContextBlockRepository
 import me.rerere.rikkahub.data.repository.FolderRepository
 import me.rerere.rikkahub.data.repository.MemoryRepository
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
@@ -150,6 +160,15 @@ internal fun summaryContextMessage(summaryContext: String): UIMessage = UIMessag
  * 保证数量校验、来源加载与缓存检查基于同一列表，重复来源不会被重复拼接。
  */
 internal fun normalizeSummarySourceIds(ids: List<Uuid>): List<Uuid> = ids.distinct()
+
+/** Joining must happen before taking any lock used by generation checkpoints/compensation. */
+internal suspend fun cancelGenerationBeforeDelete(
+    pauseGeneration: () -> Job?,
+    delete: suspend () -> Unit,
+) {
+    pauseGeneration()?.join()
+    delete()
+}
 
 /**
  * Resolve the first in-memory state without allowing a persisted conversation to inherit
@@ -238,6 +257,7 @@ class ChatService(
     private val appEventBus: AppEventBus,
     private val settingsStore: SettingsStore,
     private val conversationRepo: ConversationRepository,
+    private val contextBlockRepo: ContextBlockRepository,
     private val memoryRepository: MemoryRepository,
     private val generationHandler: GenerationHandler,
     private val templateTransformer: TemplateTransformer,
@@ -261,6 +281,15 @@ class ChatService(
     // 统一会话管理
     private val sessions = ConcurrentHashMap<Uuid, ConversationSession>()
     private val conversationMoveLocks = ConcurrentHashMap<Uuid, Mutex>()
+    private val conversationMoveCoordinators = ConcurrentHashMap<Uuid, Mutex>()
+    private val deletedConversations = ConcurrentHashMap.newKeySet<Uuid>()
+    private val conversationDeletions = ConcurrentHashMap<Uuid, CompletableDeferred<Unit>>()
+
+    private fun requireConversationAvailable(conversationId: Uuid) {
+        if (conversationId in deletedConversations) {
+            throw CancellationException("Conversation was deleted")
+        }
+    }
     private val _sessionsVersion = MutableStateFlow(0L)
 
     // 错误状态
@@ -400,6 +429,7 @@ class ChatService(
                 ?: settingsStore.settingsFlowRaw.first().getCurrentAssistant().id
             workspaceAccessGate.withAssistantMutation(initialOwner.toString()) {
                 conversationMoveLocks.computeIfAbsent(conversationId) { Mutex() }.withLock {
+                    requireConversationAvailable(conversationId)
                     val persistedConversation = conversationRepo.getConversationById(conversationId)
                     check(persistedConversation == null || persistedConversation.assistantId == initialOwner) {
                         "Conversation owner changed while waiting to initialize"
@@ -439,9 +469,13 @@ class ChatService(
         keepAliveInBackground: Boolean = true,
         block: suspend () -> Unit,
     ): Job {
-        if (!keepAliveInBackground) return appScope.launch(start = CoroutineStart.LAZY) { block() }
+        if (!keepAliveInBackground) return appScope.launch(start = CoroutineStart.LAZY) {
+            requireConversationAvailable(conversationId)
+            block()
+        }
 
         return appScope.launch(start = CoroutineStart.LAZY) {
+            requireConversationAvailable(conversationId)
             val generationId = Uuid.random()
             val foregroundStarted = ChatGenerationForegroundService.acquire(
                 context = context,
@@ -518,7 +552,7 @@ class ChatService(
     }
 
     fun sendMessage(conversationId: Uuid, content: List<UIMessagePart>, answer: Boolean = true) {
-        if (content.isEmptyInputMessage()) return
+        if (content.isEmptyInputMessage() || conversationId in deletedConversations) return
 
         val session = getOrCreateSession(conversationId)
         synchronized(session) {
@@ -534,6 +568,7 @@ class ChatService(
      * 生成中、还有工具等审批、或会话处于临时禁生成窗口时都不动作。
      */
     private fun dispatchNextQueuedMessage(conversationId: Uuid) {
+        if (conversationId in deletedConversations) return
         val session = sessions[conversationId] ?: return
         synchronized(session) {
             if (session.getJob() != null || session.isGenerationPaused) return
@@ -979,7 +1014,12 @@ class ChatService(
         messageRange: ClosedRange<Int>? = null
     ) {
         val settings = settingsStore.settingsFlow.first()
+        requireConversationAvailable(conversationId)
         val initialConversation = getConversationFlow(conversationId).value
+        val generationCommitState = GenerationConversationCommitState(
+            initiallyPersisted = initialConversation.conversationNumber > 0 ||
+                !initialConversation.newConversation || conversationRepo.existsConversationById(conversationId),
+        )
         val assistant = settings.getAssistantById(initialConversation.assistantId)
             ?: error("Conversation assistant not found")
         val model = settings.findModelById(assistant.chatModelId ?: settings.chatModelId)
@@ -1002,7 +1042,7 @@ class ChatService(
             }
 
             // reset suggestions
-            updateConversation(conversationId, initialConversation.copy(chatSuggestions = emptyList()))
+            updateConversationState(conversationId) { it.copy(chatSuggestions = emptyList()) }
 
             // memory tool
             if (!model.abilities.contains(ModelAbility.TOOL)) {
@@ -1042,24 +1082,80 @@ class ChatService(
                 assistant.enableWorkspaceCodemode && workspaceTools.isNotEmpty() &&
                 WorkspaceCodemodeRuntime.isAvailable()
             ) createWorkspaceCodemodeTool(workspaceTools) else null
-            val persistCheckpoint: suspend (List<UIMessage>) -> Unit = { messages ->
-                val updatedConversation = getConversationFlow(conversationId).value
-                    .updateCurrentMessages(messages)
-                saveConversation(conversationId, updatedConversation)
+            check(conversation.assistantId == assistant.id) { "Conversation owner changed before generation" }
+            var request = GenerationMessageSnapshot.capture(conversation, messageRange)
+            var generatedMessageIds = emptySet<Uuid>()
+            val generationContext = currentCoroutineContext()
+            val publishMessages: suspend (List<UIMessage>, Boolean) -> Unit = { messages, persist ->
+                generationContext.ensureActive()
+                workspaceAccessGate.withAssistantMutation(assistant.id.toString()) {
+                    conversationMoveLocks.computeIfAbsent(conversationId) { Mutex() }.withLock {
+                        generationContext.ensureActive()
+                        requireConversationAvailable(conversationId)
+                        request = commitGenerationMessages(
+                            state = session.state,
+                            request = request,
+                            messages = messages,
+                            persist = if (persist) { updated ->
+                                requireConversationAvailable(conversationId)
+                                conversationRepo.commitGenerationConversation(updated, generationCommitState)
+                            } else null,
+                        )
+                        generatedMessageIds = messages.drop(request.input.size).map { it.id }.toSet()
+                    }
+                }
+            }
+            val persistCheckpoint: suspend (List<UIMessage>) -> Unit = { publishMessages(it, true) }
+            val currentBlocks = contextBlockRepo.getBlocks(conversationId)
+            val contextTools = if (ModelAbility.TOOL in model.abilities) createContextTools(
+                assistantId = assistant.id,
+                conversationId = conversationId,
+                loadConversation = {
+                    val persisted = conversationRepo.getConversationById(conversationId)
+                    val latest = sessions[conversationId]?.state?.value
+                    if (persisted?.assistantId != assistant.id || latest?.assistantId != assistant.id) null
+                    else latest
+                },
+                loadBlocks = { contextBlockRepo.getBlocks(conversationId) },
+            ) else emptyList()
+            val commitContextBlocks: suspend (List<UIMessage>, List<ContextBlock>) -> Unit = { originals, usedBlocks ->
+                generationContext.ensureActive()
+                workspaceAccessGate.withAssistantMutation(assistant.id.toString()) {
+                    conversationMoveLocks.computeIfAbsent(conversationId) { Mutex() }.withLock {
+                        generationContext.ensureActive()
+                        requireConversationAvailable(conversationId)
+                        check(request.matches(session.state.value)) { "Generation source changed before context commit" }
+                        val updated = request.applyTo(session.state.value, originals)
+                        check(activeContextBlocks(updated, originals, usedBlocks).map { it.id }.toSet() ==
+                            usedBlocks.map { it.id }.toSet()) { "Context block source changed before persistence" }
+                        // 原件与块原子落库；补偿只恢复原件，不重插已删除的会话。
+                        var blocksToCommit = usedBlocks
+                        request = commitGenerationMessages(
+                            state = session.state,
+                            request = request,
+                            messages = originals,
+                            persist = { value ->
+                                requireConversationAvailable(conversationId)
+                                conversationRepo.commitGenerationConversation(
+                                    value, generationCommitState, blocksToCommit,
+                                ).also { blocksToCommit = emptyList() }
+                            },
+                        )
+                        // 事务已提交而取消时可以留块，但不能继续请求或发布视图。
+                        generationContext.ensureActive()
+                        check(request.matches(session.state.value)) { "Generation source changed during context commit" }
+                    }
+                }
             }
 
             // start generating
+            currentCoroutineContext().ensureActive()
+            requireConversationAvailable(conversationId)
             generationHandler.generateText(
                 settings = settings,
                 model = model,
                 processingStatus = session.processingStatus,
-                messages = conversation.currentMessages.let {
-                    if (messageRange != null) {
-                        it.subList(messageRange.start, messageRange.endInclusive + 1)
-                    } else {
-                        it
-                    }
-                },
+                messages = request.input,
                 additionalContextMessages = summaryContext
                     .takeIf { it.isNotBlank() }
                     ?.let { listOf(summaryContextMessage(it)) }
@@ -1072,8 +1168,12 @@ class ChatService(
                 workspaceCwd = assistant.workspaceId?.let { conversation.workspaceCwd },
                 workspaceAssistantId = assistant.id.toString(),
                 workspaceConversationId = conversationId.toString(),
-                onContextCompressed = persistCheckpoint,
+                sourceConversation = conversation,
+                responseNodeIds = request.responseNodeIds,
+                currentBlocks = currentBlocks,
+                onContextBlocksCommitted = commitContextBlocks,
                 onToolCheckpoint = persistCheckpoint,
+                onMessagesUpdated = { publishMessages(it, false) },
                 inputTransformers = buildList {
                     addAll(inputTransformers)
                     add(templateTransformer)
@@ -1081,6 +1181,7 @@ class ChatService(
                 },
                 outputTransformers = outputTransformers,
                 tools = buildList {
+                    addAll(contextTools)
                     if (useExternalWebSearch) {
                         addAll(createSearchTools(settings))
                     }
@@ -1128,24 +1229,30 @@ class ChatService(
                             )
                         )
                     }
-                }.filter { it.name != "codemode" || it === workspaceCodemodeTool },
-            ).onCompletion {
-                // 可能被取消了，或者意外结束，兜底更新（仅非挂起操作，取消上下文中安全）。
-                // 终结事件不在这里发送：成功路径由 onSuccess 发送，失败/取消路径由 onFailure 发送，
-                // 保证每个路径恰好一次，且不会在已取消上下文中执行挂起 emit。
-                val updatedConversation = getConversationFlow(conversationId).value.copy(
-                    messageNodes = getConversationFlow(conversationId).value.messageNodes.map { node ->
-                        node.copy(messages = node.messages.map { it.finishReasoning() })
+                }.filter { it.name != "codemode" || it === workspaceCodemodeTool }
+                    .filter { tool ->
+                        tool.name !in setOf("context_search", "context_read") || contextTools.any { it === tool }
                     },
-                    updateAt = Instant.now()
-                )
-                updateConversation(conversationId, updatedConversation)
+            ).onCompletion {
+                // Only this request's selected messages may be finalized.
+                if (generationContext.isActive) {
+                    session.state.update { current ->
+                        if (!request.matches(current)) current else current.copy(
+                            messageNodes = current.messageNodes.map { node ->
+                                val selected = node.currentMessage
+                                node.copy(messages = node.messages.map { message ->
+                                    if (message.id == selected.id && message.id in generatedMessageIds
+                                    ) message.finishReasoning() else message
+                                })
+                            },
+                            updateAt = Instant.now(),
+                        )
+                    }
+                }
             }.collect { chunk ->
                 when (chunk) {
                     is GenerationChunk.Messages -> {
-                        val updatedConversation = getConversationFlow(conversationId).value
-                            .updateCurrentMessages(chunk.messages)
-                        updateConversation(conversationId, updatedConversation)
+                        // State is committed synchronously by onMessagesUpdated before flow buffering.
 
                         // 通知等边缘副作用由 ChatNotificationManager 消费；
                         // tryEmit 不挂起，事件丢失只影响单次通知更新，不能反压生成链
@@ -1173,7 +1280,7 @@ class ChatService(
             Logging.log(TAG, it.stackTraceToString())
         }.onSuccess {
             val finalConversation = getConversationFlow(conversationId).value
-            saveConversation(conversationId, finalConversation)
+            mutateConversation(conversationId, finalConversation.assistantId) { it }
 
             // 成功路径的唯一终结事件（带内容预览）；tryEmit 非挂起，不反压生成链。
             // 放在 saveConversation 之后：持久化失败时不发送“生成成功”通知，避免“通知成功但持久化失败”语义。
@@ -1496,52 +1603,125 @@ class ChatService(
         }
     }
 
-    suspend fun moveConversationToAssistant(conversationId: Uuid, targetAssistantId: Uuid) {
-        val initial = conversationRepo.getConversationById(conversationId)
-            ?: error("Conversation not found")
-        workspaceAccessGate.withAssistantMutations(
-            listOf(initial.assistantId.toString(), targetAssistantId.toString())
-        ) {
-            conversationMoveLocks.computeIfAbsent(conversationId) { Mutex() }.withLock {
-                // Re-read ownership after acquiring both lock classes. Every path uses the global
-                // assistant-gate -> conversation-lock order, so binding revocation cannot wait in
-                // a cycle with a generation save.
-                val current = conversationRepo.getConversationById(conversationId)
-                    ?: error("Conversation not found")
-                check(current.assistantId == initial.assistantId) {
-                    "Conversation owner changed outside the move coordinator"
-                }
-                settingsStore.readPersistedSettingsFailFast()
-                    .getAssistantById(targetAssistantId)
-                    ?: error("Target assistant not found")
-                if (current.assistantId == targetAssistantId) return@withLock
+    suspend fun deleteConversation(conversation: Conversation) {
+        val completion = CompletableDeferred<Unit>()
+        val previous = conversationDeletions.putIfAbsent(conversation.id, completion)
+        if (previous != null) {
+            previous.await()
+            return
+        }
+        // Navigation may cancel the caller after deletion was requested. Finish cancelling and
+        // deleting as one operation, while never holding either checkpoint lock during join.
+        withContext(NonCancellable) {
+            try {
+                deletedConversations.add(conversation.id)
+                val session = sessions[conversation.id]
+                session?.messageQueue?.pause()
+                cancelGenerationBeforeDelete(
+                    pauseGeneration = { session?.pauseGeneration() },
+                    delete = {
+                        val initial = conversationRepo.getConversationById(conversation.id) ?: conversation
+                        workspaceAccessGate.withAssistantMutation(initial.assistantId.toString()) {
+                            conversationMoveLocks.computeIfAbsent(conversation.id) { Mutex() }.withLock {
+                                val latest = conversationRepo.getConversationById(conversation.id)
+                                check(latest == null || latest.assistantId == initial.assistantId) {
+                                    "Conversation owner changed while waiting to delete"
+                                }
+                                conversationRepo.deleteConversation(latest ?: initial)
+                                session?.messageQueue?.state?.value?.messages.orEmpty().forEach { queued ->
+                                    session?.messageQueue?.remove(queued.id)
+                                    cleanupQueuedAttachments(queued)
+                                }
+                            }
+                        }
+                    },
+                )
+                completion.complete(Unit)
+            } catch (error: Throwable) {
+                completion.completeExceptionally(error)
+                conversationDeletions.remove(conversation.id, completion)
+                throw error
+            }
+        }
+    }
 
-                val session = sessions[conversationId]
-                val job = session?.pauseGeneration()
-                try {
-                    job?.join()
-                    val previousSessionState = session?.state?.value
-                    if (session != null) {
-                        session.state.value = session.state.value.copy(
-                            assistantId = targetAssistantId,
-                            folderId = null,
-                            workspaceCwd = null,
-                        )
-                    }
-                    try {
-                        conversationRepo.moveConversationToAssistant(conversationId, targetAssistantId)
-                        session?.let {
-                            val persisted = conversationRepo.getConversationById(conversationId)
-                                ?: error("Conversation not found after move")
-                            updateConversation(conversationId, persisted)
+    suspend fun deleteConversationsOfAssistant(assistantId: Uuid) = withContext(NonCancellable) {
+        val conversations = conversationRepo.getConversationsOfAssistant(assistantId).first()
+        // Stop the entire selected set before waiting for any one provider/checkpoint to unwind.
+        conversations.forEach { conversation ->
+            deletedConversations.add(conversation.id)
+            sessions[conversation.id]?.let { session ->
+                session.messageQueue.pause()
+                session.pauseGeneration()
+            }
+        }
+        conversations.forEach { deleteConversation(it) }
+    }
+
+    suspend fun restoreConversation(conversation: Conversation) {
+        conversationDeletions[conversation.id]?.await()
+        workspaceAccessGate.withAssistantMutation(conversation.assistantId.toString()) {
+            conversationMoveLocks.computeIfAbsent(conversation.id) { Mutex() }.withLock {
+                val saved = conversationRepo.insertConversation(conversation)
+                sessions[conversation.id]?.let { session ->
+                    session.state.value = saved
+                    session.resumeGeneration()
+                }
+                deletedConversations.remove(conversation.id)
+                conversationDeletions.remove(conversation.id)
+            }
+        }
+    }
+
+    suspend fun moveConversationToAssistant(conversationId: Uuid, targetAssistantId: Uuid) {
+        conversationMoveCoordinators.computeIfAbsent(conversationId) { Mutex() }.withLock {
+            requireConversationAvailable(conversationId)
+            val initial = conversationRepo.getConversationById(conversationId)
+                ?: error("Conversation not found")
+            if (initial.assistantId == targetAssistantId) return@withLock
+            val session = sessions[conversationId]
+            val job = session?.pauseGeneration()
+            try {
+                // Cancellation compensation may need the same gate and checkpoint lock.
+                job?.join()
+                workspaceAccessGate.withAssistantMutations(
+                    listOf(initial.assistantId.toString(), targetAssistantId.toString())
+                ) {
+                    conversationMoveLocks.computeIfAbsent(conversationId) { Mutex() }.withLock {
+                        requireConversationAvailable(conversationId)
+                        val current = conversationRepo.getConversationById(conversationId)
+                            ?: error("Conversation not found")
+                        check(current.assistantId == initial.assistantId) {
+                            "Conversation owner changed outside the move coordinator"
                         }
-                    } catch (error: Throwable) {
-                        if (session != null && previousSessionState != null) {
-                            session.state.value = previousSessionState
+                        settingsStore.readPersistedSettingsFailFast()
+                            .getAssistantById(targetAssistantId)
+                            ?: error("Target assistant not found")
+                        val previousSessionState = session?.state?.value
+                        if (session != null) {
+                            session.state.value = session.state.value.copy(
+                                assistantId = targetAssistantId,
+                                folderId = null,
+                                workspaceCwd = null,
+                            )
                         }
-                        throw error
+                        try {
+                            conversationRepo.moveConversationToAssistant(conversationId, targetAssistantId)
+                            session?.let {
+                                val persisted = conversationRepo.getConversationById(conversationId)
+                                    ?: error("Conversation not found after move")
+                                updateConversation(conversationId, persisted)
+                            }
+                        } catch (error: Throwable) {
+                            if (session != null && previousSessionState != null) {
+                                session.state.value = previousSessionState
+                            }
+                            throw error
+                        }
                     }
-                } finally {
+                }
+            } finally {
+                if (conversationId !in deletedConversations) {
                     session?.resumeGeneration()
                     session?.let { dispatchNextQueuedMessage(it.id) }
                 }
@@ -1632,19 +1812,42 @@ class ChatService(
         }
     }
 
+    private suspend fun mutateConversation(
+        conversationId: Uuid,
+        owner: Uuid,
+        transform: (Conversation) -> Conversation,
+    ) {
+        workspaceAccessGate.withAssistantMutation(owner.toString()) {
+            conversationMoveLocks.computeIfAbsent(conversationId) { Mutex() }.withLock {
+                val current = getConversationFlow(conversationId).value
+                check(current.assistantId == owner) { "Conversation owner changed while waiting to edit" }
+                saveConversationLocked(conversationId, transform(current))
+            }
+        }
+    }
+
     private suspend fun saveConversationLocked(conversationId: Uuid, conversation: Conversation) {
+        requireConversationAvailable(conversationId)
         val exists = conversationRepo.existsConversationById(conversation.id)
         if (!exists && conversation.title.isBlank() && conversation.messageNodes.isEmpty()) {
             return // 新会话且为空时不保存
         }
 
+        val state = getOrCreateSession(conversationId).state
+        val before = state.value
         val updatedConversation = conversation.copy()
-        val persistedConversation = if (!exists) {
-            conversationRepo.insertConversation(updatedConversation)
-        } else {
-            conversationRepo.updateConversation(updatedConversation)
+        val persistedConversation = conversationRepo.commitGenerationConversation(
+            updatedConversation,
+            GenerationConversationCommitState(
+                initiallyPersisted = exists || conversation.conversationNumber > 0 || !conversation.newConversation,
+            ),
+        )
+        state.update { latest ->
+            if (latest == before) persistedConversation else latest.copy(
+                conversationNumber = persistedConversation.conversationNumber,
+            )
         }
-        updateConversation(conversationId, persistedConversation)
+        checkFilesDelete(state.value, before)
 
         // 删除消息或切换分支可能解除工具审批的阻塞，保存成功后重新看一遗队列。
         dispatchNextQueuedMessage(conversationId)
@@ -1730,26 +1933,14 @@ class ChatService(
         val assistant = settings.getAssistantById(currentConversation.assistantId)
             ?: error("Conversation assistant not found")
         val processedParts = preprocessUserInputParts(parts, assistant)
-        var edited = false
-
-        val updatedNodes = currentConversation.messageNodes.map { node ->
-            if (!node.messages.any { it.id == messageId }) {
-                return@map node
-            }
-            edited = true
-
-            node.copy(
-                messages = node.messages + UIMessage(
-                    role = node.role,
-                    parts = processedParts,
-                ),
-                selectIndex = node.messages.size
-            )
+        mutateConversation(conversationId, currentConversation.assistantId) { latest ->
+            latest.copy(messageNodes = latest.messageNodes.map { node ->
+                if (node.messages.none { it.id == messageId }) node else node.copy(
+                    messages = node.messages + UIMessage(role = node.role, parts = processedParts),
+                    selectIndex = node.messages.size,
+                )
+            })
         }
-
-        if (!edited) return
-
-        saveConversation(conversationId, currentConversation.copy(messageNodes = updatedNodes))
     }
 
     suspend fun forkConversationAtMessage(
@@ -1797,27 +1988,15 @@ class ChatService(
         nodeId: Uuid,
         selectIndex: Int
     ) {
-        val currentConversation = getConversationFlow(conversationId).value
-        val targetNode = currentConversation.messageNodes.firstOrNull { it.id == nodeId }
-            ?: throw NoSuchElementException("Message node not found")
-
-        if (selectIndex !in targetNode.messages.indices) {
-            throw IllegalArgumentException("Invalid selectIndex")
+        val owner = getConversationFlow(conversationId).value.assistantId
+        mutateConversation(conversationId, owner) { current ->
+            val target = current.messageNodes.firstOrNull { it.id == nodeId }
+                ?: throw NoSuchElementException("Message node not found")
+            require(selectIndex in target.messages.indices) { "Invalid selectIndex" }
+            current.copy(messageNodes = current.messageNodes.map { node ->
+                if (node.id == nodeId) node.copy(selectIndex = selectIndex) else node
+            })
         }
-
-        if (targetNode.selectIndex == selectIndex) {
-            return
-        }
-
-        val updatedNodes = currentConversation.messageNodes.map { node ->
-            if (node.id == nodeId) {
-                node.copy(selectIndex = selectIndex)
-            } else {
-                node
-            }
-        }
-
-        saveConversation(conversationId, currentConversation.copy(messageNodes = updatedNodes))
     }
 
     suspend fun deleteMessage(
@@ -1825,17 +2004,13 @@ class ChatService(
         messageId: Uuid,
         failIfMissing: Boolean = true,
     ) {
-        val currentConversation = getConversationFlow(conversationId).value
-        val updatedConversation = buildConversationAfterMessageDelete(currentConversation, messageId)
-
-        if (updatedConversation == null) {
-            if (failIfMissing) {
-                throw NoSuchElementException("Message not found")
+        val owner = getConversationFlow(conversationId).value.assistantId
+        mutateConversation(conversationId, owner) { current ->
+            buildConversationAfterMessageDelete(current, messageId) ?: run {
+                if (failIfMissing) throw NoSuchElementException("Message not found")
+                current
             }
-            return
         }
-
-        saveConversation(conversationId, updatedConversation)
     }
 
     suspend fun deleteMessage(

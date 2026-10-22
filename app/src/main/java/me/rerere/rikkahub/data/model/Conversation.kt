@@ -4,9 +4,16 @@ import android.net.Uri
 import androidx.core.net.toUri
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.MutableStateFlow
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.ai.ui.withoutCodemodeTrace
 import me.rerere.ai.util.InstantSerializer
 import me.rerere.rikkahub.data.datastore.DEFAULT_ASSISTANT_ID
 import java.time.Instant
@@ -64,37 +71,19 @@ data class Conversation(
     }
 
     fun updateCurrentMessages(messages: List<UIMessage>): Conversation {
-        val newNodes = this.messageNodes.toMutableList()
-
-        messages.forEachIndexed { index, message ->
-            val node = newNodes
-                .getOrElse(index) { message.toMessageNode() }
-
-            val newMessages = node.messages.toMutableList()
-            var newMessageIndex = node.selectIndex
-            if (newMessages.any { it.id == message.id }) {
-                newMessages[newMessages.indexOfFirst { it.id == message.id }] = message
+        val newNodes = messageNodes.toMutableList()
+        messages.forEach { message ->
+            val index = newNodes.indexOfFirst { node -> node.messages.any { it.id == message.id } }
+            if (index < 0) {
+                newNodes.add(message.toMessageNode())
             } else {
-                newMessages.add(message)
-                newMessageIndex = newMessages.lastIndex
-            }
-
-            val newNode = node.copy(
-                messages = newMessages,
-                selectIndex = newMessageIndex
-            )
-
-            // 更新newNodes
-            if (index > newNodes.lastIndex) {
-                newNodes.add(newNode)
-            } else {
-                newNodes[index] = newNode
+                val node = newNodes[index]
+                newNodes[index] = node.copy(messages = node.messages.map {
+                    if (it.id == message.id) message else it
+                })
             }
         }
-
-        return this.copy(
-            messageNodes = newNodes
-        )
+        return copy(messageNodes = newNodes)
     }
 
     companion object {
@@ -110,6 +99,110 @@ data class Conversation(
             newConversation = newConversation,
         )
     }
+}
+
+/** Caller serializes persistence with other conversation saves, never with provider calls. */
+internal suspend fun commitGenerationMessages(
+    state: MutableStateFlow<Conversation>,
+    request: GenerationMessageSnapshot,
+    messages: List<UIMessage>,
+    persist: (suspend (Conversation) -> Conversation)? = null,
+): GenerationMessageSnapshot {
+    val caller = currentCoroutineContext()
+    caller.ensureActive()
+    if (persist == null) {
+        while (true) {
+            caller.ensureActive()
+            val before = state.value
+            val updated = request.applyTo(before, messages)
+            if (state.compareAndSet(before, updated)) return request.copy(expected = updated)
+        }
+    }
+    return withContext(NonCancellable) {
+        while (true) {
+            caller.ensureActive()
+            val before = state.value
+            val updated = request.applyTo(before, messages)
+            val saved = persist(updated)
+            if (!caller.isActive || !request.matches(state.value)) {
+                persist(state.value)
+                caller.ensureActive()
+                error("Generation source changed during checkpoint persistence")
+            }
+            if (state.compareAndSet(before, saved)) return@withContext request.copy(expected = saved)
+        }
+        @Suppress("UNREACHABLE_CODE")
+        error("Unreachable generation commit")
+    }
+}
+
+/** Request-local identity map; never infer a node from a callback's list offset. */
+internal data class GenerationMessageSnapshot(
+    val expected: Conversation,
+    val input: List<UIMessage>,
+    val responseNodeIds: List<Uuid>,
+) {
+    fun matches(current: Conversation): Boolean =
+        current.id == expected.id && current.assistantId == expected.assistantId &&
+            current.messageNodes.map { it.id to it.currentMessage.sourceIdentity() } ==
+            expected.messageNodes.map { it.id to it.currentMessage.sourceIdentity() }
+
+    fun applyTo(current: Conversation, messages: List<UIMessage>): Conversation {
+        check(matches(current)) { "Generation source changed" }
+        check(messages.take(input.size).map { it.id } == input.map { it.id }) {
+            "Generation input mapping changed"
+        }
+        val nodes = current.messageNodes.toMutableList()
+        messages.forEachIndexed { index, message ->
+            val existing = nodes.indexOfFirst { node -> node.messages.any { it.id == message.id } }
+            if (existing >= 0) {
+                val node = nodes[existing]
+                nodes[existing] = node.copy(messages = node.messages.map { old ->
+                    if (old.id != message.id) old else {
+                        val previous = expected.getMessageNodeByMessageId(old.id)?.currentMessage
+                        message.copy(
+                            usage = if (message.usage == previous?.usage) old.usage else message.usage,
+                            translation = if (message.translation == previous?.translation) old.translation else message.translation,
+                            finishedAt = if (message.finishedAt == previous?.finishedAt) old.finishedAt else message.finishedAt,
+                        )
+                    }
+                })
+            } else {
+                check(index >= input.size) { "Generation input message disappeared" }
+                val destination = responseNodeIds.getOrNull(index - input.size)
+                val target = nodes.indexOfFirst { it.id == destination }
+                if (destination != null) {
+                    check(target >= 0) { "Generation response node disappeared" }
+                    val node = nodes[target]
+                    nodes[target] = node.copy(messages = node.messages + message, selectIndex = node.messages.size)
+                } else {
+                    nodes.add(message.toMessageNode())
+                }
+            }
+        }
+        return current.copy(messageNodes = nodes)
+    }
+
+    companion object {
+        fun capture(conversation: Conversation, range: ClosedRange<Int>? = null): GenerationMessageSnapshot {
+            val start = range?.start ?: 0
+            val end = range?.endInclusive?.plus(1) ?: conversation.messageNodes.size
+            return GenerationMessageSnapshot(
+                expected = conversation,
+                input = conversation.currentMessages.subList(start, end).toList(),
+                responseNodeIds = conversation.messageNodes.drop(end).map { it.id },
+            )
+        }
+    }
+}
+
+private fun UIMessage.sourceIdentity(): Triple<Uuid, MessageRole, List<UIMessagePart>> =
+    Triple(id, role, parts.map { it.sourceIdentity() })
+
+private fun UIMessagePart.sourceIdentity(): UIMessagePart = when (val part = withoutCodemodeTrace()) {
+    is UIMessagePart.Reasoning -> part.copy(finishedAt = null)
+    is UIMessagePart.Tool -> part.copy(output = part.output.map { it.sourceIdentity() })
+    else -> part
 }
 
 @Serializable

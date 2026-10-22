@@ -1,5 +1,7 @@
 package me.rerere.rikkahub.data.db
 
+import me.rerere.rikkahub.data.db.dao.ContextBlockDAO
+import me.rerere.rikkahub.data.db.entity.ContextBlockEntity
 import androidx.room.AutoMigration
 import androidx.room.Database
 import androidx.room.RoomDatabase
@@ -34,10 +36,11 @@ import me.rerere.rikkahub.data.db.migrations.Migration_22_23
 import me.rerere.rikkahub.data.db.migrations.Migration_8_9
 import me.rerere.rikkahub.utils.JsonInstant
 
-const val APP_DATABASE_VERSION = 31
+const val APP_DATABASE_VERSION = 32
 
 @Database(
     entities = [
+        ContextBlockEntity::class,
         ConversationEntity::class,
         ConversationNumberSequenceEntity::class,
         MemoryEntity::class,
@@ -78,6 +81,8 @@ abstract class AppDatabase : RoomDatabase() {
     companion object {
         const val CURRENT_VERSION = APP_DATABASE_VERSION
     }
+
+    abstract fun contextBlockDao(): ContextBlockDAO
 
     abstract fun conversationDao(): ConversationDAO
 

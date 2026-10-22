@@ -1,5 +1,10 @@
 package me.rerere.rikkahub.data.workspace
 
+import me.rerere.rikkahub.data.db.migrations.Migration_31_32
+import me.rerere.rikkahub.data.datastore.Settings
+import me.rerere.rikkahub.utils.JsonInstant
+import java.security.MessageDigest
+import org.junit.Assert.assertEquals
 import android.content.Context
 import androidx.room.testing.MigrationTestHelper
 import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
@@ -177,6 +182,59 @@ class RoomSchema31ArchiveGateInstrumentedTest {
         } finally {
             context.deleteDatabase(databaseName)
             archive.delete()
+            staging.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun portable31And32VerifyWithoutChangingArchiveOrSourceDatabase() {
+        listOf(31, 32).forEach { version -> verifyPortableFixture(version, corruptHash = false, corruptSchema = false) }
+    }
+
+    @Test
+    fun portable31RejectsBadHashAndSchemaBeforeUpgrade() {
+        verifyPortableFixture(31, corruptHash = true, corruptSchema = false)
+        verifyPortableFixture(31, corruptHash = false, corruptSchema = true)
+    }
+
+    private fun verifyPortableFixture(version: Int, corruptHash: Boolean, corruptSchema: Boolean) {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val name = "portable-schema-$version-${System.nanoTime()}"
+        val staging = newStaging(context, name)
+        val archive = File(staging, "portable.zip")
+        fun hash(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+        try {
+            helper.createDatabase(name, 31).close()
+            if (version == 32) helper.runMigrationsAndValidate(name, 32, true, Migration_31_32).close()
+            tamper(context, name, buildList {
+                add(requireNotNull(roomSchema31ExpectedSnapshotForTest().sqliteMasterSql["message_fts"]))
+                if (corruptSchema) add("CREATE TABLE restore_attack (payload TEXT)")
+            })
+            val source = context.getDatabasePath(name)
+            val sourceBytes = source.readBytes()
+            val manifest = WorkspaceArchiveManifest(
+                createdAt = 1, databaseVersion = version,
+                databaseEntries = listOf("database/rikka_hub.db"), snapshotsExcluded = true,
+                databasePayloads = listOf(WorkspaceArchivePayload("database/rikka_hub.db", sourceBytes.size.toLong(), if (corruptHash) "0".repeat(64) else hash(sourceBytes))),
+            )
+            ZipOutputStream(archive.outputStream()).use { zip ->
+                listOf(
+                    "manifest.json" to JsonInstant.encodeToString(manifest).toByteArray(),
+                    "settings.json" to JsonInstant.encodeToString(Settings()).toByteArray(),
+                    "database/rikka_hub.db" to sourceBytes,
+                ).forEach { (path, bytes) ->
+                    zip.putNextEntry(ZipEntry(path))
+                    zip.write(bytes)
+                    zip.closeEntry()
+                }
+            }
+            val originalArchiveHash = hash(archive.readBytes())
+            val result = runCatching { verifyBackup(archive) }
+            assertEquals(result.exceptionOrNull()?.message, !(corruptHash || corruptSchema), result.isSuccess)
+            assertEquals(originalArchiveHash, hash(archive.readBytes()))
+            assertEquals(hash(sourceBytes), hash(source.readBytes()))
+        } finally {
+            context.deleteDatabase(name)
             staging.deleteRecursively()
         }
     }

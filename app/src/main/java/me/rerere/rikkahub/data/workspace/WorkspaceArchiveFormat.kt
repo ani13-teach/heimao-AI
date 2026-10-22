@@ -31,8 +31,8 @@ data class WorkspaceArchiveManifest(
             "Unsupported workspace archive version: $formatVersion"
         }
         require(createdAt > 0L) { "Workspace archive creation time is invalid" }
-        require(databaseVersion == AppDatabase.CURRENT_VERSION) {
-            "Workspace archive database version $databaseVersion does not match current ${AppDatabase.CURRENT_VERSION}"
+        require(databaseVersion in setOf(31, 32)) {
+            "Unsupported workspace archive database version $databaseVersion"
         }
         require(settingsPath == SETTINGS_PATH) { "Unsupported settings path: $settingsPath" }
         require(DEFAULT_EXCLUDED.all { it in excluded }) {

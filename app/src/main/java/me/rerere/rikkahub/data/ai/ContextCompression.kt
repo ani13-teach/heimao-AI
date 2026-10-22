@@ -153,6 +153,8 @@ private fun hashPart(part: UIMessagePart): JsonElement {
 
 /** Only original identity, role and parts are hashed: streaming bookkeeping is excluded.
  * Canonical JSON makes map ordering and storage round trips irrelevant. */
+internal fun contextSourceHash(messages: List<UIMessage>): String = prefixHash(messages)
+
 private fun prefixHash(messages: List<UIMessage>): String {
     val digest = MessageDigest.getInstance("SHA-256")
     fun field(value: String) {
@@ -236,7 +238,7 @@ internal suspend fun compactContextIfNeeded(
 }
 
 /** Exact source preservation, including newlines and surrogate pairs. No per-message truncation. */
-private fun splitCompressionSource(source: String, maxTokens: Int): List<String> {
+internal fun splitCompressionSource(source: String, maxTokens: Int): List<String> {
     val chunks = ArrayList<String>()
     var start = 0
     var offset = 0
@@ -268,7 +270,7 @@ private fun splitCompressionSource(source: String, maxTokens: Int): List<String>
 }
 
 @Suppress("DEPRECATION")
-private fun renderCompressionHistory(messages: List<UIMessage>): String = messages.joinToString("\n\n") {
+internal fun renderCompressionHistory(messages: List<UIMessage>): String = messages.joinToString("\n\n") {
     "[${it.role.name}]\n" + it.parts.mapNotNull(::renderCompressionPart).joinToString("\n")
 }
 

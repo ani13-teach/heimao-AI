@@ -8,9 +8,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
-import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonNull
-import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.*
+import me.rerere.ai.core.InputSchema
+import me.rerere.ai.core.Tool
+import me.rerere.ai.ui.CodemodeExecution
+import me.rerere.ai.ui.CodemodeStatus
+import me.rerere.ai.ui.UIMessagePart
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -67,6 +70,93 @@ class WorkspaceCodemodeRuntimeTest {
         assertEquals(1, max.get())
         assertEquals(4, calls.size)
         assertEquals(listOf(JsonPrimitive(4)), output)
+    }
+
+    @Test fun executionReturnsNonzeroShellResultsThroughPromiseAggregates() = runBlocking {
+        for (aggregate in listOf("all", "allSettled")) {
+            val exitCodes = listOf(0, 1, 127)
+            val results = exitCodes.map { exitCode ->
+                buildJsonObject {
+                    put("exitCode", exitCode)
+                    put("stdout", "out-$exitCode")
+                    put("stderr", if (exitCode == 0) "" else "err-$exitCode")
+                    put("timedOut", false)
+                    put("extra", "preserved")
+                }
+            }
+            val calls = mutableListOf<String>()
+            val shell = executionTool("workspace_shell") { arguments ->
+                val exitCode = arguments.jsonObject.getValue("command").jsonPrimitive.content.toInt()
+                calls += "shell:$exitCode"
+                listOf(UIMessagePart.Text(results[exitCodes.indexOf(exitCode)].toString()))
+            }
+            val after = buildJsonObject { put("text", "after") }
+            val read = executionTool("workspace_read_file") {
+                calls += "read"
+                listOf(UIMessagePart.Text(after.toString()))
+            }
+            val trace = mutableListOf<CodemodeExecution>()
+            val execution = CodemodeToolExecution(mapOf(shell.name to shell, read.name to read), "parent", trace::add)
+            val output = execution.run("""
+                const results = await Promise.$aggregate([
+                  tools.workspace_shell({command:'0'}),
+                  tools.workspace_shell({command:'1'}),
+                  tools.workspace_shell({command:'127'})
+                ]);
+                const after = await tools.workspace_read_file({path:'/workspace/after.txt'});
+                text({results, after});
+            """.trimIndent())
+            val expectedResults = if (aggregate == "all") JsonArray(results) else JsonArray(results.map { result ->
+                buildJsonObject { put("status", "fulfilled"); put("value", result) }
+            })
+            assertEquals(buildJsonObject {
+                put("results", expectedResults); put("after", after)
+            }, Json.parseToJsonElement((output.single() as UIMessagePart.Text).text))
+            assertEquals(listOf("shell:0", "shell:1", "shell:127", "read"), calls)
+            assertEquals(CodemodeStatus.SUCCEEDED, trace.last().status)
+            val operations = trace.last().operations
+            assertEquals(listOf(CodemodeStatus.SUCCEEDED, CodemodeStatus.FAILED,
+                CodemodeStatus.FAILED, CodemodeStatus.SUCCEEDED), operations.map { it.status })
+            assertEquals(results, operations.take(3).map { it.result })
+            assertEquals(null, operations[0].error)
+            assertTrue(operations[1].error!!.contains("exitCode=1"))
+            assertTrue(operations[2].error!!.contains("exitCode=127"))
+        }
+    }
+
+    @Test fun executionRetainsOutputAndBlocksLaterCallsAfterCaughtToolException() = runBlocking {
+        var shellCalls = 0
+        var reads = 0
+        val shell = executionTool("workspace_shell") { shellCalls++; error("tool failed") }
+        val read = executionTool("workspace_read_file") { reads++; emptyList() }
+        val trace = mutableListOf<CodemodeExecution>()
+        val execution = CodemodeToolExecution(mapOf(shell.name to shell, read.name to read), "parent", trace::add)
+        val output = execution.run("""
+            text('before');
+            try { await tools.workspace_shell({command:'fail'}); } catch (_) {}
+            await tools.workspace_read_file({path:'/workspace/after.txt'});
+            text('after');
+        """.trimIndent())
+        assertEquals(1, shellCalls)
+        assertEquals(0, reads)
+        assertEquals(2, output.size)
+        assertEquals("\"before\"", (output.first() as UIMessagePart.Text).text)
+        assertTrue((output.last() as UIMessagePart.Text).text.startsWith("Codemode failed:"))
+        assertEquals(CodemodeStatus.FAILED, trace.last().status)
+        assertEquals(CodemodeStatus.FAILED, trace.last().operations.single().status)
+        assertEquals("tool failed", trace.last().operations.single().error)
+    }
+
+    private fun executionTool(
+        name: String,
+        execute: suspend (JsonElement) -> List<UIMessagePart>,
+    ): Tool {
+        val argument = if (name == "workspace_shell") "command" else "path"
+        return Tool(name = name, description = "", parameters = {
+            InputSchema.Obj(buildJsonObject {
+                put(argument, buildJsonObject { put("type", "string") })
+            }, listOf(argument))
+        }, execute = execute)
     }
 
     @Test fun cancellationInterruptsSynchronousLoop() = runBlocking {

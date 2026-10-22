@@ -1,5 +1,6 @@
 package me.rerere.rikkahub.data.workspace
 
+import me.rerere.rikkahub.data.db.migrations.Migration_31_32
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.os.Build
@@ -1184,6 +1185,7 @@ class WorkspaceArchiveService(
                     },
                     expectedSnapshotsEmpty = validatedManifest.snapshotsExcluded,
                 )
+                upgradePortableDatabaseIfNeeded(it, validatedManifest.databaseVersion, verificationRoot, budget)
             }
         } catch (error: Throwable) {
             failure = error
@@ -1341,6 +1343,30 @@ class WorkspaceArchiveService(
             expectedSnapshotsEmpty = true,
         )
         return combinedMain
+    }
+
+    private fun upgradePortableDatabaseIfNeeded(
+        source: File,
+        sourceVersion: Int,
+        stagingRoot: File,
+        budget: WorkspaceArchiveBudget,
+    ): File {
+        if (sourceVersion == AppDatabase.CURRENT_VERSION) return source
+        require(sourceVersion == 31) { "Unsupported portable database schema $sourceVersion" }
+        val directory = File(stagingRoot, "portable-upgraded")
+        require(directory.mkdirs() || directory.isDirectory) { "Unable to create portable database staging" }
+        val target = File(directory, "rikka_hub")
+        copyStagedDatabaseFile(source, target, budget, stagingRoot)
+        val stagedRoom = openStagedRoomDatabase(target)
+        try {
+            stagedRoom.openHelper.writableDatabase
+        } finally {
+            stagedRoom.close()
+        }
+        checkpointLegacyDatabase(target)
+        cleanupDatabaseSidecars(target)
+        validateStagedDatabase(target, expectedVersion = AppDatabase.CURRENT_VERSION)
+        return target
     }
 
     private fun copyStagedDatabaseFile(
@@ -1821,9 +1847,17 @@ class WorkspaceArchiveService(
                     },
                     expectedSnapshotsEmpty = manifest.snapshotsExcluded,
                 )
+                val upgradedDatabase = upgradePortableDatabaseIfNeeded(stagedDatabase, manifest.databaseVersion, staging, budget)
+                databaseFiles["database/rikka_hub.db"] = upgradedDatabase
             }
+            val preparedManifest = if (databaseFiles.isNotEmpty()) manifest.copy(
+                databaseVersion = AppDatabase.CURRENT_VERSION,
+                databasePayloads = databaseFiles.map { (path, file) ->
+                    WorkspaceArchivePayload(path, file.length(), sha256(file))
+                },
+            ) else manifest
             return PreparedPortableArchive(
-                manifest = manifest,
+                manifest = preparedManifest,
                 settingsFile = settingsFile,
                 databaseFiles = databaseFiles,
                 payloadFiles = payloadFiles,
@@ -2082,7 +2116,7 @@ class WorkspaceArchiveService(
                 )
                 validateStagedDatabase(
                     file = stagedDatabase,
-                    expectedVersion = prepared.manifest.databaseVersion,
+                    expectedVersion = AppDatabase.CURRENT_VERSION,
                     expectedReferences = prepared.manifest.references,
                     expectedWorkspaceKeys = prepared.manifest.workspaces.map {
                         WorkspaceArchiveWorkspaceKey(it.id, it.root)
@@ -3101,10 +3135,10 @@ class WorkspaceArchiveService(
             "Staged database is not a regular file"
         }
         require(file.length() > 0L) { "Staged database is empty" }
-        require(expectedVersion == AppDatabase.CURRENT_VERSION) {
-            "Staged database validation accepts only Room schema ${AppDatabase.CURRENT_VERSION}"
+        require(expectedVersion in setOf(31, 32)) {
+            "Unsupported staged database schema $expectedVersion"
         }
-        val validationHelper = openStagedDatabaseForValidation(file)
+        val validationHelper = openStagedDatabaseForValidation(file, expectedVersion)
         try {
             val staged = validationHelper.readableDatabase
             requirePragmaHealthy(staged, "quick_check")
@@ -3114,9 +3148,6 @@ class WorkspaceArchiveService(
             val userVersion = staged.query("PRAGMA user_version").use { cursor ->
                 require(cursor.moveToFirst()) { "Staged database user_version is unavailable" }
                 cursor.getInt(0)
-            }
-            require(userVersion == AppDatabase.CURRENT_VERSION) {
-                "Staged database user_version $userVersion is not Room schema ${AppDatabase.CURRENT_VERSION}"
             }
             require(userVersion == expectedVersion) {
                 "Staged database user_version $userVersion does not match expected $expectedVersion"
@@ -3131,20 +3162,21 @@ class WorkspaceArchiveService(
                 "Staged database Room identity is malformed"
             }
             val schema = readRoomSchemaSnapshot(staged, userVersion, identity)
-            if (!roomSchema31IsExact(schema)) {
+            val expectation = if (expectedVersion == 31) ROOM_SCHEMA_31_EXPECTATION else ROOM_SCHEMA_32_EXPECTATION
+            if (!roomSchemaIsExact(schema, expectation)) {
                 // The message reaches the backup UI, so name the drifting objects there instead of
                 // only stating that the schema is not the current Room schema. A release build
                 // refuses run-as, so the same structure also goes to a file this device can hand
                 // over.
-                val difference = describeRoomSchema31Difference(schema)
+                val difference = describeRoomSchemaDifference(schema, expectation)
                 val report = writeSchemaDriftReport(schema, difference)
                 Log.e(
                     TAG,
-                    "Staged database is not Room schema ${AppDatabase.CURRENT_VERSION}: " +
+                    "Staged database is not Room schema $expectedVersion: " +
                         "$difference (report=${report?.absolutePath ?: "unavailable"})",
                 )
                 error(
-                    "Staged database schema is not exactly Room schema ${AppDatabase.CURRENT_VERSION}: " +
+                    "Staged database schema is not exactly Room schema $expectedVersion: " +
                         "$difference" +
                         (report?.let { " (report: ${it.name})" } ?: ""),
                 )
@@ -3224,8 +3256,8 @@ class WorkspaceArchiveService(
             .getOrNull()
     }
 
-    private fun openStagedDatabaseForValidation(file: File): SupportSQLiteOpenHelper {
-        val callback = object : SupportSQLiteOpenHelper.Callback(AppDatabase.CURRENT_VERSION) {
+    private fun openStagedDatabaseForValidation(file: File, expectedVersion: Int): SupportSQLiteOpenHelper {
+        val callback = object : SupportSQLiteOpenHelper.Callback(expectedVersion) {
             override fun onCreate(db: SupportSQLiteDatabase) {
                 error("Staged database unexpectedly requested creation")
             }
@@ -3700,6 +3732,7 @@ class WorkspaceArchiveService(
             Migration_28_29,
             Migration_29_30,
             Migration_30_31,
+            Migration_31_32,
         )
         private const val MESSAGE_FTS_TABLE = "message_fts"
         private val FTS_SHADOW_NAMES = setOf(

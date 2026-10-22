@@ -33,7 +33,10 @@ fun createWorkspaceCodemodeTool(workspaceTools: List<Tool>): Tool {
             "workspace_write_file, workspace_edit_file or workspace_shell with their normal arguments. " +
             "Calls execute serially, including Promise.all. Only text(value) output is returned to the model. " +
             "No network, filesystem, timers, imports or host objects are available to JavaScript. " +
-            "Text files only; image attachments are unsupported. Stop on failed operations; completed writes are not rolled back. " +
+            "Text files only; image attachments are unsupported. Shell commands that finish without timing out return " +
+            "their original JSON even for nonzero exit codes; check exitCode and stderr. Nonzero exits mark the " +
+            "operation failed but allow further calls; batch success depends on JavaScript completing. " +
+            "Timeouts, invalid shell results and tool exceptions stop execution; completed writes are not rolled back. " +
             "Limits: 32 KiB code, 64 calls, 64 KiB per argument/result, 32 KiB total output, 120 seconds. " +
             "Example: const r = await tools.workspace_read_file({path:'/workspace/a.txt'}); text(r.text); " +
             "Available tools: " + allowed.keys.joinToString(", "),
@@ -98,6 +101,7 @@ internal class CodemodeToolExecution(
         trace = trace.copy(operations = trace.operations + operation)
         checkpoint(trace)
         var result: JsonElement? = null
+        var operationError: String? = null
         try {
             require(name in allowedCodemodeTools) { "Tool is not available in Codemode" }
             val tool = tools[name] ?: error("Tool is not available in this workspace")
@@ -112,9 +116,11 @@ internal class CodemodeToolExecution(
             require(result.toString().toByteArray(Charsets.UTF_8).size <= 65536) { "Codemode result exceeds 64 KiB; use a narrower shell query" }
             if (name == "workspace_shell") {
                 val shell = result as? JsonObject ?: error("Invalid workspace shell result")
-                val exitCode = (shell["exitCode"] as? JsonPrimitive)?.intOrNull
-                val timedOut = (shell["timedOut"] as? JsonPrimitive)?.booleanOrNull
-                check(exitCode == 0 && timedOut == false) { "Workspace shell failed (exitCode=$exitCode, timedOut=$timedOut)" }
+                val exitCode = (shell["exitCode"] as? JsonPrimitive)?.takeUnless { it.isString }?.intOrNull
+                val timedOut = (shell["timedOut"] as? JsonPrimitive)?.takeUnless { it.isString }?.booleanOrNull
+                check(exitCode != null && exitCode >= 0 && timedOut != null) { "Invalid workspace shell result" }
+                check(!timedOut) { "Workspace shell timed out (exitCode=$exitCode)" }
+                if (exitCode != 0) operationError = "Workspace shell failed (exitCode=$exitCode)"
             }
         } catch (error: Throwable) {
             fatal = error
@@ -122,7 +128,7 @@ internal class CodemodeToolExecution(
             complete(operation, CodemodeStatus.FAILED, result, (error.message ?: "Tool failed").take(1024))
             throw error
         }
-        complete(operation, CodemodeStatus.SUCCEEDED, result, null)
+        complete(operation, if (operationError == null) CodemodeStatus.SUCCEEDED else CodemodeStatus.FAILED, result, operationError)
         return checkNotNull(result)
     }
 
