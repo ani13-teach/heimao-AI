@@ -21,6 +21,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.SheetValue
 import androidx.compose.material3.rememberBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -32,15 +33,16 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
-import me.rerere.ai.core.Tool
 import me.rerere.ai.provider.ModelType
 import me.rerere.ai.provider.ProviderManager
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.provider.TextGenerationParams
 import me.rerere.ai.ui.StreamChunk
 import me.rerere.ai.ui.UIMessage
-import me.rerere.ai.ui.UIMessagePart
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.Connect
 import me.rerere.rikkahub.R
@@ -55,7 +57,6 @@ fun ProviderConnectionTester(
 ) {
     var showTestDialog by remember { mutableStateOf(false) }
     val providerManager = koinInject<ProviderManager>()
-    val scope = rememberCoroutineScope()
 
     IconButton(onClick = { showTestDialog = true }) {
         Icon(HugeIcons.Connect, null)
@@ -65,20 +66,31 @@ fun ProviderConnectionTester(
         var model by remember(internalProvider) {
             mutableStateOf(internalProvider.models.firstOrNull { it.type == ModelType.CHAT })
         }
-        var nonStreamingState: UiState<String> by remember { mutableStateOf(UiState.Idle) }
-        var streamingState: UiState<String> by remember { mutableStateOf(UiState.Idle) }
-        var toolsState: UiState<String> by remember { mutableStateOf(UiState.Idle) }
-        var streamingText by remember { mutableStateOf("") }
+        val scope = rememberCoroutineScope()
+        var streamingState: UiState<String> by remember(internalProvider, model) {
+            mutableStateOf(UiState.Idle)
+        }
+        var streamingText by remember(internalProvider, model) { mutableStateOf("") }
+        var testJob by remember { mutableStateOf<Job?>(null) }
+        var testId by remember { mutableStateOf(0) }
 
-        fun resetStates() {
-            nonStreamingState = UiState.Idle
-            streamingState = UiState.Idle
-            toolsState = UiState.Idle
-            streamingText = ""
+        fun cancelTest() {
+            testId++
+            testJob?.cancel()
+            testJob = null
+        }
+
+        fun dismissDialog() {
+            cancelTest()
+            showTestDialog = false
+        }
+
+        DisposableEffect(internalProvider) {
+            onDispose { cancelTest() }
         }
 
         AlertDialog(
-            onDismissRequest = { showTestDialog = false },
+            onDismissRequest = { dismissDialog() },
             title = {
                 Text(stringResource(R.string.setting_provider_page_test_connection))
             },
@@ -90,119 +102,73 @@ fun ProviderConnectionTester(
                         type = ModelType.CHAT,
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        model = it
+                        if (model != it) {
+                            cancelTest()
+                            streamingState = UiState.Idle
+                            streamingText = ""
+                            model = it
+                        }
                     }
-
-                    TestResultItem(
-                        label = "非流式",
-                        state = nonStreamingState,
-                        resultText = (nonStreamingState as? UiState.Success)?.data ?: ""
-                    )
 
                     TestResultItem(
                         label = "流式",
                         state = streamingState,
                         resultText = streamingText
                     )
-
-                    TestResultItem(
-                        label = "工具调用",
-                        state = toolsState,
-                        resultText = (toolsState as? UiState.Success)?.data ?: ""
-                    )
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showTestDialog = false }) {
+                TextButton(onClick = { dismissDialog() }) {
                     Text(stringResource(R.string.cancel))
                 }
             },
             confirmButton = {
                 TextButton(
+                    enabled = model != null && streamingState !is UiState.Loading,
                     onClick = {
-                        if (model == null) return@TextButton
-                        val provider = providerManager.getProviderByType(internalProvider)
-                        resetStates()
-                        scope.launch {
-                            launch {
-                                runCatching {
-                                    nonStreamingState = UiState.Loading
-                                    val result = provider.generateText(
-                                        providerSetting = internalProvider,
-                                        messages = listOf(
-                                            UIMessage.system("You are a helpful assistant"),
-                                            UIMessage.user("hello"),
-                                        ),
-                                        params = TextGenerationParams(
-                                            model = model!!,
-                                            customHeaders = model!!.customHeaders,
-                                            customBody = model!!.customBodies
-                                        )
-                                    )
-                                    val text = result.message.parts
-                                        .filterIsInstance<UIMessagePart.Text>()
-                                        .joinToString("") { it.text }
-                                    nonStreamingState = UiState.Success(text)
-                                }.onFailure { nonStreamingState = UiState.Error(it) }
-                            }
-                            launch {
-                                runCatching {
-                                    streamingState = UiState.Loading
-                                    val flow = provider.streamText(
-                                        providerSetting = internalProvider,
-                                        messages = listOf(
-                                            UIMessage.system("You are a helpful assistant"),
-                                            UIMessage.user("hello"),
-                                        ),
-                                        params = TextGenerationParams(
-                                            model = model!!,
-                                            customHeaders = model!!.customHeaders,
-                                            customBody = model!!.customBodies
-                                        )
-                                    )
-                                    flow.collect { chunk ->
-                                        if (chunk is StreamChunk.TextDelta) {
-                                            streamingText += chunk.text
+                        val selectedModel = model ?: return@TextButton
+                        if (streamingState is UiState.Loading) return@TextButton
+                        val providerSetting = internalProvider
+                        val currentTestId = ++testId
+                        streamingText = ""
+                        streamingState = UiState.Loading
+                        testJob = scope.launch {
+                            try {
+                                val provider = providerManager.getProviderByType(providerSetting)
+                                val flow = provider.streamText(
+                                    providerSetting = providerSetting,
+                                    messages = listOf(
+                                        UIMessage.system("You are a helpful assistant"),
+                                        UIMessage.user("hello"),
+                                    ),
+                                    params = TextGenerationParams(
+                                        model = selectedModel,
+                                        customHeaders = selectedModel.customHeaders,
+                                        customBody = selectedModel.customBodies.filterNot {
+                                            it.key.equals("stream", ignoreCase = true)
                                         }
-                                    }
-                                    streamingState = UiState.Success("")
-                                }.onFailure { streamingState = UiState.Error(it) }
-                            }
-                            launch {
-                                runCatching {
-                                    toolsState = UiState.Loading
-                                    val testTool = Tool(
-                                        name = "get_current_time",
-                                        description = "Get the current date and time.",
-                                        execute = { emptyList() }
                                     )
-                                    val result = provider.generateText(
-                                        providerSetting = internalProvider,
-                                        messages = listOf(
-                                            UIMessage.system("You are a helpful assistant"),
-                                            UIMessage.user("Use the get_current_time tool."),
-                                        ),
-                                        params = TextGenerationParams(
-                                            model = model!!,
-                                            tools = listOf(testTool),
-                                            customHeaders = model!!.customHeaders,
-                                            customBody = model!!.customBodies
-                                        )
-                                    )
-                                    val message = result.message
-                                    val toolCall = message.parts
-                                        .filterIsInstance<UIMessagePart.Tool>()
-                                        .firstOrNull()
-                                    val resultText = if (toolCall != null) {
-                                        "调用: ${toolCall.toolName}  入参: ${toolCall.input}"
-                                    } else {
-                                        val text = message.parts
-                                            .filterIsInstance<UIMessagePart.Text>()
-                                            .joinToString("") { it.text }
-                                        "未调用工具，响应: $text"
+                                )
+                                flow.collect { chunk ->
+                                    coroutineContext.ensureActive()
+                                    if (testId == currentTestId && chunk is StreamChunk.TextDelta) {
+                                        streamingText += chunk.text
                                     }
-                                    toolsState = UiState.Success(resultText)
-                                }.onFailure { toolsState = UiState.Error(it) }
+                                }
+                                coroutineContext.ensureActive()
+                                if (testId == currentTestId) {
+                                    streamingState = UiState.Success(streamingText)
+                                }
+                            } catch (e: CancellationException) {
+                                if (testId == currentTestId) {
+                                    streamingState = UiState.Idle
+                                }
+                                throw e
+                            } catch (e: Exception) {
+                                coroutineContext.ensureActive()
+                                if (testId == currentTestId) {
+                                    streamingState = UiState.Error(e)
+                                }
                             }
                         }
                     }
@@ -220,7 +186,7 @@ private fun TestResultItem(
     state: UiState<String>,
     resultText: String
 ) {
-    var showErrorSheet by remember { mutableStateOf(false) }
+    var showErrorSheet by remember(state) { mutableStateOf(false) }
 
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -238,7 +204,21 @@ private fun TestResultItem(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            is UiState.Loading -> LinearWavyProgressIndicator(modifier = Modifier.weight(1f))
+            is UiState.Loading -> Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                LinearWavyProgressIndicator(modifier = Modifier.fillMaxWidth())
+                if (resultText.isNotBlank()) {
+                    Text(
+                        text = resultText,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
             is UiState.Success -> Column(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(2.dp)

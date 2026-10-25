@@ -1,4 +1,6 @@
 import com.android.build.api.dsl.Packaging
+import com.chaquo.python.TaskBuilder.ReqsAssetsTask
+import com.chaquo.python.TaskBuilder.ReqsTask
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 import java.io.FileInputStream
@@ -23,8 +25,8 @@ android {
         applicationId = "me.rerere.rikkahub"
         minSdk = 26
         targetSdk = 37
-        versionCode = 184
-        versionName = "2.4.16"
+        versionCode = 186
+        versionName = "2.4.18"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -98,6 +100,8 @@ android {
     }
     androidResources {
         generateLocaleConfig = true
+        ignoreAssetsPatterns += "banner"
+        localeFilters += listOf("en", "ja", "ko", "ko-rKR", "ru", "zh", "zh-rTW")
     }
     packaging {
         jniLibs {
@@ -133,6 +137,29 @@ chaquopy {
             install("matplotlib==3.8.4")
             install("openpyxl==3.1.5")
         }
+    }
+}
+
+// Chaquopy 17.1.0 has no requirements exclusion DSL. Keep its installation intact
+// and filter a separate copy before ZIP creation and build.json asset hashing.
+afterEvaluate {
+    tasks.withType<ReqsAssetsTask>().toList().forEach { assetsTask ->
+        val variant = assetsTask.name.removePrefix("generate").removeSuffix("PythonRequirementsAssets")
+        val installed = tasks.named<ReqsTask>("install${variant}PythonRequirements")
+        val prunedDirectory = layout.buildDirectory.dir("python/prunedRequirements/${variant.lowercase()}")
+        val pruned = tasks.register<Sync>("prune${variant}PythonRequirements") {
+            from(installed.flatMap { it.outputDir })
+            into(prunedDirectory)
+            includeEmptyDirs = false
+            exclude(
+                "*/numpy/**/tests/**",
+                "*/pandas/tests/**",
+                "*/matplotlib/tests/**",
+                "*/mpl_toolkits/**/tests/**",
+            )
+        }
+        assetsTask.inputDir.set(prunedDirectory)
+        assetsTask.dependsOn(pruned)
     }
 }
 

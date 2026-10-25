@@ -46,10 +46,25 @@ class AndroidWorkspacePythonExecutorTest {
             assert matplotlib.get_backend().lower() == 'agg'
             matrix = np.arange(9).reshape(3, 3)
             assert int((matrix @ matrix)[2, 2]) == 111
+            coefficients = np.array([[3., 1.], [1., 2.]])
+            solution = np.linalg.solve(coefficients, np.array([9., 8.]))
+            assert np.allclose(solution, [2., 3.])
+            grouped = pd.DataFrame({'组': ['甲', '乙', '甲'], '值': [2, 5, 7]})
+            totals = grouped.groupby('组', as_index=False)['值'].sum()
+            merged = totals.merge(pd.DataFrame({'组': ['甲', '乙'], '标签': ['A', 'B']}), on='组')
+            assert merged.set_index('标签')['值'].to_dict() == {'A': 9, 'B': 5}
             df = pd.DataFrame({'项目': ['合计'], '数值': [12]})
             df.to_excel('/workspace/result.xlsx', index=False)
             loaded = pd.read_excel('/workspace/result.xlsx')
             assert loaded.iloc[0, 1] == 12
+            workbook = openpyxl.Workbook()
+            workbook.active.append(['中文项目', 42])
+            workbook.save('/workspace/direct.xlsx')
+            workbook.close()
+            restored = openpyxl.load_workbook('/workspace/direct.xlsx')
+            assert restored.active['A1'].value == '中文项目'
+            assert restored.active['B1'].value == 42
+            restored.close()
             with warnings.catch_warnings():
                 warnings.filterwarnings('error', message='Glyph .* missing from font.*')
                 fig, ax = plt.subplots()
@@ -59,6 +74,12 @@ class AndroidWorkspacePythonExecutorTest {
                 ax.set_ylabel('行')
                 fig.savefig('/workspace/plot.png')
                 plt.close(fig)
+            from PIL import Image, ImageStat
+            with Image.open('/workspace/plot.png') as image:
+                image.load()
+                assert image.format == 'PNG'
+                assert image.width > 100 and image.height > 100
+                assert max(ImageStat.Stat(image.convert('RGB')).var) > 1
             print('ok')
         """.trimIndent())
         assertEquals(result.stderr, 0, result.exitCode)

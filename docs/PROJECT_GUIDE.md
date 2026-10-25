@@ -181,6 +181,8 @@ sdk.dir=C\:\\Android\\Sdk
 ```
 
 3. 完整 APK 构建需要由项目维护者提供自己的 `app/google-services.json`，不要使用随机配置或提交私有配置。
+
+Python 依赖打包使用 `prune<Variant>PythonRequirements` Sync 任务，将 Chaquopy 安装输出复制到 `app/build/python/prunedRequirements/<variant>/`，仅排除 numpy、pandas、matplotlib、mpl_toolkits 的 `tests` 目录，再生成 `.imy` 和 `build.json`。保留原安装输出、`testing`、`_testing`、字体和运行库；依赖升级或 Chaquopy 插件升级时需复核该任务衔接，并执行 `AndroidWorkspacePythonExecutorTest` 验证计算、中文绘图和 Excel 读写。Android 语言资源只打包应用已有的英语、日语、韩语、俄语和简繁中文。
 4. 在仓库根执行：
 
 ```bash
