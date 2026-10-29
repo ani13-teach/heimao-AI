@@ -108,6 +108,18 @@ class TimeReminderTransformerTest {
         assertEquals("Msg 3", getMessageText(result[5]))
     }
 
+    @Test fun `synthetic summaries never receive reminders and real reminder identity is stable`() {
+        val summary = UIMessage.user("summary").copy(isSynthetic = true, createdAt = LocalDateTime(1970, 1, 1, 0, 0))
+        val source = userMessage("real", LocalDateTime(2026, 2, 22, 10, 0))
+        val result = applyTimeReminder(listOf(summary, source))
+        assertEquals(listOf(summary), applyTimeReminder(listOf(summary)))
+        assertEquals(summary, result.first())
+        assertEquals(timeReminderId(source.id), result[1].id)
+        assertEquals(source.createdAt, result[1].createdAt)
+        assertEquals(result, applyTimeReminder(listOf(summary, source)))
+        assertFalse(getMessageText(result[1]).contains("1970"))
+    }
+
     @Test
     fun `empty messages should return empty`() {
         val result = applyTimeReminder(emptyList())

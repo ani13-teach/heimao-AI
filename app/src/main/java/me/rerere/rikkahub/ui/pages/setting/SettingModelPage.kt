@@ -1,27 +1,20 @@
 package me.rerere.rikkahub.ui.pages.setting
 
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.BottomAppBar
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
-import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.LargeFlexibleTopAppBar
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBarItem
@@ -29,7 +22,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -42,31 +34,28 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
-import me.rerere.ai.provider.Model
+import me.rerere.ai.provider.Modality
 import me.rerere.ai.provider.ModelType
-import me.rerere.ai.provider.ProviderSetting
+import me.rerere.ai.registry.ModelRegistry
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.AiBrain01
 import me.rerere.hugeicons.stroke.AiEditing
-import me.rerere.hugeicons.stroke.ArrowRight01
-import me.rerere.hugeicons.stroke.Cancel01
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.datastore.DEFAULT_AUTO_MODEL_ID
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.validateContextCompressionSettings
-import me.rerere.rikkahub.ui.components.ai.ModelListSheet
-import me.rerere.rikkahub.ui.components.ai.rememberModelListState
+import me.rerere.rikkahub.ui.components.ai.ModelChainSettingItem
 import me.rerere.rikkahub.ui.components.nav.BackButton
-import me.rerere.rikkahub.ui.components.ui.CardGroup
 import me.rerere.rikkahub.ui.theme.CustomColors
 import me.rerere.rikkahub.utils.plus
 import org.koin.androidx.compose.koinViewModel
-import kotlin.uuid.Uuid
 
 @Composable
 fun SettingModelPage(vm: SettingVM = koinViewModel()) {
@@ -125,89 +114,89 @@ private fun ModelSettingsPage(settings: Settings, vm: SettingVM, contentPadding:
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         item {
-            ModelSettingItem(
+            ModelChainSettingItem(
                 title = stringResource(R.string.setting_model_page_chat_model),
                 description = stringResource(R.string.setting_model_page_chat_model_desc),
-                modelId = settings.chatModelId,
+                primaryModelId = settings.chatModelId,
+                fallbackModelIds = emptyList(),
                 providers = settings.providers,
-                onSelect = { vm.updateSettings(settings.copy(chatModelId = it.id)) },
+                singleModel = true,
+                onSave = { primary, _ ->
+                    if (primary != null) vm.updateSettings(settings.copy(chatModelId = primary))
+                },
             )
         }
         item {
-            ModelSettingItem(
+            ModelChainSettingItem(
                 title = stringResource(R.string.setting_model_page_fast_model),
                 description = stringResource(R.string.setting_model_page_fast_model_desc),
-                modelId = settings.fastModelId,
+                primaryModelId = settings.fastModelId,
+                fallbackModelIds = settings.fastFallbackModelIds,
                 providers = settings.providers,
-                onSelect = { vm.updateSettings(settings.copy(fastModelId = it.id)) },
+                onSave = { primary, fallbacks ->
+                    if (primary != null) vm.updateSettings(settings.copy(fastModelId = primary, fastFallbackModelIds = fallbacks))
+                },
             )
         }
         item {
-            ModelSettingItem(
+            ModelChainSettingItem(
                 title = stringResource(R.string.setting_model_page_title_model),
                 description = stringResource(R.string.setting_model_page_title_model_desc),
-                modelId = settings.titleModelId,
-                providers = settings.providers,
-                onSelect = { vm.updateSettings(settings.copy(titleModelId = it.id)) },
-                onClear = { vm.updateSettings(settings.copy(titleModelId = null)) },
-            )
-        }
-        item {
-            FallbackModelSettingItem(
-                title = stringResource(R.string.setting_model_page_title_fallback),
-                description = stringResource(R.string.setting_model_page_fallback_desc),
-                primaryModelId = settings.titleModelId ?: settings.fastModelId,
+                primaryModelId = settings.titleModelId,
                 fallbackModelIds = settings.titleFallbackModelIds,
                 providers = settings.providers,
-                onChange = { vm.updateSettings(settings.copy(titleFallbackModelIds = it)) },
+                accept = { it.type == ModelType.CHAT && !ModelRegistry.QWEN_MT.match(it.modelId) },
+                defaultModelLabel = "使用快速模型",
+                inheritedModelId = settings.fastModelId,
+                inheritedFallbackIds = settings.fastFallbackModelIds,
+                inheritFallbacks = true,
+                onSave = { primary, fallbacks ->
+                    vm.updateSettings(settings.copy(titleModelId = primary, titleFallbackModelIds = fallbacks))
+                },
             )
         }
+        item { SuggestionModelSettingItem(settings = settings, vm = vm) }
         item {
-            SuggestionModelSettingItem(
-                settings = settings,
-                vm = vm,
-            )
-        }
-        item {
-            ModelSettingItem(
+            ModelChainSettingItem(
                 title = stringResource(R.string.setting_model_page_translate_model),
                 description = stringResource(R.string.setting_model_page_translate_model_desc),
-                modelId = settings.translateModeId,
-                providers = settings.providers,
-                onSelect = { vm.updateSettings(settings.copy(translateModeId = it.id)) },
-            )
-        }
-        item {
-            FallbackModelSettingItem(
-                title = stringResource(R.string.setting_model_page_translate_fallback),
-                description = stringResource(R.string.setting_model_page_fallback_desc),
                 primaryModelId = settings.translateModeId,
                 fallbackModelIds = settings.translateFallbackModelIds,
                 providers = settings.providers,
-                onChange = { vm.updateSettings(settings.copy(translateFallbackModelIds = it)) },
+                onSave = { primary, fallbacks ->
+                    if (primary != null) vm.updateSettings(settings.copy(translateModeId = primary, translateFallbackModelIds = fallbacks))
+                },
             )
         }
         item {
-            ModelSettingItem(
+            ModelChainSettingItem(
                 title = stringResource(R.string.setting_model_page_ocr_model),
                 description = stringResource(R.string.setting_model_page_ocr_model_desc),
-                modelId = settings.ocrModelId,
+                primaryModelId = settings.ocrModelId,
+                fallbackModelIds = settings.ocrFallbackModelIds,
                 providers = settings.providers,
-                onSelect = { vm.updateSettings(settings.copy(ocrModelId = it.id)) },
+                accept = { it.type == ModelType.CHAT && Modality.IMAGE in it.inputModalities },
+                onSave = { primary, fallbacks ->
+                    if (primary != null) vm.updateSettings(settings.copy(ocrModelId = primary, ocrFallbackModelIds = fallbacks))
+                },
             )
         }
         item {
-            ModelSettingItem(
+            ModelChainSettingItem(
                 title = stringResource(R.string.setting_model_page_compress_model),
                 description = stringResource(R.string.setting_model_page_compress_model_desc),
-                modelId = settings.compressModelId,
+                primaryModelId = settings.compressModelId,
+                fallbackModelIds = settings.compressFallbackModelIds,
                 providers = settings.providers,
-                onSelect = { vm.updateSettings(settings.copy(compressModelId = it.id)) },
+                defaultModelLabel = "使用当前聊天模型",
+                defaultModelId = DEFAULT_AUTO_MODEL_ID,
+                accept = { it.type == ModelType.CHAT },
+                onSave = { primary, fallbacks ->
+                    if (primary != null) vm.updateSettings(settings.copy(compressModelId = primary, compressFallbackModelIds = fallbacks))
+                },
             )
         }
-        item {
-            ContextCompressionSettingItem(settings = settings, vm = vm)
-        }
+        item { ContextCompressionSettingItem(settings = settings, vm = vm) }
     }
 }
 
@@ -235,9 +224,9 @@ private fun ContextCompressionSettingItem(settings: Settings, vm: SettingVM) {
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text("自动上下文压缩", style = MaterialTheme.typography.titleMedium)
+            Text("自动压缩", style = MaterialTheme.typography.titleMedium)
             Text(
-                "所有助手和供应商共用。输入最多 7 位数字，两项一起保存。0 关闭自动压缩；开启时压缩后上限须小于触发长度。token 按本地统一规则估算，并非供应商的精确计数；上限包含摘要、系统提示词、工具、记忆和当前问题等全部请求内容。",
+                "达到触发长度后，将旧摘要与较早历史合并为一份摘要，保留当前轮和最近一个完整轮；未触发时沿用原摘要。所有助手和供应商共用，两项一起保存。0 停止更新摘要，已有摘要继续使用。压缩后上限须小于触发长度；token 为本地估算，上限包含摘要、系统提示词、工具、记忆和当前问题等全部请求内容。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -309,259 +298,41 @@ private fun ContextCompressionSettingItem(settings: Settings, vm: SettingVM) {
 }
 
 @Composable
-private fun SuggestionModelSettingItem(
-    settings: Settings,
-    vm: SettingVM,
-) {
-    val title = stringResource(R.string.setting_model_page_suggestion_model)
-    val state = rememberModelListState(
-        modelId = settings.suggestionModelId,
-        providers = settings.providers,
-        type = ModelType.CHAT,
-    )
-
-    Column {
-        CardGroup(title = { Text(title) }) {
-            item(
-                headlineContent = { Text(stringResource(R.string.setting_model_page_enable_suggestion)) },
-                trailingContent = {
-                    Switch(
-                        checked = settings.enableSuggestion,
-                        onCheckedChange = {
-                            vm.updateSettings(settings.copy(enableSuggestion = it))
-                        }
-                    )
-                },
-            )
-            if (settings.enableSuggestion) {
-                item(
-                    onClick = { state.open() },
-                    headlineContent = { Text(title) },
-                    trailingContent = {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp),
-                        ) {
-                            Text(
-                                text = state.currentModel?.displayName
-                                    ?: stringResource(R.string.model_list_select_model),
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            if (state.currentModel != null) {
-                                IconButton(
-                                    onClick = { vm.updateSettings(settings.copy(suggestionModelId = null)) },
-                                    modifier = Modifier.size(20.dp),
-                                ) {
-                                    Icon(HugeIcons.Cancel01, contentDescription = null, modifier = Modifier.size(14.dp))
-                                }
-                            } else {
-                                Icon(
-                                    HugeIcons.ArrowRight01,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(16.dp),
-                                )
-                            }
-                        }
-                    },
+private fun SuggestionModelSettingItem(settings: Settings, vm: SettingVM) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Card(colors = CustomColors.cardColorsOnSurfaceContainer) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text(
+                    stringResource(R.string.setting_model_page_enable_suggestion),
+                    modifier = Modifier.weight(1f),
+                )
+                Switch(
+                    checked = settings.enableSuggestion,
+                    onCheckedChange = { vm.updateSettings(settings.copy(enableSuggestion = it)) },
+                    modifier = Modifier.semantics { contentDescription = "启用聊天建议" },
                 )
             }
         }
-        Text(
-            text = stringResource(R.string.setting_model_page_suggestion_model_desc),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
-        )
-    }
-
-    ModelListSheet(state = state, onSelect = { vm.updateSettings(settings.copy(suggestionModelId = it.id)) })
-}
-
-@Composable
-private fun FallbackModelSettingItem(
-    title: String,
-    description: String,
-    primaryModelId: Uuid?,
-    fallbackModelIds: List<Uuid>,
-    providers: List<ProviderSetting>,
-    onChange: (List<Uuid>) -> Unit,
-) {
-    // 备用只从主模型所属的那个供应商里选；换了主模型之后，旧备用可能已经不在同一家
-    val candidates = remember(providers, primaryModelId) {
-        val owner = primaryModelId?.let { id ->
-            providers.firstOrNull { provider -> provider.models.any { it.id == id } }
-        }
-        owner?.models.orEmpty().filter { it.id != primaryModelId && it.type == ModelType.CHAT }
-    }
-    val effective = fallbackModelIds.filter { id -> candidates.any { it.id == id } }
-    var visible by remember { mutableStateOf(false) }
-
-    Column {
-        CardGroup(title = { Text(title) }) {
-            item(
-                onClick = { visible = true },
-                headlineContent = { Text(title) },
-                trailingContent = {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        Text(
-                            text = effective.joinToString(" → ") { id ->
-                                candidates.first { it.id == id }.let { it.displayName.ifBlank { it.modelId } }
-                            }.ifEmpty { stringResource(R.string.setting_model_page_fallback_empty) },
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Icon(
-                            HugeIcons.ArrowRight01,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp),
-                        )
-                    }
+        if (settings.enableSuggestion) {
+            ModelChainSettingItem(
+                title = stringResource(R.string.setting_model_page_suggestion_model),
+                description = stringResource(R.string.setting_model_page_suggestion_model_desc),
+                primaryModelId = settings.suggestionModelId,
+                fallbackModelIds = settings.suggestionFallbackModelIds,
+                providers = settings.providers,
+                accept = { it.type == ModelType.CHAT && !ModelRegistry.QWEN_MT.match(it.modelId) },
+                defaultModelLabel = "使用快速模型",
+                inheritedModelId = settings.fastModelId,
+                inheritedFallbackIds = settings.fastFallbackModelIds,
+                inheritFallbacks = true,
+                onSave = { primary, fallbacks ->
+                    vm.updateSettings(settings.copy(suggestionModelId = primary, suggestionFallbackModelIds = fallbacks))
                 },
             )
         }
-        Text(
-            text = description,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
-        )
     }
-
-    if (!visible) return
-
-    // 点一下加进队列，再点一下移出；顺序就是尝试顺序
-    AlertDialog(
-        onDismissRequest = { visible = false },
-        title = { Text(title) },
-        text = {
-            if (candidates.isEmpty()) {
-                Text(stringResource(R.string.setting_model_page_fallback_no_candidate))
-            } else {
-                LazyColumn(
-                    // 对话框内容必须给上界，否则惰性列表量不到高度
-                    modifier = Modifier.heightIn(max = 360.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                    items(candidates, key = { it.id }) { model ->
-                        val order = effective.indexOf(model.id)
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    onChange(
-                                        if (order >= 0) {
-                                            effective.filterNot { it == model.id }
-                                        } else {
-                                            effective + model.id
-                                        }
-                                    )
-                                },
-                        ) {
-                            Checkbox(checked = order >= 0, onCheckedChange = null)
-                            Column(modifier = Modifier.padding(start = 4.dp)) {
-                                Text(
-                                    text = model.displayName.ifBlank { model.modelId },
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                                if (order >= 0) {
-                                    Text(
-                                        text = stringResource(
-                                            R.string.setting_model_page_fallback_order,
-                                            order + 1,
-                                        ),
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = { visible = false }) {
-                Text(stringResource(android.R.string.ok))
-            }
-        },
-        dismissButton = if (effective.isNotEmpty()) {
-            {
-                TextButton(onClick = { onChange(emptyList()) }) {
-                    Text(stringResource(R.string.setting_model_page_fallback_clear))
-                }
-            }
-        } else {
-            null
-        },
-    )
-}
-
-@Composable
-private fun ModelSettingItem(
-    title: String,
-    description: String,
-    modelId: Uuid?,
-    providers: List<ProviderSetting>,
-    onSelect: (Model) -> Unit,
-    onClear: (() -> Unit)? = null,
-) {
-    val state = rememberModelListState(
-        modelId = modelId,
-        providers = providers,
-        type = ModelType.CHAT,
-    )
-
-    Column {
-        CardGroup(title = { Text(title) }) {
-            item(
-                onClick = { state.open() },
-                headlineContent = { Text(title) },
-                trailingContent = {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        Text(
-                            text = state.currentModel?.displayName
-                                ?: stringResource(R.string.model_list_select_model),
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        if (onClear != null && state.currentModel != null) {
-                            IconButton(onClick = onClear, modifier = Modifier.size(20.dp)) {
-                                Icon(HugeIcons.Cancel01, contentDescription = null, modifier = Modifier.size(14.dp))
-                            }
-                        } else {
-                            Icon(
-                                HugeIcons.ArrowRight01,
-                                contentDescription = null,
-                                modifier = Modifier.size(16.dp),
-                            )
-                        }
-                    }
-                },
-            )
-        }
-        Text(
-            text = description,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
-        )
-    }
-
-    ModelListSheet(state = state, onSelect = onSelect)
 }

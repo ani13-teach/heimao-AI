@@ -40,11 +40,9 @@ import me.rerere.ai.core.Tool
 import me.rerere.ai.provider.BuiltInTools
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
-import me.rerere.ai.provider.ModelType
 import me.rerere.ai.provider.ProviderManager
 import me.rerere.ai.provider.TextGenerationParams
 import me.rerere.ai.provider.generateTextWithModelTransport
-import me.rerere.ai.registry.ModelRegistry
 import me.rerere.ai.ui.ToolApprovalState
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
@@ -52,7 +50,6 @@ import me.rerere.ai.ui.codemodeExecution
 import me.rerere.ai.ui.interruptCodemode
 import me.rerere.ai.ui.canResumeToolExecution
 import me.rerere.ai.ui.finishPendingTools
-import me.rerere.ai.ui.finishReasoning
 import me.rerere.ai.ui.isEmptyInputMessage
 import me.rerere.common.android.Logging
 import me.rerere.rikkahub.AppScope
@@ -62,7 +59,8 @@ import me.rerere.rikkahub.data.ai.GenerationHandler
 import me.rerere.rikkahub.data.ai.cancelRunningCodemode
 import me.rerere.rikkahub.data.ai.codemode.WorkspaceCodemodeRuntime
 import me.rerere.rikkahub.data.ai.codemode.createWorkspaceCodemodeTool
-import me.rerere.rikkahub.data.ai.fallbackCandidates
+import me.rerere.rikkahub.data.ai.titleModelCandidates
+import me.rerere.rikkahub.data.ai.suggestionModelCandidates
 import me.rerere.rikkahub.data.ai.mcp.McpManager
 import me.rerere.rikkahub.data.ai.runWithModelFallback
 import me.rerere.rikkahub.data.ai.toRetryPolicy
@@ -436,7 +434,7 @@ class ChatService(
 
     suspend fun initializeConversation(conversationId: Uuid) {
         val session = getOrCreateSession(conversationId)
-        try {
+        session.initialize {
             val initialPersisted = conversationRepo.getConversationById(conversationId)
             val initialOwner = initialPersisted?.assistantId
                 ?: settingsStore.settingsFlowRaw.first().getCurrentAssistant().id
@@ -458,15 +456,12 @@ class ChatService(
                         )
                     }
                     session.state.value = initializedConversation
-                    if (persistedConversation != null) {
-                        settingsStore.updateAssistant(initializedConversation.assistantId)
-                    }
-                    session.completeInitialization()
                 }
             }
-        } catch (error: Throwable) {
-            session.failInitialization(error)
-            throw error
+        }
+        val conversation = session.state.value
+        if (!conversation.newConversation) {
+            settingsStore.updateAssistant(conversation.assistantId)
         }
     }
 
@@ -1275,21 +1270,19 @@ class ChatService(
                         tool.name !in setOf("context_search", "context_read") || contextTools.any { it === tool }
                     },
             ).onCompletion {
-                // Only this request's selected messages may be finalized.
-                if (generationContext.isActive) {
-                    session.state.update { current ->
-                        if (!request.matches(current)) current else current.copy(
-                            messageNodes = current.messageNodes.map { node ->
-                                val selected = node.currentMessage
-                                node.copy(messages = node.messages.map { message ->
-                                    if (message.id == selected.id && message.id in generatedMessageIds
-                                    ) message.finishReasoning() else message
-                                })
-                            },
-                            updateAt = Instant.now(),
-                        )
+                // Cleanup outlives cancellation without holding up a job joined under mutation locks.
+                val finalization = launchWithConversationReference(conversationId) {
+                    try {
+                        finalizeConversationGeneration(conversationId, request.expected.assistantId) { current ->
+                            request.finishReasoning(current, generatedMessageIds)
+                        }
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
+                        Log.e(TAG, "Failed to finalize generation reasoning", error)
                     }
                 }
+                if (generationContext.isActive) finalization.join()
             }.collect { chunk ->
                 when (chunk) {
                     is GenerationChunk.Messages -> {
@@ -1486,15 +1479,8 @@ class ChatService(
 
         runCatching {
             val settings = settingsStore.settingsFlow.first()
-            val model = settings.findModelById(settings.titleModelId, fallback = settings.fastModelId)
-                ?: return@runCatching
-            val candidates = fallbackCandidates(
-                providers = settings.providers,
-                primaryModel = model,
-                fallbackModelIds = settings.titleFallbackModelIds,
-                // 标题要的是短正文，翻译专模（Qwen MT）不算能用
-                accept = { it.type == ModelType.CHAT && !ModelRegistry.QWEN_MT.match(it.modelId) },
-            )
+            val candidates = settings.titleModelCandidates()
+            if (candidates.isEmpty()) return@runCatching
             val retryPolicy = settings.toRetryPolicy()
             val prompt = settings.titlePrompt.applyPlaceholders(
                 "locale" to Locale.getDefault().displayName,
@@ -1551,33 +1537,29 @@ class ChatService(
         runCatching {
             val settings = settingsStore.settingsFlow.first()
             if (!settings.enableSuggestion) return@runCatching
-            val model = settings.findModelById(settings.suggestionModelId, fallback = settings.fastModelId)
-                ?: return@runCatching
-            val provider = model.findProvider(settings.providers) ?: return@runCatching
-
-            sessions[conversationId]?.let { session ->
-                updateConversation(
-                    conversationId,
-                    session.state.value.copy(chatSuggestions = emptyList())
-                )
-            }
-
-            val providerHandler = providerManager.getProviderByType(provider)
-            val resultMessages = providerHandler.generateTextWithModelTransport(
-                providerSetting = provider,
-                messages = listOf(
-                    UIMessage.user(
-                        settings.suggestionPrompt.applyPlaceholders(
-                            "locale" to Locale.getDefault().displayName,
-                            "content" to conversation.currentMessages
-                                .takeLast(8).joinToString("\n\n") { it.summaryAsText(maxLength = 500) }),
-                    )
-                ),
-                params = backgroundTextGenerationParams(model),
+            val candidates = settings.suggestionModelCandidates()
+            if (candidates.isEmpty()) return@runCatching
+            val retryPolicy = settings.toRetryPolicy()
+            val prompt = settings.suggestionPrompt.applyPlaceholders(
+                "locale" to Locale.getDefault().displayName,
+                "content" to conversation.currentMessages
+                    .takeLast(8).joinToString("\n\n") { it.summaryAsText(maxLength = 500) },
             )
-            val suggestions =
-                resultMessages.last().toText().split("\n").map { it.trim() }
-                    .filter { it.isNotBlank() }
+            val suggestions = runWithModelFallback(candidates) { candidate ->
+                val provider = candidate.findProvider(settings.providers)
+                    ?: return@runWithModelFallback null
+                val providerHandler = providerManager.getProviderByType(provider)
+                val resultMessages = providerHandler.generateTextWithModelTransport(
+                    providerSetting = provider,
+                    messages = listOf(UIMessage.user(prompt)),
+                    params = backgroundTextGenerationParams(candidate),
+                    responseMessages = listOf(UIMessage.assistant("")),
+                    retryPolicy = retryPolicy,
+                )
+                resultMessages.lastOrNull()?.toText().orEmpty().lineSequence()
+                    .map { it.trim() }.filter { it.isNotBlank() }.take(10).toList()
+                    .takeIf { it.isNotEmpty() }
+            }
 
             val latestConversation = conversationRepo.getConversationById(conversationId)
                 ?: sessions[conversationId]?.state?.value
@@ -1591,6 +1573,7 @@ class ChatService(
                 )
             )
         }.onFailure {
+            if (it is CancellationException) throw it
             it.printStackTrace()
         }
     }
@@ -1867,6 +1850,23 @@ class ChatService(
         }
     }
 
+    private suspend fun finalizeConversationGeneration(
+        conversationId: Uuid,
+        owner: Uuid,
+        transform: (Conversation) -> Conversation,
+    ) {
+        workspaceAccessGate.withAssistantMutation(owner.toString()) {
+            val session = sessions[conversationId] ?: return@withAssistantMutation
+            finalizeGenerationState(
+                mutex = conversationMoveLocks.computeIfAbsent(conversationId) { Mutex() },
+                state = session.state,
+                owner = owner,
+                transform = transform,
+                persist = { saveConversationLocked(conversationId, it) },
+            )
+        }
+    }
+
     private suspend fun saveConversationLocked(conversationId: Uuid, conversation: Conversation) {
         requireConversationAvailable(conversationId)
         val exists = conversationRepo.existsConversationById(conversation.id)
@@ -2124,12 +2124,20 @@ class ChatService(
     // 停止当前会话生成任务（不清理会话缓存）
     suspend fun stopGeneration(conversationId: Uuid) {
         val session = sessions[conversationId] ?: return
-        val job = synchronized(session) {
-            // 用户主动停止：队列也停下来，避免刚停就又自动发下一条
+        synchronized(session) {
+            // 用户主动停止：队列也停下来，避免刚停就又自动发下一条。
             session.messageQueue.pause()
-            session.getJob()?.also { it.cancel() }
-        } ?: return
-        runCatching { job.join() }
-        finishInterruptedPendingTools(conversationId, cancelledByUser = true)
+        }
+        val source = session.state.value
+        session.stopGeneration(
+            onStopped = {
+                finalizeConversationGeneration(conversationId, source.assistantId) { current ->
+                    finishStoppedGeneration(source, current) { tool ->
+                        if (tool.codemodeExecution != null || !tool.isExecuted) cancelToolByUser(tool) else tool
+                    }
+                }
+            },
+            onReady = { dispatchNextQueuedMessage(conversationId) },
+        )
     }
 }

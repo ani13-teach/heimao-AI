@@ -3,7 +3,11 @@ package me.rerere.rikkahub.service
 import android.util.Log
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -44,18 +48,55 @@ class ConversationSession(
 
     // ChatVM 创建 session 后才异步加载持久化会话；发送必须等待这一步完成，
     // 否则临时初始值中的 workspaceId=null 可能覆盖新会话的助手默认值。
-    private val initialization = CompletableDeferred<Unit>()
+    private val initializationLock = Any()
+    private var initialization = CompletableDeferred<Unit>()
+    private var initializationClosed = false
+    @Volatile
+    private var initializationJob: Job? = null
+
+    suspend fun initialize(block: suspend () -> Unit) {
+        val (attempt, job) = synchronized(initializationLock) {
+            if (!initializationClosed && initialization.isCancelled) {
+                initialization = CompletableDeferred()
+                initializationJob = null
+            }
+            val attempt = initialization
+            val job = if (!initializationClosed && initializationJob == null && !attempt.isCompleted) {
+                scope.launch(start = CoroutineStart.LAZY) {
+                    try {
+                        block()
+                        attempt.complete(Unit)
+                    } catch (error: Throwable) {
+                        attempt.completeExceptionally(error)
+                    }
+                }.also { task ->
+                    initializationJob = task
+                    task.invokeOnCompletion { error ->
+                        // 旧任务的回调只能结束它自己的初始化尝试。
+                        if (error != null) attempt.completeExceptionally(error)
+                        if (refCount.get() <= 0) scheduleIdleCheck()
+                    }
+                }
+            } else {
+                initializationJob
+            }
+            attempt to job
+        }
+        job?.start()
+        attempt.await()
+    }
 
     suspend fun awaitInitialized() {
-        initialization.await()
+        val attempt = synchronized(initializationLock) { initialization }
+        attempt.await()
     }
 
     fun completeInitialization() {
-        initialization.complete(Unit)
+        synchronized(initializationLock) { initialization.complete(Unit) }
     }
 
     fun failInitialization(error: Throwable) {
-        initialization.completeExceptionally(error)
+        synchronized(initializationLock) { initialization.completeExceptionally(error) }
     }
 
     // 原子引用计数
@@ -69,7 +110,8 @@ class ConversationSession(
     val generationJob: StateFlow<Job?> = _generationJob.asStateFlow()
     val isGenerating: Boolean get() = _generationJob.value?.isActive == true
     val isInUse: Boolean
-        get() = refCount.get() > 0 || _generationJob.value != null ||
+        get() = refCount.get() > 0 || _generationJob.value != null || stoppingJob != null ||
+                initializationJob?.isCompleted == false ||
                 messageQueue.state.value.messages.isNotEmpty()
 
     // 空闲检查任务
@@ -108,10 +150,12 @@ class ConversationSession(
     @Volatile
     private var acceptsGenerationJobs = true
     private val generationJobLock = Any()
+    @Volatile
+    private var stoppingJob: Deferred<Unit>? = null
 
     fun setJob(job: Job?): Boolean {
         val previous = synchronized(generationJobLock) {
-            if (job != null && !acceptsGenerationJobs) {
+            if (job != null && isGenerationPaused) {
                 job.cancel()
                 return false
             }
@@ -132,7 +176,7 @@ class ConversationSession(
     }
 
     /** 会话正处于临时禁生成窗口（搬家、归档等）时为 true。 */
-    val isGenerationPaused: Boolean get() = !acceptsGenerationJobs
+    val isGenerationPaused: Boolean get() = !acceptsGenerationJobs || stoppingJob != null
 
     fun pauseGeneration(): Job? = synchronized(generationJobLock) {
         acceptsGenerationJobs = false
@@ -146,6 +190,34 @@ class ConversationSession(
     }
 
     fun getJob(): Job? = _generationJob.value
+
+    suspend fun stopGeneration(
+        onStopped: suspend () -> Unit,
+        onReady: () -> Unit = {},
+    ) {
+        val stop = synchronized(generationJobLock) {
+            stoppingJob ?: run {
+                val generation = _generationJob.value
+                scope.async(start = CoroutineStart.LAZY) {
+                    generation?.cancelAndJoin()
+                    onStopped()
+                }.also { task ->
+                    stoppingJob = task
+                    task.invokeOnCompletion { error ->
+                        synchronized(generationJobLock) {
+                            if (stoppingJob === task) stoppingJob = null
+                        }
+                        if (error != null) messageQueue.pause()
+                        onReady()
+                        if (refCount.get() <= 0) scheduleIdleCheck()
+                    }
+                }
+            }
+        }
+        // 页面离开只取消等待，应用级任务继续收尾；收尾前不接纳下一轮生成。
+        stop.start()
+        stop.await()
+    }
 
     private fun scheduleIdleCheck() {
         idleCheckJob?.cancel()
@@ -163,10 +235,15 @@ class ConversationSession(
     }
 
     fun cleanup() {
+        stoppingJob?.cancel()
         _generationJob.value?.cancel()
         _generationJob.value = null
         idleCheckJob?.cancel()
         idleCheckJob = null
-        initialization.cancel()
+        synchronized(initializationLock) {
+            initializationClosed = true
+            initialization.cancel()
+            initializationJob?.cancel()
+        }
     }
 }

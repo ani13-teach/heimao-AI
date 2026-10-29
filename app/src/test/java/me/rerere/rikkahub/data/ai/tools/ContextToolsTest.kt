@@ -91,6 +91,58 @@ class ContextToolsTest {
         assertNotEquals(first.getValue("items"), second.getValue("items"))
         assertFalse(second.getValue("truncated").jsonPrimitive.boolean)
     }
+    @Test fun `search hides covered snapshots but old IDs and their cursors remain readable`() = runBlocking {
+        val (c, old) = fixture("needle ".repeat(3000))
+        val merged = old.copy(id = Uuid.random(), summary = "new needle facts", formatVersion = 2, createdAt = old.createdAt + 1)
+        var blocks = listOf(old)
+        fun tools() = createContextTools(c.assistantId, c.id, { c }, { blocks }).associateBy { it.name }
+        val first = tools().getValue("context_read").call(buildJsonObject {
+            put("block_id", old.id.toString()); put("view", "original")
+        })
+        val next = first.getValue("next_cursor").jsonPrimitive.content
+        blocks = listOf(old, merged)
+        val activeTools = tools()
+        val search = activeTools.getValue("context_search").call(buildJsonObject { put("query", "needle") })
+        assertEquals(listOf(merged.id.toString()), search.getValue("items").jsonArray.map {
+            it.jsonObject.getValue("block_id").jsonPrimitive.content
+        })
+        val resumed = activeTools.getValue("context_read").call(buildJsonObject {
+            put("block_id", old.id.toString()); put("view", "original"); put("cursor", next)
+        })
+        assertEquals("OK", resumed.getValue("status").jsonPrimitive.content)
+        val oldSummary = tools().getValue("context_read").call(buildJsonObject { put("block_id", old.id.toString()) })
+        assertEquals(old.summary, oldSummary.getValue("content").jsonPrimitive.content)
+        val originalSearch = tools().getValue("context_search").call(buildJsonObject {
+            put("query", "needle"); put("scope", "original")
+        })
+        assertEquals(1, originalSearch.getValue("items").jsonArray.size)
+    }
+
+    @Test fun `search and read cursors bind summary contents not only source hash`() = runBlocking {
+        val (c, base) = fixture()
+        var block = base.copy(summary = "needle ".repeat(3000), formatVersion = 2)
+        fun tools() = createContextTools(c.assistantId, c.id, { c }, { listOf(block) }).associateBy { it.name }
+        val read = tools().getValue("context_read").call(buildJsonObject { put("block_id", block.id.toString()) })
+        val readCursor = read.getValue("next_cursor").jsonPrimitive.content
+        block = block.copy(summary = "changed " + block.summary)
+        val stale = tools().getValue("context_read").call(buildJsonObject {
+            put("block_id", block.id.toString()); put("cursor", readCursor)
+        })
+        assertEquals("STALE", stale.getValue("status").jsonPrimitive.content)
+        val second = base.copy(id = Uuid.random(), sources = c.messageNodes.subList(2, 4).map {
+            ContextBlockSource(it.id, it.currentMessage.id)
+        }, sourceHash = contextSourceHash(c.currentMessages.subList(2, 4)),
+            prefixHash = contextSourceHash(c.currentMessages.take(4)), summary = "needle second")
+        var searchable = listOf(block, second)
+        fun searchTool() = createContextTools(c.assistantId, c.id, { c }, { searchable }).first()
+        val page = searchTool().call(buildJsonObject { put("query", "needle"); put("limit", 1) })
+        val searchCursor = page.getValue("next_cursor").jsonPrimitive.content
+        searchable = listOf(block.copy(summary = "new needle"), second)
+        assertEquals("STALE", searchTool().call(buildJsonObject {
+            put("query", "needle"); put("limit", 1); put("cursor", searchCursor)
+        }).getValue("status").jsonPrimitive.content)
+    }
+
     @Test fun `bad input never coerces arrays or wrong types`() = runBlocking {
         val (c, b) = fixture()
         val tool = createContextTools(c.assistantId, c.id, { c }, { listOf(b) }).first()

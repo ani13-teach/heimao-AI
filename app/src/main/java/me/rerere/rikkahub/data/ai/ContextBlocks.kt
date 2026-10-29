@@ -7,6 +7,7 @@ import me.rerere.ai.ui.ToolApprovalState
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.withoutCodemodeTrace
+import me.rerere.rikkahub.data.ai.transformers.timeReminderId
 import me.rerere.rikkahub.data.datastore.validateContextCompressionSettings
 import me.rerere.rikkahub.data.model.ContextBlock
 import me.rerere.rikkahub.data.model.ContextBlockSource
@@ -16,8 +17,8 @@ import java.util.UUID
 import kotlin.coroutines.coroutineContext
 import kotlin.uuid.Uuid
 
-/** A block is tied to the selected node/message path, including the prefix before its sources. */
-internal fun activeContextBlocks(
+/** Validate provenance independently of which immutable snapshot is currently sent. */
+internal fun validContextBlocks(
     conversation: Conversation,
     messages: List<UIMessage>,
     blocks: List<ContextBlock>,
@@ -28,12 +29,10 @@ internal fun activeContextBlocks(
     }
     if (selected.map { it.first.messageId }.distinct().size != selected.size ||
         messages.map { it.id }.distinct().size != messages.size) return emptyList()
-    val occupied = mutableSetOf<ContextBlockSource>()
-    return blocks.sortedWith(compareBy<ContextBlock> { it.createdAt }.thenBy { it.id.toString() })
-        .filter { block ->
-            if (block.formatVersion != 1 || block.conversationId != conversation.id ||
+    return blocks.distinctBy { it.id }.filter { block ->
+            if (block.formatVersion !in 1..2 || block.conversationId != conversation.id ||
                 block.assistantId != conversation.assistantId || block.summary.isBlank() ||
-                block.sources.isEmpty() || block.sources.any { it in occupied }) return@filter false
+                block.sources.isEmpty()) return@filter false
             val start = selected.indexOfFirst { it.first == block.sources.first() }
             val end = start + block.sources.size
             if (start < 0 || end > selected.size ||
@@ -46,9 +45,29 @@ internal fun activeContextBlocks(
                 contextSourceHash(selected.subList(start, end).map { it.second }) != block.sourceHash ||
                 contextSourceHash(selected.take(end).map { it.second }) != block.prefixHash ||
                 input.none { it.role != MessageRole.SYSTEM }) return@filter false
-            occupied.addAll(block.sources)
             true
         }.sortedBy { block -> selected.indexOfFirst { it.first == block.sources.first() } }
+}
+
+/** Prefer covering v2 snapshots; an overlapping rejected block leaves its uncovered originals visible. */
+internal fun activeContextBlocks(
+    conversation: Conversation,
+    messages: List<UIMessage>,
+    blocks: List<ContextBlock>,
+): List<ContextBlock> {
+    val valid = validContextBlocks(conversation, messages, blocks)
+    val occupied = mutableSetOf<ContextBlockSource>()
+    val priority = valid.filter { it.formatVersion == 2 }.sortedWith(
+        compareByDescending<ContextBlock> { it.sources.size }.thenByDescending { it.createdAt }.thenBy { it.id.toString() }
+    ) + valid.filter { it.formatVersion == 1 }.sortedWith(
+        compareBy<ContextBlock> { it.createdAt }.thenBy { it.id.toString() }
+    )
+    return priority.filter { block ->
+        if (block.sources.any { it in occupied }) false else {
+            occupied.addAll(block.sources)
+            true
+        }
+    }.sortedBy { block -> messages.indexOfFirst { it.id == block.sources.first().messageId } }
 }
 
 private fun ContextBlock.asMessage(): UIMessage =
@@ -63,21 +82,41 @@ internal fun projectContextBlocks(messages: List<UIMessage>, blocks: List<Contex
     blocks.sortedWith(compareBy<ContextBlock> { it.createdAt }.thenBy { it.id.toString() }).forEach { block ->
         val ids = block.sources.map { it.messageId }
         val start = messages.indexOfFirst { it.id == ids.firstOrNull() }
-        if (ids.isEmpty() || start < 0 || start + ids.size > messages.size ||
-            messages.subList(start, start + ids.size).map { it.id } != ids ||
+        if (ids.isEmpty() || start < 0 || start + ids.size > messages.size) return@forEach
+        val present = messages.subList(start, start + ids.size)
+        if (present.map { it.id } != ids ||
             ids.any { it in covered }) return@forEach
-        val first = messages.subList(start, start + ids.size).firstOrNull { it.role != MessageRole.SYSTEM }
+        val first = present.firstOrNull { it.role != MessageRole.SYSTEM }
             ?: return@forEach
         replacements[first.id] = block
         covered.addAll(ids)
     }
+    val inserted = mutableSetOf<Uuid>()
     return buildList {
         messages.forEach { message ->
             if (message.role == MessageRole.SYSTEM) add(message)
-            else if (message.id in replacements) add(replacements.getValue(message.id).asMessage())
-            else if (message.id !in covered) add(message)
+            else if (message.id in replacements) {
+                val block = replacements.getValue(message.id)
+                if (inserted.add(block.id)) add(block.asMessage())
+            } else if (message.id !in covered) add(message)
         }
     }
+}
+
+/** Covered originals never reach input transforms; immutable summaries are restored afterward. */
+internal suspend fun transformContextBlockInput(
+    messages: List<UIMessage>,
+    blocks: List<ContextBlock>,
+    transform: suspend (List<UIMessage>) -> List<UIMessage>,
+): List<UIMessage> {
+    val projected = projectContextBlocks(messages, blocks)
+    val summaries = projected.filter { message -> blocks.any { it.id == message.id } }.associateBy { it.id }
+    check(summaries.size == blocks.size) { "摘要的完整连续来源不可用，无法安全投影上下文" }
+    val transformed = transform(projected)
+    check(blocks.all { block -> transformed.count { it.id == block.id } == 1 }) {
+        "输入转换丢失或复制了摘要，无法安全复用上下文"
+    }
+    return transformed.map { summaries[it.id] ?: it }
 }
 
 private data class ContextRound(val start: Int, val end: Int, val complete: Boolean)
@@ -144,10 +183,14 @@ internal fun legacyContextBlock(conversation: Conversation, messages: List<UIMes
     return null
 }
 
-internal data class BlockCompactionResult(val prompt: LogicalPrompt, val blocks: List<ContextBlock>)
+internal data class BlockCompactionResult(
+    val prompt: LogicalPrompt,
+    /** Newly created immutable snapshots, not the final provider selection. */
+    val blocks: List<ContextBlock>,
+    val activeBlocks: List<ContextBlock>,
+)
 
-/** Adds disjoint blocks atomically. Existing summaries are never used as summarizer input. */
-@Suppress("DEPRECATION")
+/** Roll the prior summary and newly eligible originals into one immutable snapshot. */
 internal suspend fun compactContextBlocks(
     prompt: LogicalPrompt,
     conversation: Conversation,
@@ -156,111 +199,143 @@ internal suspend fun compactContextBlocks(
     triggerTokens: Int,
     targetTokens: Int,
     maxSourceTokens: Int = 16_000,
+    rebuildPrompt: (suspend (List<ContextBlock>) -> LogicalPrompt)? = null,
     summarize: suspend (String, Int) -> String,
 ): BlockCompactionResult {
     validateContextCompressionSettings(triggerTokens, targetTokens)?.let { error(it) }
     coroutineContext.ensureActive()
-    // The caller has already projected active existing blocks before applying transformers.
+    val active = activeContextBlocks(conversation, messages, existingBlocks)
     if (triggerTokens == 0 || estimatePromptTokens(prompt) < triggerTokens) {
-        return BlockCompactionResult(prompt, emptyList())
+        return BlockCompactionResult(prompt, emptyList(), active)
     }
     require(maxSourceTokens > 0) { "压缩来源分块上限必须大于 0" }
     val sourceLimit = minOf(maxSourceTokens, 16_000)
-    val active = activeContextBlocks(conversation, messages, existingBlocks)
-    val occupied = active.flatMap { it.sources }.map { it.messageId }.toSet()
     val protected = protectionStart(messages)
     val historyIds = prompt.history.filter { it.role != MessageRole.SYSTEM }.map { it.id }.toSet()
     val outsideIds = (prompt.system + prompt.transientContext + prompt.memorySnapshot + prompt.memoryDelta + prompt.memory +
         prompt.claudeMemoryDelta + prompt.currentToolLoop + listOfNotNull(prompt.latestUser))
         .map { it.id }.toSet()
-    val candidates = contextRounds(messages).filter { round ->
-        val source = messages.subList(round.start, round.end)
-        val ids = source.filter { it.role != MessageRole.SYSTEM }.map { it.id }
-        round.complete && round.end <= protected && source.none { it.id in occupied } &&
-            ids.isNotEmpty() && ids.all { it in historyIds && it !in outsideIds }
-    }.mapNotNull { round ->
-        val source = messages.subList(round.start, round.end)
-        val sources = source.map { message ->
-            val node = conversation.messageNodes.firstOrNull { it.messages.getOrNull(it.selectIndex)?.id == message.id }
-                ?: return@mapNotNull null
-            ContextBlockSource(node.id, message.id)
+    val bySource = active.flatMap { block -> block.sources.map { it.messageId to block } }.toMap()
+    val rounds = contextRounds(messages).filter { it.start < protected }
+    // A pending tool turn is a hard boundary, not a hole that a rolling snapshot may span.
+    val eligible = rounds.dropWhile { !it.complete }.takeWhile { round ->
+        round.complete && round.end <= protected && messages.subList(round.start, round.end).all { message ->
+            if (message.role == MessageRole.SYSTEM) true else {
+                val sentId = bySource[message.id]?.id ?: message.id
+                sentId in historyIds && sentId !in outsideIds
+            }
         }
-        val end = conversation.messageNodes.indexOfFirst { it.id == sources.last().nodeId } + 1
-        val block = ContextBlock(
-            conversationId = conversation.id, assistantId = conversation.assistantId,
-            sources = sources, sourceHash = contextSourceHash(source),
-            prefixHash = contextSourceHash(conversation.currentMessages.take(end)), summary = "",
-        )
-        // Check path contiguity and selected content before any model call.
-        if (activeContextBlocks(conversation, messages, listOf(block.copy(summary = "validation"))).isEmpty()) null
-        else block to source
     }
-    check(candidates.isNotEmpty()) { "没有可压缩的完整历史用户轮，无法满足上下文预算" }
-
-    val systemIds = messages.filter { it.role == MessageRole.SYSTEM }.map { it.id }.toSet()
-    fun replace(history: List<UIMessage>, block: ContextBlock): List<UIMessage> {
-        val ids = block.sources.map { it.messageId }.filter { it !in systemIds }.toSet()
+    check(eligible.isNotEmpty()) { "没有可压缩的完整历史用户轮，无法满足上下文预算" }
+    var start = eligible.first().start
+    val end = eligible.last().end
+    // Legacy prefix snapshots may include leading SYSTEM messages before the first user turn.
+    active.filter { block ->
+        val first = messages.indexOfFirst { it.id == block.sources.first().messageId }
+        val last = first + block.sources.size
+        first < start && last > start && last <= end
+    }.forEach { block -> start = messages.indexOfFirst { it.id == block.sources.first().messageId } }
+    val source = messages.subList(start, end)
+    val ids = source.map { it.id }.toSet()
+    val merged = active.filter { block -> block.sources.any { it.messageId in ids } }
+    check(merged.all { block -> block.sources.all { it.messageId in ids } }) {
+        "摘要来源跨越受保护用户轮，无法安全归并"
+    }
+    val sources = source.map { message ->
+        val node = conversation.messageNodes.firstOrNull { it.messages.getOrNull(it.selectIndex)?.id == message.id }
+            ?: error("压缩来源不在当前选中分支")
+        ContextBlockSource(node.id, message.id)
+    }
+    val prefixEnd = conversation.messageNodes.indexOfFirst { it.id == sources.last().nodeId } + 1
+    val emptyBlock = ContextBlock(
+        conversationId = conversation.id, assistantId = conversation.assistantId,
+        sources = sources, sourceHash = contextSourceHash(source),
+        prefixHash = contextSourceHash(conversation.currentMessages.take(prefixEnd)),
+        summary = "", formatVersion = 2,
+    )
+    check(validContextBlocks(conversation, messages, listOf(emptyBlock.copy(summary = "validation"))).size == 1) {
+        "压缩来源不是当前分支的连续原文"
+    }
+    val replaceIds = source.filter { it.role != MessageRole.SYSTEM }.map { it.id }.toSet() +
+        source.filter { it.role == MessageRole.USER && !it.isSynthetic }.map { timeReminderId(it.id) } + merged.map { it.id }
+    fun replace(block: ContextBlock): LogicalPrompt {
         var inserted = false
-        return buildList {
-            history.forEach { message ->
-                if (message.role == MessageRole.SYSTEM || message.id !in ids) add(message)
+        val history = buildList {
+            prompt.history.forEach { message ->
+                if (message.role == MessageRole.SYSTEM || message.id !in replaceIds) add(message)
                 else if (!inserted) {
                     add(block.asMessage())
                     inserted = true
                 }
             }
         }
+        check(inserted) { "没有可替换的完整历史来源" }
+        return prompt.copy(history = history)
     }
-
-    // Reserve only the oldest necessary rounds, not an empty block for every old turn.
-    val planned = mutableListOf<Pair<ContextBlock, List<UIMessage>>>()
-    var minimumHistory = prompt.history
-    var remainingBudget = 0L
-    for (candidate in candidates) {
-        planned.add(candidate)
-        minimumHistory = replace(minimumHistory, candidate.first)
-        remainingBudget = targetTokens.toLong() - estimatePromptTokens(prompt.copy(history = minimumHistory))
-        if (remainingBudget >= planned.size) break
+    val mergedIds = merged.map { it.id }.toSet()
+    val placeholderBlocks = active.filterNot { it.id in mergedIds } + emptyBlock
+    val budgetPrompt = rebuildPrompt?.invoke(placeholderBlocks) ?: replace(emptyBlock)
+    coroutineContext.ensureActive()
+    check(budgetPrompt.history.count { it.id == emptyBlock.id } == 1) {
+        "重建请求必须恰好保留一条摘要占位消息"
     }
-    check(remainingBudget >= planned.size) { "系统、工具、记忆、近期两轮及已有摘要等必留内容已超出压缩目标" }
+    // Joining summary text to the wrapper can split an ASCII run at either boundary.
+    val remainingBudget = targetTokens.toLong() - estimatePromptTokens(budgetPrompt) - 1
+    check(remainingBudget > 0) { "系统、工具、记忆、近期两轮及已有摘要等必留内容已超出压缩目标" }
+    val budget = remainingBudget.coerceAtMost(16_000L).toInt()
+    val rendered = renderCompressionHistory(projectContextBlocks(source, merged)
+        .filter { it.role != MessageRole.SYSTEM }.map { it.withoutCodemodeTrace() })
+    check(rendered.isNotBlank()) { "历史消息没有可总结的内容，无法压缩上下文" }
     var calls = 0
-    suspend fun summarizeChecked(source: String, budget: Int): String {
+    suspend fun summarizeChecked(input: String, outputBudget: Int): String {
         coroutineContext.ensureActive()
         check(calls < 16) { "本次上下文压缩已达到 16 次摘要调用上限" }
-        check(estimateTextTokens(source) <= sourceLimit) { "摘要输入超过来源分块上限" }
+        check(estimateTextTokens(input) <= sourceLimit) { "摘要输入超过来源分块上限" }
         calls++
-        val result = summarize(source, budget)
+        val result = summarize(input, outputBudget)
         coroutineContext.ensureActive()
         check(result.isNotBlank()) { "压缩模型返回了空摘要，请重试或更换压缩模型" }
         return result
     }
-
-    var working = prompt
-    val added = mutableListOf<ContextBlock>()
-    planned.forEachIndexed { index, (emptyBlock, source) ->
-        val budget = (remainingBudget / (planned.size - index)).coerceIn(1L, 1024L).toInt()
-        val rendered = renderCompressionHistory(source.filter { it.role != MessageRole.SYSTEM }.map { it.withoutCodemodeTrace() })
-        check(rendered.isNotBlank()) { "历史消息没有可总结的内容，无法压缩上下文" }
-        val chunks = splitCompressionSource(rendered, sourceLimit)
-        check(calls + chunks.size <= 16) { "完整用户轮所需摘要调用超过本次 16 次上限" }
-        var fragmentBudget = budget.toLong()
-        var summary = chunks.mapIndexed { chunkIndex, chunk ->
-            val share = (fragmentBudget / (chunks.size - chunkIndex)).coerceIn(1L, 1024L).toInt()
+    val chunks = splitCompressionSource(rendered, sourceLimit)
+    check(chunks.size + (if (chunks.size > 1) 1 else 0) <= 16) {
+        "完整历史所需摘要调用超过本次 16 次上限"
+    }
+    val intermediateLimit = minOf(budget, sourceLimit)
+    var fragmentBudget = intermediateLimit - (chunks.size - 1)
+    if (chunks.size > 1) {
+        check(fragmentBudget >= chunks.size) { "中间摘要预算无法为每片预留至少一个 token" }
+    }
+    var summary = if (chunks.size == 1) {
+        summarizeChecked(chunks.single(), budget)
+    } else {
+        chunks.mapIndexed { index, chunk ->
+            val share = fragmentBudget / (chunks.size - index)
             summarizeChecked(chunk, share).also {
-                fragmentBudget = (fragmentBudget - estimateTextTokens(it) - 1).coerceAtLeast(0)
+                val used = estimateTextTokens(it)
+                check(used <= share) { "中间摘要超过分配预算，无法安全归并" }
+                fragmentBudget -= used
             }
-        }.joinToString("\n")
-        // A newly created block gets at most one shrink; no committed block is rewritten.
-        if (estimateTextTokens(summary) > budget) summary = summarizeChecked(summary, budget)
-        check(estimateTextTokens(summary) <= budget) { "摘要收缩后仍超过分块预算，请提高压缩目标或更换压缩模型" }
-        val block = emptyBlock.copy(summary = summary)
-        remainingBudget -= estimateTextTokens(summary)
-        working = working.copy(history = replace(working.history, block))
-        added.add(block)
-        if (estimatePromptTokens(working) <= targetTokens) {
-            coroutineContext.ensureActive()
-            return BlockCompactionResult(working, added.toList())
+        }.joinToString("\n").also {
+            check(estimateTextTokens(it) <= intermediateLimit) { "中间摘要超过最终摘要或来源分块预算" }
         }
     }
-    error("新增摘要累积后仍超出完整请求预算，请提高压缩目标")
+    // Partial summaries are local only. No fragment is persisted if merge/shrink fails.
+    if (chunks.size > 1 || estimateTextTokens(summary) > budget) {
+        summary = summarizeChecked(summary, budget)
+    }
+    check(estimateTextTokens(summary) <= budget) { "摘要收缩后仍超过分块预算，请提高压缩目标或更换压缩模型" }
+    val block = emptyBlock.copy(summary = summary)
+    val working = if (rebuildPrompt == null) replace(block) else {
+        budgetPrompt.copy(history = budgetPrompt.history.map { message ->
+            if (message.id == block.id) block.asMessage() else message
+        })
+    }
+    check(estimatePromptTokens(working) <= targetTokens) { "新增摘要累积后仍超出完整请求预算，请提高压缩目标" }
+    val finalActive = activeContextBlocks(conversation, messages, active + block)
+    check(finalActive.any { it.id == block.id } && merged.none { old -> finalActive.any { it.id == old.id } }) {
+        "滚动摘要未完整替换已覆盖快照"
+    }
+    coroutineContext.ensureActive()
+    return BlockCompactionResult(working, listOf(block), finalActive)
 }

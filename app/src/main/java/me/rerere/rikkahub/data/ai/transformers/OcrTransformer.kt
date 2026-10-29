@@ -2,13 +2,14 @@ package me.rerere.rikkahub.data.ai.transformers
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.provider.Modality
-import me.rerere.ai.provider.Model
+import me.rerere.ai.provider.ModelType
 import me.rerere.ai.provider.ProviderManager
 import me.rerere.ai.provider.TextGenerationParams
 import me.rerere.ai.provider.generateTextWithModelTransport
@@ -16,6 +17,9 @@ import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.common.cache.LruCache
 import me.rerere.common.cache.SingleFileCacheStore
+import me.rerere.rikkahub.data.ai.fallbackCandidates
+import me.rerere.rikkahub.data.ai.runWithModelFallback
+import me.rerere.rikkahub.data.ai.toRetryPolicy
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.datastore.findProvider
@@ -89,24 +93,36 @@ object OcrTransformer : InputMessageTransformer, KoinComponent {
 
         val settings = get<SettingsStore>().settingsFlow.value
         val model = settings.findModelById(settings.ocrModelId) ?: return "[Image]"
-        val providerSetting = model.findProvider(settings.providers) ?: return "[Image]"
-        val provider = get<ProviderManager>().getProviderByType(providerSetting)
-        val resultMessages = provider.generateTextWithModelTransport(
-            providerSetting = providerSetting,
-            messages = listOf(
-                UIMessage.system(settings.ocrPrompt),
-                UIMessage(
-                    role = MessageRole.USER,
-                    parts = listOf(UIMessagePart.Image(part.url))
-                )
-            ),
-            params = TextGenerationParams(
-                model = model,
-                customHeaders = model.customHeaders,
-                customBody = model.customBodies,
-            ),
-        )
-        val content = resultMessages.last().toText().ifBlank { "[ERROR, OCR failed]" }
+        val candidates = fallbackCandidates(
+            settings.providers, model, settings.ocrFallbackModelIds,
+        ) { it.type == ModelType.CHAT && Modality.IMAGE in it.inputModalities }
+        val retryPolicy = settings.toRetryPolicy()
+        val content = runWithModelFallback(candidates) { candidate ->
+            check(candidate.type == ModelType.CHAT && Modality.IMAGE in candidate.inputModalities) {
+                "OCR model must support image input"
+            }
+            val providerSetting = candidate.findProvider(settings.providers)
+                ?: return@runWithModelFallback null
+            val provider = get<ProviderManager>().getProviderByType(providerSetting)
+            val resultMessages = provider.generateTextWithModelTransport(
+                providerSetting = providerSetting,
+                messages = listOf(
+                    UIMessage.system(settings.ocrPrompt),
+                    UIMessage(
+                        role = MessageRole.USER,
+                        parts = listOf(UIMessagePart.Image(part.url))
+                    )
+                ),
+                params = TextGenerationParams(
+                    model = candidate,
+                    customHeaders = candidate.customHeaders,
+                    customBody = candidate.customBodies,
+                ),
+                responseMessages = listOf(UIMessage.assistant("")),
+                retryPolicy = retryPolicy,
+            )
+            resultMessages.lastOrNull()?.toText()?.trim()?.takeIf { it.isNotBlank() }
+        }
         Log.i(TAG, "performOcr: $content")
         val ocrResult = """
             <image_file_ocr>
@@ -119,6 +135,7 @@ object OcrTransformer : InputMessageTransformer, KoinComponent {
         cache.put(part.url, ocrResult)
         return ocrResult
     }.getOrElse {
+        if (it is CancellationException) throw it
         "[ERROR, OCR failed: $it]"
     }
 }

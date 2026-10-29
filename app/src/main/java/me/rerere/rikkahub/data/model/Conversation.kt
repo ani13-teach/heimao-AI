@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.ai.ui.finishReasoning
 import me.rerere.ai.ui.withoutCodemodeTrace
 import me.rerere.ai.util.InstantSerializer
 import me.rerere.rikkahub.data.datastore.DEFAULT_ASSISTANT_ID
@@ -146,6 +147,22 @@ internal data class GenerationMessageSnapshot(
         current.id == expected.id && current.assistantId == expected.assistantId &&
             current.messageNodes.map { it.id to it.currentMessage.sourceIdentity() } ==
             expected.messageNodes.map { it.id to it.currentMessage.sourceIdentity() }
+
+    fun finishReasoning(current: Conversation, generatedMessageIds: Set<Uuid>): Conversation {
+        if (!matches(current)) return current
+        val nodes = current.messageNodes.map { node ->
+            val selected = node.currentMessage
+            node.copy(messages = node.messages.map { message ->
+                if (message.id == selected.id && message.id in generatedMessageIds) {
+                    message.finishReasoning()
+                } else message
+            })
+        }
+        return if (nodes == current.messageNodes) current else current.copy(
+            messageNodes = nodes,
+            updateAt = Instant.now(),
+        )
+    }
 
     fun applyTo(current: Conversation, messages: List<UIMessage>): Conversation {
         check(matches(current)) { "Generation source changed" }

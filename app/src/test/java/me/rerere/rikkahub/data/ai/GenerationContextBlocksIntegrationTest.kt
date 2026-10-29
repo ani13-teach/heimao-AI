@@ -4,6 +4,12 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import me.rerere.rikkahub.data.ai.transformers.applyTimeReminder
+import me.rerere.rikkahub.data.ai.transformers.applyInjections
+import me.rerere.rikkahub.data.ai.transformers.timeReminderId
+import me.rerere.rikkahub.data.model.InjectionPosition
+import me.rerere.rikkahub.data.model.PromptInjection
+import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.provider.LogicalPrompt
 import me.rerere.ai.ui.UIMessage
 import me.rerere.rikkahub.data.model.ContextBlock
@@ -87,6 +93,106 @@ class GenerationContextBlocksIntegrationTest {
         assertTrue(projected.last().id == response.id)
         assertEquals(contextSourceHash(originals.take(2)), result.blocks.single().sourceHash)
         assertEquals(contextSourceHash(originals.take(2)), result.blocks.single().prefixHash)
+    }
+
+    @Test fun `new and reused summaries bypass input transforms while originals still transform`() = runBlocking {
+        val originals = listOf(UIMessage.user("old " + "x".repeat(6000)), UIMessage.assistant("old answer"),
+            UIMessage.user("recent"), UIMessage.assistant("recent answer"), UIMessage.user("current"))
+        val c = conversation(originals)
+        suspend fun transformed(messages: List<UIMessage>, blocks: List<ContextBlock>) =
+            transformContextBlockInput(messages, blocks) { raw ->
+                raw.map { it.copy(parts = listOf(me.rerere.ai.ui.UIMessagePart.Text("transformed:" + it.toText()))) }
+            }
+        val firstPrompt = LogicalPrompt.fromMessages(transformed(originals, emptyList()))
+        val compacted = compactContextBlocks(firstPrompt, c, originals, emptyList(),
+            estimatePromptTokens(firstPrompt), 300,
+            rebuildPrompt = { LogicalPrompt.fromMessages(transformed(originals, it)) }) { _, _ -> "literal {cur_date} {{model_name}}" }
+        val summary = compacted.prompt.history.first()
+        assertFalse(summary.toText().contains("transformed:"))
+        val next = originals + UIMessage.assistant("answer") + UIMessage.user("next")
+        val continued = c.copy(messageNodes = c.messageNodes + next.drop(originals.size).map { MessageNode.of(it) })
+        val reused = transformed(next, activeContextBlocks(continued, next, compacted.activeBlocks))
+        assertEquals(summary, reused.first())
+        assertTrue(reused.drop(1).all { it.toText().startsWith("transformed:") })
+        assertEquals(originals, c.currentMessages)
+    }
+
+    @Test fun `rebuild moves top injection before summary and never repeats covered image processing`() = runBlocking {
+        val oldUser = UIMessage.user("x".repeat(60_000)).copy(parts = listOf(
+            UIMessagePart.Text("x".repeat(60_000)), UIMessagePart.Image("file:///old-image.png")))
+        val originals = listOf(oldUser, UIMessage.assistant("old answer"), UIMessage.user("recent"),
+            UIMessage.assistant("recent answer"), UIMessage.user("now")).mapIndexed { index, message ->
+                message.copy(createdAt = kotlinx.datetime.LocalDateTime(2026, 1, 2, 10, index * 5))
+            }
+        val c = conversation(originals)
+        var imagePasses = 0
+        var transforms = 0
+        suspend fun build(blocks: List<ContextBlock>): LogicalPrompt = LogicalPrompt.fromMessages(
+            transformContextBlockInput(originals, blocks) { input ->
+                transforms++
+                imagePasses += input.count { m -> m.parts.any { it is UIMessagePart.Image } }
+                applyInjections(applyTimeReminder(input), mapOf(InjectionPosition.TOP_OF_CHAT to listOf(
+                    PromptInjection.ModeInjection(position = InjectionPosition.TOP_OF_CHAT, content = "independent mode"))))
+            })
+        val initial = build(emptyList())
+        assertEquals(listOf(timeReminderId(oldUser.id)), initial.toMessages()
+            .filter { it.toText().contains("<time_reminder>") }.map { it.id })
+        var rebuilds = 0
+        var calls = 0
+        var allocatedBudget = 0
+        lateinit var budgetPrompt: LogicalPrompt
+        val target = 3000
+        val compacted = compactContextBlocks(initial, c, originals, emptyList(), estimatePromptTokens(initial), target,
+            rebuildPrompt = { blocks ->
+                rebuilds++
+                assertEquals("", blocks.single().summary)
+                build(blocks).also { budgetPrompt = it }
+            }) { _, budget ->
+                calls++
+                allocatedBudget = budget
+                ("中" + "f".repeat((budget - 6) * 4) + "文").also {
+                    assertEquals(budget, estimateTextTokens(it))
+                }
+            }
+        assertEquals(1, calls)
+        assertEquals(1, rebuilds)
+        assertEquals(2, transforms)
+        assertEquals(target - estimatePromptTokens(budgetPrompt) - 1, allocatedBudget)
+        val rebuilt = compacted.prompt
+        assertEquals(target, estimatePromptTokens(rebuilt))
+        assertFalse(rebuilt.toMessages().any { it.id == timeReminderId(oldUser.id) })
+        assertEquals(listOf(timeReminderId(originals[2].id)), rebuilt.toMessages()
+            .filter { it.toText().contains("<time_reminder>") }.map { it.id })
+        budgetPrompt.history.filter { it.id != compacted.blocks.single().id }.forEach { message ->
+            assertSame(message, rebuilt.history.single { it.id == message.id })
+        }
+        val reused = build(compacted.activeBlocks)
+        assertEquals(1, imagePasses)
+        assertEquals(rebuilt.toMessages().map { it.role to it.toText() }, reused.toMessages().map { it.role to it.toText() })
+        val summaryId = compacted.blocks.single().id
+        assertEquals("independent mode", rebuilt.toMessages().first().toText())
+        assertEquals(summaryId, rebuilt.toMessages()[1].id)
+        assertEquals(rebuilt.toMessages().first { it.id == summaryId }, reused.toMessages().first { it.id == summaryId })
+        val recent = originals[2]
+        assertEquals(rebuilt.toMessages().first { it.id == timeReminderId(recent.id) },
+            reused.toMessages().first { it.id == timeReminderId(recent.id) })
+        assertEquals(3, transforms)
+        assertEquals(1, rebuilds)
+        assertEquals(originals, c.currentMessages)
+    }
+
+    @Test fun `projection rejects gaps and transformations cannot drop or duplicate summary`() = runBlocking {
+        val originals = listOf(UIMessage.user("x".repeat(6000)), UIMessage.assistant("old answer"),
+            UIMessage.user("recent"), UIMessage.assistant("answer"), UIMessage.user("now"))
+        val c = conversation(originals)
+        val p = LogicalPrompt.fromMessages(originals)
+        val result = compactContextBlocks(p, c, originals, emptyList(), estimatePromptTokens(p), 300) { _, _ -> "facts" }
+        val blocks = result.activeBlocks
+        val withGap = listOf(originals[0], UIMessage.user("injected").copy(isSynthetic = true)) + originals.drop(1)
+        assertEquals(withGap, projectContextBlocks(withGap, blocks))
+        assertTrue(runCatching { transformContextBlockInput(withGap, blocks) { it } }.isFailure)
+        assertTrue(runCatching { transformContextBlockInput(originals, blocks) { it.drop(1) } }.isFailure)
+        assertTrue(runCatching { transformContextBlockInput(originals, blocks) { it + it.first() } }.isFailure)
     }
 
     @Test fun `failed block persistence never exposes provider prompt`() = runBlocking {

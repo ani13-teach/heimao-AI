@@ -34,18 +34,33 @@ class ContextBlockRepositoryTest {
                 sources = listOf(ContextBlockSource(Uuid.parse(node.id), Uuid.random())),
                 sourceHash = "source", prefixHash = "prefix", summary = "summary",
             )
-            repository.insertBlocks(listOf(block))
-            assertEquals(listOf(block), repository.getBlocks(block.conversationId))
+            val rolling = block.copy(id = Uuid.random(), formatVersion = 2,
+                summary = "rolling summary", createdAt = block.createdAt + 1)
+            val snapshots = listOf(block, rolling)
+            repository.insertBlocks(snapshots)
+            assertEquals(snapshots, repository.getBlocks(block.conversationId))
+            assertEquals(listOf(1, 2), repository.getBlocks(block.conversationId).map { it.formatVersion })
+            val otherConversation = conversation.copy(id = Uuid.random().toString(),
+                assistantId = Uuid.random().toString(), conversationNumber = 2)
+            db.conversationDao().insert(otherConversation)
+            val otherBlock = rolling.copy(id = Uuid.random(), conversationId = Uuid.parse(otherConversation.id),
+                assistantId = Uuid.parse(otherConversation.assistantId), summary = "other assistant")
+            repository.insertBlocks(listOf(otherBlock))
+            assertEquals(listOf(otherBlock), repository.getBlocks(otherBlock.conversationId))
             db.messageNodeDao().deleteByConversation(conversation.id)
             db.messageNodeDao().insertAll(listOf(node))
-            assertEquals(listOf(block), repository.getBlocks(block.conversationId))
+            assertEquals(snapshots, repository.getBlocks(block.conversationId))
             val fresh = block.copy(id = Uuid.random())
             assertTrue(runCatching { repository.insertBlocks(listOf(fresh, block)) }.isFailure)
-            assertEquals(listOf(block), repository.getBlocks(block.conversationId))
-            assertTrue(runCatching { repository.insertBlocks(listOf(fresh.copy(assistantId = Uuid.random()))) }.isFailure)
-            assertEquals(listOf(block), repository.getBlocks(block.conversationId))
+            assertEquals(snapshots, repository.getBlocks(block.conversationId))
+            assertTrue(runCatching { repository.insertBlocks(listOf(
+                fresh, rolling.copy(id = Uuid.random(), assistantId = otherBlock.assistantId)
+            )) }.isFailure)
+            assertEquals(listOf(otherBlock), repository.getBlocks(otherBlock.conversationId))
+            assertEquals(snapshots, repository.getBlocks(block.conversationId))
             db.conversationDao().delete(conversation)
             assertTrue(repository.getBlocks(block.conversationId).isEmpty())
+            assertEquals(listOf(otherBlock), repository.getBlocks(otherBlock.conversationId))
         } finally {
             db.close()
         }

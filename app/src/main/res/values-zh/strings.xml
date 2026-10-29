@@ -749,13 +749,7 @@
   <string name="setting_model_page_title_model_desc">用于总结对话标题的模型。未设置时使用快速模型</string>
   <string name="setting_model_page_translate_model">翻译模型</string>
   <string name="setting_model_page_translate_model_desc">用于翻译功能的模型</string>
-  <string name="setting_model_page_title_fallback">标题备用模型</string>
-  <string name="setting_model_page_translate_fallback">翻译备用模型</string>
-  <string name="setting_model_page_fallback_desc">主模型失败后按顺序尝试的模型，只能选同一供应商下的模型。每个模型各自按「自动重试」的设置尝试，次数上限不在模型之间共享。留空则不切换</string>
-  <string name="setting_model_page_fallback_empty">未设置</string>
-  <string name="setting_model_page_fallback_clear">清空</string>
-  <string name="setting_model_page_fallback_order">第 %1$d 个</string>
-  <string name="setting_model_page_fallback_no_candidate">这个供应商下没有其它可用作备用的对话模型</string>
+
   <string name="setting_model_page_translate_prompt_vars">变量: 原始文本: {source_text}, 目标语言: {target_lang}</string>
   <string name="setting_page_assistant">助手</string>
   <string name="setting_page_assistant_desc">设置个性化助手 (智能体)</string>

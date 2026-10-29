@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.datastore.core.IOException
 import androidx.datastore.preferences.SharedPreferencesMigration
 import androidx.datastore.preferences.core.MutablePreferences
+import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
@@ -71,7 +72,10 @@ private val Context.settingsStore by preferencesDataStore(
     }
 )
 
-private fun MutablePreferences.writeSettings(settings: Settings) {
+internal fun Preferences.readModelFallbackIds(key: Preferences.Key<String>): List<Uuid> =
+    this[key]?.let { JsonInstant.decodeFromString<List<Uuid>>(it) }.orEmpty()
+
+internal fun MutablePreferences.writeSettings(settings: Settings) {
     val compressionError = validateContextCompressionSettings(
         settings.autoCompressionThresholdTokens,
         settings.autoCompressionTargetTokens,
@@ -91,6 +95,7 @@ private fun MutablePreferences.writeSettings(settings: Settings) {
     this[SettingsStore.FAVORITE_MODELS] = JsonInstant.encodeToString(settings.favoriteModels)
     this[SettingsStore.SELECT_MODEL] = settings.chatModelId.toString()
     this[SettingsStore.FAST_MODEL] = settings.fastModelId.toString()
+    this[SettingsStore.FAST_FALLBACK_MODELS] = JsonInstant.encodeToString(settings.fastFallbackModelIds)
     settings.titleModelId?.let {
         this[SettingsStore.TITLE_MODEL] = it.toString()
     } ?: remove(SettingsStore.TITLE_MODEL)
@@ -102,14 +107,17 @@ private fun MutablePreferences.writeSettings(settings: Settings) {
     settings.suggestionModelId?.let {
         this[SettingsStore.SUGGESTION_MODEL] = it.toString()
     } ?: remove(SettingsStore.SUGGESTION_MODEL)
+    this[SettingsStore.SUGGESTION_FALLBACK_MODELS] = JsonInstant.encodeToString(settings.suggestionFallbackModelIds)
     this[SettingsStore.IMAGE_GENERATION_MODEL] = settings.imageGenerationModelId.toString()
     this[SettingsStore.TITLE_PROMPT] = settings.titlePrompt
     this[SettingsStore.TRANSLATION_PROMPT] = settings.translatePrompt
     this[SettingsStore.TRANSLATE_THINKING_BUDGET] = settings.translateThinkingBudget
     this[SettingsStore.SUGGESTION_PROMPT] = settings.suggestionPrompt
     this[SettingsStore.OCR_MODEL] = settings.ocrModelId.toString()
+    this[SettingsStore.OCR_FALLBACK_MODELS] = JsonInstant.encodeToString(settings.ocrFallbackModelIds)
     this[SettingsStore.OCR_PROMPT] = settings.ocrPrompt
     this[SettingsStore.COMPRESS_MODEL] = settings.compressModelId.toString()
+    this[SettingsStore.COMPRESS_FALLBACK_MODELS] = JsonInstant.encodeToString(settings.compressFallbackModelIds)
     this[SettingsStore.COMPRESS_PROMPT] = settings.compressPrompt
     this[SettingsStore.AUTO_COMPRESSION_THRESHOLD_TOKENS] = settings.autoCompressionThresholdTokens
     this[SettingsStore.AUTO_COMPRESSION_TARGET_TOKENS] = settings.autoCompressionTargetTokens
@@ -167,20 +175,24 @@ class SettingsStore(
         val FAVORITE_MODELS = stringPreferencesKey("favorite_models")
         val SELECT_MODEL = stringPreferencesKey("chat_model")
         val FAST_MODEL = stringPreferencesKey("fast_model")
+        val FAST_FALLBACK_MODELS = stringPreferencesKey("fast_fallback_models")
         val TITLE_MODEL = stringPreferencesKey("title_model")
         val TITLE_FALLBACK_MODELS = stringPreferencesKey("title_fallback_models")
         val TRANSLATE_MODEL = stringPreferencesKey("translate_model")
         val TRANSLATE_FALLBACK_MODELS = stringPreferencesKey("translate_fallback_models")
         val ENABLE_SUGGESTION = booleanPreferencesKey("enable_suggestion")
         val SUGGESTION_MODEL = stringPreferencesKey("suggestion_model")
+        val SUGGESTION_FALLBACK_MODELS = stringPreferencesKey("suggestion_fallback_models")
         val IMAGE_GENERATION_MODEL = stringPreferencesKey("image_generation_model")
         val TITLE_PROMPT = stringPreferencesKey("title_prompt")
         val TRANSLATION_PROMPT = stringPreferencesKey("translation_prompt")
         val TRANSLATE_THINKING_BUDGET = intPreferencesKey("translate_thinking_budget")
         val SUGGESTION_PROMPT = stringPreferencesKey("suggestion_prompt")
         val OCR_MODEL = stringPreferencesKey("ocr_model")
+        val OCR_FALLBACK_MODELS = stringPreferencesKey("ocr_fallback_models")
         val OCR_PROMPT = stringPreferencesKey("ocr_prompt")
         val COMPRESS_MODEL = stringPreferencesKey("compress_model")
+        val COMPRESS_FALLBACK_MODELS = stringPreferencesKey("compress_fallback_models")
         val COMPRESS_PROMPT = stringPreferencesKey("compress_prompt")
         val AUTO_COMPRESSION_THRESHOLD_TOKENS = intPreferencesKey("auto_compression_threshold_tokens")
         val AUTO_COMPRESSION_TARGET_TOKENS = intPreferencesKey("auto_compression_target_tokens")
@@ -230,6 +242,7 @@ class SettingsStore(
                     ?: DEFAULT_AUTO_MODEL_ID,
                 fastModelId = preferences[FAST_MODEL]?.let { Uuid.parse(it) }
                     ?: DEFAULT_AUTO_MODEL_ID,
+                fastFallbackModelIds = preferences.readModelFallbackIds(FAST_FALLBACK_MODELS),
                 titleModelId = preferences[TITLE_MODEL]?.let { Uuid.parse(it) },
                 titleFallbackModelIds = preferences[TITLE_FALLBACK_MODELS]?.let {
                     JsonInstant.decodeFromString(it)
@@ -241,14 +254,17 @@ class SettingsStore(
                 } ?: emptyList(),
                 enableSuggestion = preferences[ENABLE_SUGGESTION] != false,
                 suggestionModelId = preferences[SUGGESTION_MODEL]?.let { Uuid.parse(it) },
+                suggestionFallbackModelIds = preferences.readModelFallbackIds(SUGGESTION_FALLBACK_MODELS),
                 imageGenerationModelId = preferences[IMAGE_GENERATION_MODEL]?.let { Uuid.parse(it) } ?: Uuid.random(),
                 titlePrompt = preferences[TITLE_PROMPT] ?: DEFAULT_TITLE_PROMPT,
                 translatePrompt = preferences[TRANSLATION_PROMPT] ?: DEFAULT_TRANSLATION_PROMPT,
                 translateThinkingBudget = preferences[TRANSLATE_THINKING_BUDGET] ?: 0,
                 suggestionPrompt = preferences[SUGGESTION_PROMPT] ?: DEFAULT_SUGGESTION_PROMPT,
                 ocrModelId = preferences[OCR_MODEL]?.let { Uuid.parse(it) } ?: Uuid.random(),
+                ocrFallbackModelIds = preferences.readModelFallbackIds(OCR_FALLBACK_MODELS),
                 ocrPrompt = preferences[OCR_PROMPT] ?: DEFAULT_OCR_PROMPT,
                 compressModelId = preferences[COMPRESS_MODEL]?.let { Uuid.parse(it) } ?: DEFAULT_AUTO_MODEL_ID,
+                compressFallbackModelIds = preferences.readModelFallbackIds(COMPRESS_FALLBACK_MODELS),
                 compressPrompt = preferences[COMPRESS_PROMPT] ?: DEFAULT_COMPRESS_PROMPT,
                 autoCompressionThresholdTokens = preferences[AUTO_COMPRESSION_THRESHOLD_TOKENS]
                     ?: Settings.DEFAULT_AUTO_COMPRESSION_THRESHOLD_TOKENS,
@@ -562,10 +578,11 @@ data class Settings(
     val favoriteModels: List<Uuid> = emptyList(),
     val chatModelId: Uuid = Uuid.random(),
     val fastModelId: Uuid = Uuid.random(),
+    val fastFallbackModelIds: List<Uuid> = emptyList(),
     val titleModelId: Uuid? = null,
     /**
      * 标题生成失败后依次尝试的备用模型，按列表顺序生效。
-     * 只接受与主模型同属一个供应商的对话模型；留空表示不切换。
+     * 接受跨供应商的对话模型；未指定标题主模型且列表为空时继承快速模型备用。
      */
     val titleFallbackModelIds: List<Uuid> = emptyList(),
     val imageGenerationModelId: Uuid = Uuid.random(),
@@ -577,10 +594,13 @@ data class Settings(
     val translateThinkingBudget: Int = 0,
     val enableSuggestion: Boolean = true,
     val suggestionModelId: Uuid? = null,
+    val suggestionFallbackModelIds: List<Uuid> = emptyList(),
     val suggestionPrompt: String = DEFAULT_SUGGESTION_PROMPT,
     val ocrModelId: Uuid = Uuid.random(),
+    val ocrFallbackModelIds: List<Uuid> = emptyList(),
     val ocrPrompt: String = DEFAULT_OCR_PROMPT,
     val compressModelId: Uuid = Uuid.random(),
+    val compressFallbackModelIds: List<Uuid> = emptyList(),
     val compressPrompt: String = DEFAULT_COMPRESS_PROMPT,
     /** 所有助手和供应商共用的自动压缩触发阈值；0 关闭。 */
     val autoCompressionThresholdTokens: Int = DEFAULT_AUTO_COMPRESSION_THRESHOLD_TOKENS,

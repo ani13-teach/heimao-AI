@@ -759,13 +759,7 @@
   <string name="setting_model_page_title_model_desc">Model used to summarize conversation titles. If not set, uses the fast model</string>
   <string name="setting_model_page_translate_model">Translation Model</string>
   <string name="setting_model_page_translate_model_desc">The model used for translation features</string>
-  <string name="setting_model_page_title_fallback">Title fallback models</string>
-  <string name="setting_model_page_translate_fallback">Translation fallback models</string>
-  <string name="setting_model_page_fallback_desc">Models tried in order after the main model fails. Only models from the same provider are listed. Each one gets its own full auto-retry budget. Leave empty to turn switching off.</string>
-  <string name="setting_model_page_fallback_empty">Not set</string>
-  <string name="setting_model_page_fallback_clear">Clear</string>
-  <string name="setting_model_page_fallback_order">Try #%1$d</string>
-  <string name="setting_model_page_fallback_no_candidate">This provider has no other chat model to fall back to.</string>
+
   <string name="setting_model_page_translate_prompt_vars">Variables: Source text: {source_text}, Target language: {target_lang}</string>
   <string name="setting_page_assistant">Assistant</string>
   <string name="setting_page_assistant_desc">Set up personalized assistants (agents)</string>

@@ -108,10 +108,13 @@ private fun rememberReasoningState(reasoning: UIMessagePart.Reasoning): Pair<Rea
         }
     }
 
-    LaunchedEffect(loading) {
-        if (loading) {
+    LaunchedEffect(reasoning.createdAt, reasoning.finishedAt) {
+        val finishedAt = reasoning.finishedAt
+        if (finishedAt != null) {
+            state.duration = finishedAt - reasoning.createdAt
+        } else {
             while (isActive) {
-                state.duration = (reasoning.finishedAt ?: Clock.System.now()) - reasoning.createdAt
+                state.duration = Clock.System.now() - reasoning.createdAt
                 delay(50)
             }
         }

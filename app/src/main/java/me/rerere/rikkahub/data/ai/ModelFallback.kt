@@ -2,30 +2,52 @@ package me.rerere.rikkahub.data.ai
 
 import kotlinx.coroutines.CancellationException
 import me.rerere.ai.provider.Model
+import me.rerere.ai.provider.ModelType
+import me.rerere.ai.registry.ModelRegistry
+import me.rerere.rikkahub.data.datastore.Settings
+import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.ai.provider.ProviderSetting
 import kotlin.uuid.Uuid
 
-/**
- * 一次后台生成按顺序尝试的模型：主模型在最前，备用模型按用户排的顺序跟在后面。
- *
- * 备用只从主模型所属的那个供应商里取。列表里指向别的供应商、类型不符（由 [accept] 判定）
- * 和重复的条目都会被丢掉，所以用户换了主模型之后，旧的备用不会被误用。
- */
+internal const val MAX_MODEL_FALLBACKS = 10
+
+internal fun Settings.titleFallbackIds(): List<Uuid> =
+    if (titleModelId == null && titleFallbackModelIds.isEmpty()) fastFallbackModelIds else titleFallbackModelIds
+
+internal fun Settings.suggestionFallbackIds(): List<Uuid> =
+    if (suggestionModelId == null && suggestionFallbackModelIds.isEmpty()) fastFallbackModelIds else suggestionFallbackModelIds
+
+internal fun Settings.titleModelCandidates(): List<Model> =
+    findModelById(titleModelId, fallback = fastModelId)?.let { primary ->
+        fallbackCandidates(providers, primary, titleFallbackIds()) {
+            it.type == ModelType.CHAT && !ModelRegistry.QWEN_MT.match(it.modelId)
+        }
+    }.orEmpty()
+
+internal fun Settings.suggestionModelCandidates(): List<Model> =
+    findModelById(suggestionModelId, fallback = fastModelId)?.let { primary ->
+        fallbackCandidates(providers, primary, suggestionFallbackIds()) {
+            it.type == ModelType.CHAT && !ModelRegistry.QWEN_MT.match(it.modelId)
+        }
+    }.orEmpty()
+
+/** 主模型优先，备用按 UUID 从所有启用的供应商中解析，不改写原始配置。 */
 internal fun fallbackCandidates(
     providers: List<ProviderSetting>,
     primaryModel: Model,
     fallbackModelIds: List<Uuid>,
     accept: (Model) -> Boolean,
 ): List<Model> {
-    val owner = providers.firstOrNull { provider ->
-        provider.models.any { it.id == primaryModel.id }
-    } ?: return listOf(primaryModel)
+    val available = providers.filter { it.enabled }.flatMap { it.models }
+    val fallbacks = fallbackModelIds.asSequence()
+        .distinct()
+        .filter { it != primaryModel.id }
+        .mapNotNull { id -> available.firstOrNull { it.id == id } }
+        .filter { it.type == ModelType.CHAT && accept(it) }
+        .take(MAX_MODEL_FALLBACKS)
+        .toList()
 
-    val fallbacks = fallbackModelIds
-        .mapNotNull { id -> owner.models.firstOrNull { it.id == id } }
-        .filter { it.id != primaryModel.id && accept(it) }
-
-    return (listOf(primaryModel) + fallbacks).distinctBy { it.id }
+    return listOf(primaryModel) + fallbacks
 }
 
 /**

@@ -301,7 +301,17 @@ class ChatVM(
 
     fun stopGeneration() {
         viewModelScope.launch {
-            chatService.stopGeneration(_conversationId)
+            try {
+                chatService.stopGeneration(_conversationId)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                chatService.addError(
+                    error,
+                    _conversationId,
+                    title = context.getString(R.string.error_title_operation),
+                )
+            }
         }
     }
 

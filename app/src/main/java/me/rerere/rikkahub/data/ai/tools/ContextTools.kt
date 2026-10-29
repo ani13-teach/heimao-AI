@@ -11,6 +11,7 @@ import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.ai.activeContextBlocks
 import me.rerere.rikkahub.data.ai.contextSourceHash
 import me.rerere.rikkahub.data.ai.estimateTextTokens
+import me.rerere.rikkahub.data.ai.validContextBlocks
 import me.rerere.rikkahub.data.model.ContextBlock
 import me.rerere.rikkahub.data.model.Conversation
 import java.security.MessageDigest
@@ -49,9 +50,10 @@ fun createContextTools(
         val budget = minOf(CALL_BUDGET, TURN_BUDGET - charged)
         if (budget < 128) return@withLock contextError("BUDGET_EXCEEDED")
         val args = input as? JsonObject ?: return@withLock contextError("BAD_ARGUMENT")
-        val blocks = activeContextBlocks(conversation, messages, loadBlocks())
-        val payload = if (name == "context_search") searchContext(args, conversation, blocks, budget)
-            else readContext(args, conversation, blocks, budget)
+        val valid = validContextBlocks(conversation, messages, loadBlocks())
+        val payload = if (name == "context_search") {
+            searchContext(args, conversation, activeContextBlocks(conversation, messages, valid), budget)
+        } else readContext(args, conversation, valid, budget)
         val text = payload.toString()
         check(estimateTextTokens(text) <= budget) { "Context tool result exceeds local budget" }
         // Revalidate after loading blocks; an edit or ownership change invalidates the snapshot.
@@ -172,7 +174,10 @@ private fun searchContext(args: JsonObject, c: Conversation, blocks: List<Contex
         ?: return errorPayload("BAD_ARGUMENT") else 10
     val records = blocks.flatMap { b -> if (scope == "summary") listOf(SearchRecord(b, null, b.summary))
         else sourceMessages(c, b).map { SearchRecord(b, it.id, contextOriginalText(it)) } }
-    val key = digest("${c.id}:${c.assistantId}:$scope:$query:" + blocks.joinToString { "${it.id}:${it.sourceHash}:${it.prefixHash}" })
+        .distinctBy { it.messageId ?: it.block.id }
+    val key = digest("${c.id}:${c.assistantId}:$scope:$query:" + records.joinToString {
+        "${it.block.id}:${it.block.sourceHash}:${it.block.prefixHash}:${it.messageId}:${digest(it.text)}"
+    })
     var index = offset(args, key)?.takeIf { it <= records.size } ?: return errorPayload("STALE")
     val items = mutableListOf<JsonObject>()
     fun page(next: Int) = buildJsonObject {

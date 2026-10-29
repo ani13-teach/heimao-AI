@@ -810,6 +810,7 @@ class GenerationHandler(
         settings: Settings,
         chatModel: Model,
         processingStatus: MutableStateFlow<String?>,
+        rebuildPrompt: suspend (List<ContextBlock>) -> LogicalPrompt,
     ): BlockCompactionResult {
         val threshold = settings.autoCompressionThresholdTokens
         val target = settings.autoCompressionTargetTokens
@@ -827,8 +828,9 @@ class GenerationHandler(
                 "locale" to Locale.getDefault().displayName,
             ) + "\n[历史资料结束]"),
         )
+        val reservedOutput = minOf(target, 16_000)
         val compressionPromptOverhead = estimatePromptTokens(
-            LogicalPrompt.fromMessages(summaryMessages("", 1024))
+            LogicalPrompt.fromMessages(summaryMessages("", reservedOutput))
         )
         val status = "正在自动压缩上下文…"
         try {
@@ -839,40 +841,48 @@ class GenerationHandler(
                 existingBlocks = existingBlocks,
                 triggerTokens = threshold,
                 targetTokens = target,
-                maxSourceTokens = (threshold.toLong() - compressionPromptOverhead - 1024 - 16)
+                maxSourceTokens = (threshold.toLong() - compressionPromptOverhead - reservedOutput - 16)
                     .coerceIn(1L, 16_000L).toInt(),
+                rebuildPrompt = rebuildPrompt,
             ) { source, summaryBudget ->
                 processingStatus.value = status
-                val compressionModel = settings.compressionModelFor(chatModel)
-                val compressionProvider = compressionModel.findProvider(settings.providers)
-                    ?: error("压缩模型的供应商不可用")
-                val handler = providerManager.getProviderByType(compressionProvider)
+                val primary = settings.compressionModelFor(chatModel)
+                val candidates = fallbackCandidates(
+                    settings.providers, primary, settings.compressFallbackModelIds,
+                ) { it.type == ModelType.CHAT }
                 val requests = summaryMessages(source, summaryBudget)
                 val inputTokens = estimatePromptTokens(LogicalPrompt.fromMessages(requests))
                 check(inputTokens.toLong() + summaryBudget <= threshold) {
                     "本地摘要预算无法容纳提示词、来源内容与预留输出，请提高自动压缩触发长度"
                 }
-                val result = handler.generateTextWithModelTransport(
-                    providerSetting = compressionProvider,
-                    messages = requests,
-                    params = TextGenerationParams(
+                runWithModelFallback(candidates) { compressionModel ->
+                    val compressionProvider = compressionModel.findProvider(settings.providers)
+                        ?: error("压缩模型的供应商不可用")
+                    val handler = providerManager.getProviderByType(compressionProvider)
+                    val result = handler.generateTextWithModelTransport(
+                        providerSetting = compressionProvider,
+                        messages = requests,
+                        params = TextGenerationParams(
+                            model = compressionModel,
+                            maxTokens = summaryBudget,
+                            customHeaders = compressionModel.customHeaders,
+                            customBody = compressionModel.customBodies,
+                        ),
+                        responseMessages = listOf(UIMessage.assistant("")),
+                        retryPolicy = settings.toRetryPolicy(),
+                    )
+                    chatLogStore.recordTokenUsage(
                         model = compressionModel,
-                        maxTokens = summaryBudget,
-                        customHeaders = compressionModel.customHeaders,
-                        customBody = compressionModel.customBodies,
-                    ),
-                )
-                chatLogStore.recordTokenUsage(
-                    model = compressionModel,
-                    provider = compressionProvider,
-                    usage = result.lastOrNull()?.usage,
-                )
-                val summary = result.lastOrNull()?.toText()?.trim().orEmpty()
-                val outputTokens = estimatePromptTokens(LogicalPrompt.fromMessages(result.takeLast(1)))
-                check(inputTokens.toLong() + outputTokens <= threshold) {
-                    "摘要输入与输出超过本地预算，请提高自动压缩触发长度"
+                        provider = compressionProvider,
+                        usage = result.lastOrNull()?.usage,
+                    )
+                    val summary = result.lastOrNull()?.toText()?.trim().orEmpty()
+                    val outputTokens = estimatePromptTokens(LogicalPrompt.fromMessages(result.takeLast(1)))
+                    check(inputTokens.toLong() + outputTokens <= threshold) {
+                        "摘要输入与输出超过本地预算，请提高自动压缩触发长度"
+                    }
+                    summary.takeIf { it.isNotBlank() }
                 }
-                summary
             }
         } finally {
             if (processingStatus.value == status) processingStatus.value = null
@@ -934,35 +944,38 @@ class GenerationHandler(
         val projectedBlocks = activeContextBlocks(
             sourceConversation, messages, activeBlocks + listOfNotNull(legacy),
         )
-        val contextMessages = projectContextBlocks(messages, projectedBlocks).map { it.withoutCodemodeTrace() }
-        val transformed = buildList {
-            add(UIMessage.system(prompt = stableSystemPrompt).copy(isSynthetic = true))
-            addAll(contextMessages)
-        }.transforms(
-            transformers = transformers,
-            context = context,
-            model = model,
-            assistant = assistant,
-            settings = settings,
-            conversationModeInjectionIds = conversationModeInjectionIds,
-            processingStatus = processingStatus,
-            workspaceId = workspaceId,
-            workspaceCwd = workspaceCwd,
-        )
-        val systemMessages = transformed.filter { it.role == MessageRole.SYSTEM }
-        val stableSystems = systemMessages.ifEmpty { listOf(UIMessage.system(stableSystemPrompt)) }
-        val conversationMessages = transformed.filter { it.role != MessageRole.SYSTEM }
-        val logicalPrompt = buildMemoryGenerationPrompt(
-            memoryMode = memoryMode,
-            tools = tools,
-            stableSystems = stableSystems,
-            conversationMessages = conversationMessages,
-            additionalContextMessages = additionalContextMessages.map { it.withoutCodemodeTrace() },
-            memorySnapshot = memorySnapshot,
-            claudeMemoryCacheBlocks = claudeMemoryCacheBlocks,
-            memoryDelta = memoryDelta,
-            claudeMemoryPatches = claudeMemoryPatches,
-        )
+        val contextMessages = messages.map { it.withoutCodemodeTrace() }
+        suspend fun buildContextPrompt(blocks: List<ContextBlock>): LogicalPrompt {
+            val transformed = transformContextBlockInput(buildList {
+                add(UIMessage.system(prompt = stableSystemPrompt).copy(isSynthetic = true))
+                addAll(contextMessages)
+            }, blocks) { input ->
+                input.transforms(
+                    transformers = transformers,
+                    context = context,
+                    model = model,
+                    assistant = assistant,
+                    settings = settings,
+                    conversationModeInjectionIds = conversationModeInjectionIds,
+                    processingStatus = processingStatus,
+                    workspaceId = workspaceId,
+                    workspaceCwd = workspaceCwd,
+                )
+            }
+            val systemMessages = transformed.filter { it.role == MessageRole.SYSTEM }
+            return buildMemoryGenerationPrompt(
+                memoryMode = memoryMode,
+                tools = tools,
+                stableSystems = systemMessages.ifEmpty { listOf(UIMessage.system(stableSystemPrompt)) },
+                conversationMessages = transformed.filter { it.role != MessageRole.SYSTEM },
+                additionalContextMessages = additionalContextMessages.map { it.withoutCodemodeTrace() },
+                memorySnapshot = memorySnapshot,
+                claudeMemoryCacheBlocks = claudeMemoryCacheBlocks,
+                memoryDelta = memoryDelta,
+                claudeMemoryPatches = claudeMemoryPatches,
+            )
+        }
+        val logicalPrompt = buildContextPrompt(projectedBlocks)
         // 唯一请求入口：普通发送、重新生成和每一轮工具续跑均先检查完整请求。
         val compaction = compactRequestContext(
             prompt = logicalPrompt,
@@ -972,8 +985,9 @@ class GenerationHandler(
             settings = settings,
             chatModel = model,
             processingStatus = processingStatus,
+            rebuildPrompt = ::buildContextPrompt,
         )
-        val usedBlocks = projectedBlocks + compaction.blocks
+        val usedBlocks = compaction.activeBlocks
         val committedPrompt = committedContextBlockPrompt(
             compaction.prompt, messages, usedBlocks, onContextBlocksCommitted,
         )
