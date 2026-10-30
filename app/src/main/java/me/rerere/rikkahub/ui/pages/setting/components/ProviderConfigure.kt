@@ -30,6 +30,8 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.dokar.sonner.ToastType
 import me.rerere.ai.provider.ClaudePromptCacheTtl
+import me.rerere.ai.provider.PromptCacheKeyMode
+import me.rerere.ai.provider.SessionAffinityMode
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.datastore.DEFAULT_PROVIDERS
@@ -99,13 +101,18 @@ fun ProviderSetting.convertTo(type: KClass<out ProviderSetting>): ProviderSettin
         else -> error("Unsupported provider type: $type")
     }
     val convertedBaseUrl = sourceBaseUrl.convertToTargetBaseUrl(targetDefaultBaseUrl)
+    val sessionAffinity = when (this) {
+        is ProviderSetting.OpenAI -> this.sessionAffinity
+        is ProviderSetting.Claude -> this.sessionAffinity
+        is ProviderSetting.Google -> SessionAffinityMode.OFF
+    }
 
     return when (type) {
         ProviderSetting.OpenAI::class -> ProviderSetting.OpenAI(
             id = this.id, enabled = this.enabled, name = this.name, models = this.models,
             balanceOption = this.balanceOption, builtIn = this.builtIn,
             description = this.description, shortDescription = this.shortDescription,
-            apiKey = apiKey, baseUrl = convertedBaseUrl
+            apiKey = apiKey, baseUrl = convertedBaseUrl, sessionAffinity = sessionAffinity
         )
         ProviderSetting.Google::class -> ProviderSetting.Google(
             id = this.id, enabled = this.enabled, name = this.name, models = this.models,
@@ -117,7 +124,7 @@ fun ProviderSetting.convertTo(type: KClass<out ProviderSetting>): ProviderSettin
             id = this.id, enabled = this.enabled, name = this.name, models = this.models,
             balanceOption = this.balanceOption, builtIn = this.builtIn,
             description = this.description, shortDescription = this.shortDescription,
-            apiKey = apiKey, baseUrl = convertedBaseUrl
+            apiKey = apiKey, baseUrl = convertedBaseUrl, sessionAffinity = sessionAffinity
         )
         else -> error("Unsupported provider type: $type")
     }
@@ -288,6 +295,57 @@ private fun ProviderConfigureOpenAI(
             onCheckedChange = { onEdit(provider.copy(includeHistoryReasoning = it)) }
         )
     }
+
+    Text("会话缓存键")
+    SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+        val modes = listOf(PromptCacheKeyMode.AUTO to "自动", PromptCacheKeyMode.ENABLED to "开启", PromptCacheKeyMode.DISABLED to "关闭")
+        modes.forEachIndexed { index, (mode, label) ->
+            SegmentedButton(
+                selected = provider.promptCacheKeyMode == mode,
+                onClick = { onEdit(provider.copy(promptCacheKeyMode = mode)) },
+                shape = SegmentedButtonDefaults.itemShape(index, modes.size),
+            ) { Text(label) }
+        }
+    }
+    Text("自动仅为 OpenAI 官方接口添加；模型设置可单独覆盖。", style = MaterialTheme.typography.bodySmall)
+
+    SessionAffinityConfigure(provider.baseUrl, provider.sessionAffinity) { onEdit(provider.copy(sessionAffinity = it)) }
+}
+
+@Composable
+private fun SessionAffinityConfigure(
+    baseUrl: String,
+    mode: SessionAffinityMode,
+    onChange: (SessionAffinityMode) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("中转站会话路由")
+        Switch(
+            checked = mode != SessionAffinityMode.OFF,
+            onCheckedChange = { enabled ->
+                onChange(if (!enabled) SessionAffinityMode.OFF else {
+                    if (baseUrl.toHttpUrlOrNull()?.host == "openrouter.ai") SessionAffinityMode.OPENROUTER else SessionAffinityMode.OPENAI
+                })
+            },
+        )
+    }
+    if (mode != SessionAffinityMode.OFF) {
+        Text("路由请求头格式")
+        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+            val formats = listOf(SessionAffinityMode.OPENAI to "通用会话头", SessionAffinityMode.OPENROUTER to "x-session-id")
+            formats.forEachIndexed { index, (format, label) ->
+                SegmentedButton(
+                    selected = mode == format,
+                    onClick = { onChange(format) },
+                    shape = SegmentedButtonDefaults.itemShape(index, formats.size),
+                ) { Text(label) }
+            }
+        }
+    }
 }
 
 @Composable
@@ -375,6 +433,8 @@ private fun ProviderConfigureClaude(
             }
         }
     }
+
+    SessionAffinityConfigure(provider.baseUrl, provider.sessionAffinity) { onEdit(provider.copy(sessionAffinity = it)) }
 }
 
 @Composable

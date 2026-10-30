@@ -681,6 +681,20 @@ private fun ModelSettingsForm(
                             parentProvider = parentProvider
                         )
 
+                        if (model.type == ModelType.CHAT && (model.providerOverwrite ?: parentProvider) is ProviderSetting.OpenAI) {
+                            Text("会话缓存键")
+                            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                                val modes = listOf(null to "跟随渠道", true to "开启", false to "关闭")
+                                modes.forEachIndexed { index, (enabled, label) ->
+                                    SegmentedButton(
+                                        selected = model.promptCacheKeyEnabled == enabled,
+                                        onClick = { onModelChange(model.copy(promptCacheKeyEnabled = enabled)) },
+                                        shape = SegmentedButtonDefaults.itemShape(index, modes.size),
+                                    ) { Text(label) }
+                                }
+                            }
+                        }
+
                         CustomHeaders(
                             headers = model.customHeaders,
                             onUpdate = { headers ->

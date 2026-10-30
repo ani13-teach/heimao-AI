@@ -176,7 +176,6 @@ internal class ChatCompletionsStreamDecoder : StreamChunkDecoder {
             ?.get("cached_tokens")?.jsonPrimitive?.intOrNull
             ?: usage["cached_tokens"]?.jsonPrimitive?.intOrNull
             ?: usage["prompt_cache_hit_tokens"]?.jsonPrimitive?.intOrNull
-            ?: 0
         return UsageNormalizer.normalize(
             totalInputTokens = usage["prompt_tokens"]?.jsonPrimitive?.intOrNull,
             completionTokens = usage["completion_tokens"]?.jsonPrimitive?.intOrNull,

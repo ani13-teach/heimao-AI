@@ -30,6 +30,7 @@ class SkillManager(
                 if (!skillFile.exists()) return@mapNotNull null
                 parseSkillFile(skillFile, dir)
             }
+            ?.sortedBy { it.name }
             ?: emptyList()
     }
 

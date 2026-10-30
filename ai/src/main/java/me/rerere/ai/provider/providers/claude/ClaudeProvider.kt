@@ -34,7 +34,11 @@ import me.rerere.ai.core.TokenUsage
 import me.rerere.ai.core.UsageNormalizer
 import me.rerere.ai.core.merge
 import me.rerere.ai.provider.BuiltInTools
+import me.rerere.ai.provider.inPromptOrder
 import me.rerere.ai.provider.CacheBoundary
+import me.rerere.ai.provider.PromptCacheApi
+import me.rerere.ai.provider.observePromptCacheRequest
+import me.rerere.ai.provider.withSessionAffinity
 import me.rerere.ai.provider.ClaudePromptCacheTtl
 import me.rerere.ai.provider.ImageGenerationParams
 import me.rerere.ai.provider.Model
@@ -243,6 +247,7 @@ private fun TokenUsage?.sum(other: TokenUsage?): TokenUsage? {
         totalTokens = totalTokens + other.totalTokens,
         cacheReadTokens = cacheReadTokens + other.cacheReadTokens,
         cacheWriteTokens = cacheWriteTokens + other.cacheWriteTokens,
+        cacheUsageReported = me.rerere.ai.core.mergeCacheUsageReported(cacheUsageReported, other.cacheUsageReported),
         provider = other.provider ?: provider,
         model = other.model ?: model,
     )
@@ -311,6 +316,7 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
             .addHeader("x-api-key", keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString()))
             .addHeader("anthropic-version", ANTHROPIC_VERSION)
             .configureReferHeaders(providerSetting.baseUrl)
+            .withSessionAffinity(providerSetting, params)
             .build()
 
         Log.i(TAG, "generateText: ${json.encodeToString(requestBody)}")
@@ -361,6 +367,7 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
             .addHeader("anthropic-version", ANTHROPIC_VERSION)
             .addHeader("Content-Type", "application/json")
             .configureReferHeaders(providerSetting.baseUrl)
+            .withSessionAffinity(providerSetting, params)
             .build()
 
         Log.i(TAG, "streamText: ${json.encodeToString(requestBody)}")
@@ -569,13 +576,13 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
             }
         }.mergeCustomBody(params.customBody)
 
-        if (!providerSetting.promptCaching) return request
+        if (!providerSetting.promptCaching) return request.observePromptCacheRequest(params, PromptCacheApi.CLAUDE, logicalPrompt = prompt)
         // Custom body values can replace the arrays used by the logical layout. Applying
         // cached indices after such a replacement could attach a boundary to unrelated
         // content, so leave the caller-owned wire shape untouched and skip caching.
         if (params.customBody.any { it.key == "messages" || it.key == "system" || it.key == "tools" }) {
             Log.w(TAG, "[PromptCache] skipped: custom body overrides prompt layout")
-            return request
+            return request.observePromptCacheRequest(params, PromptCacheApi.CLAUDE, layoutSkipped = true, logicalPrompt = prompt)
         }
 
         val systemResult = applyCacheBoundary(
@@ -599,7 +606,15 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
             promptCacheTtl = providerSetting.promptCacheTtl,
         )
         request = historyResult.request
-        return request
+        return request.observePromptCacheRequest(
+            params, PromptCacheApi.CLAUDE,
+            appliedBoundaries = buildList {
+                if (systemResult.applied) add(CacheBoundary.SYSTEM_END)
+                if (memoryResult.applied) add(CacheBoundary.MEMORY_END)
+                if (historyResult.applied) add(CacheBoundary.HISTORY_END)
+            },
+            logicalPrompt = prompt,
+        )
     }
 
     private fun buildToolDefinitions(params: TextGenerationParams): List<JsonObject> = buildList {
@@ -614,7 +629,7 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
                 })
             }
         }
-        params.model.tools.forEach { builtInTool ->
+        params.model.tools.inPromptOrder().forEach { builtInTool ->
             when (builtInTool) {
                 BuiltInTools.Search -> add(buildJsonObject {
                     put("type", "web_search_20250305")
@@ -1229,10 +1244,10 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
             ?: bodyJson["message"]?.jsonObject?.get("usage")?.jsonObject
             ?: return null
         val inputTokens = usageJson["input_tokens"]?.jsonPrimitive?.intOrNull ?: 0
-        val cachedInputTokens = usageJson["cache_read_input_tokens"]?.jsonPrimitiveOrNull?.intOrNull ?: 0
-        val cachedCreationTokens = usageJson["cache_creation_input_tokens"]?.jsonPrimitiveOrNull?.intOrNull ?: 0
+        val cachedInputTokens = usageJson["cache_read_input_tokens"]?.jsonPrimitiveOrNull?.intOrNull
+        val cachedCreationTokens = usageJson["cache_creation_input_tokens"]?.jsonPrimitiveOrNull?.intOrNull
         val completionTokens = usageJson["output_tokens"]?.jsonPrimitive?.intOrNull ?: 0
-        val promptTokens = inputTokens + cachedInputTokens + cachedCreationTokens
+        val promptTokens = inputTokens + (cachedInputTokens ?: 0) + (cachedCreationTokens ?: 0)
         return UsageNormalizer.normalize(
             totalInputTokens = promptTokens,
             completionTokens = completionTokens,

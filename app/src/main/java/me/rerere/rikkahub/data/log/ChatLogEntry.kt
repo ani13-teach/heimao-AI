@@ -2,6 +2,7 @@ package me.rerere.rikkahub.data.log
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import me.rerere.ai.provider.PromptCacheDiagnostic
 
 /**
  * 日志等级。既是开关也是等级：`OFF` 就是关。
@@ -45,10 +46,17 @@ sealed interface ChatLogEntry {
         val cacheReadTokens: Int,
         val cacheWriteTokens: Int,
         val totalTokens: Int,
+        val sessionKey: String? = null,
+        /** Null means the log predates explicit reporting status. */
+        val usageReported: Boolean? = null,
+        val cacheUsageReported: Boolean? = null,
+        val cacheDiagnostic: PromptCacheDiagnostic? = null,
     ) : ChatLogEntry {
         /** 缓存命中率 = 缓存读 ÷ 输入 token。没有输入时无意义，返回 null。 */
         val cacheHitRate: Double?
-            get() = if (promptTokens > 0) cacheReadTokens.toDouble() / promptTokens else null
+            get() = if (usageReported != false && cacheUsageReported != false && promptTokens > 0) {
+                cacheReadTokens.toDouble() / promptTokens
+            } else null
     }
 
     /** 一次工具调用失败。只记失败，成功不记。 */

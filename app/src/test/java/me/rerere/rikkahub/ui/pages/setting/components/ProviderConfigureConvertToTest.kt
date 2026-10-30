@@ -3,6 +3,7 @@ package me.rerere.rikkahub.ui.pages.setting.components
 import me.rerere.ai.provider.BalanceOption
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ProviderSetting
+import me.rerere.ai.provider.SessionAffinityMode
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertSame
@@ -83,6 +84,19 @@ class ProviderConfigureConvertToTest {
         val converted = original.convertTo(ProviderSetting.Claude::class) as ProviderSetting.Claude
         assertEquals("https://gateway.example.com/proxy/v1", converted.baseUrl)
         assertEquals("gateway.example.com", converted.baseUrl.toHttpUrlOrNull()?.host)
+    }
+
+    @Test
+    fun `switching OpenAI and Claude protocol preserves routing opt in and format`() {
+        for (mode in SessionAffinityMode.entries) {
+            val original = ProviderSetting.OpenAI(baseUrl = "https://relay.example/v1", sessionAffinity = mode)
+            val claude = original.convertTo(ProviderSetting.Claude::class) as ProviderSetting.Claude
+            assertEquals(mode, claude.sessionAffinity)
+            val openai = claude.convertTo(ProviderSetting.OpenAI::class) as ProviderSetting.OpenAI
+            assertEquals(mode, openai.sessionAffinity)
+        }
+        val google = ProviderSetting.Google(baseUrl = "https://relay.example/v1beta")
+        assertEquals(SessionAffinityMode.OFF, (google.convertTo(ProviderSetting.Claude::class) as ProviderSetting.Claude).sessionAffinity)
     }
 
     @Test

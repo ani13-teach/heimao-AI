@@ -19,6 +19,8 @@ data class Model(
     val providerOverwrite: ProviderSetting? = null,
     /** Whether this model uses streaming. Null is accepted only for legacy settings migration. */
     val streamOutput: Boolean? = null,
+    /** Null inherits the OpenAI channel's cache-key policy. */
+    val promptCacheKeyEnabled: Boolean? = null,
 )
 
 @Serializable

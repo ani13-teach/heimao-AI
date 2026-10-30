@@ -37,6 +37,10 @@ import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.provider.TextGenerationResult
 import me.rerere.ai.provider.TextGenerationParams
+import me.rerere.ai.provider.withPromptCacheKey
+import me.rerere.ai.provider.PromptCacheApi
+import me.rerere.ai.provider.observePromptCacheRequest
+import me.rerere.ai.provider.withSessionAffinity
 import me.rerere.ai.provider.stream.SseEvent
 import me.rerere.ai.provider.providers.PartGroup
 import me.rerere.ai.provider.providers.groupPartsByToolBoundary
@@ -97,6 +101,7 @@ class ChatCompletionsAPI(
             .post(json.encodeToString(requestBody).toRequestBody("application/json".toMediaType()))
             .addHeader("Authorization", "Bearer ${keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString())}")
             .configureReferHeaders(providerSetting.baseUrl)
+            .withSessionAffinity(providerSetting, params)
             .build()
 
         Log.i(TAG, "generateText: ${json.encodeToString(requestBody)}")
@@ -152,6 +157,7 @@ class ChatCompletionsAPI(
             .addHeader("Authorization", "Bearer ${keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString())}")
             .addHeader("Content-Type", "application/json")
             .configureReferHeaders(providerSetting.baseUrl)
+            .withSessionAffinity(providerSetting, params)
             .build()
 
         Log.i(TAG, "streamText: ${json.encodeToString(requestBody)}")
@@ -437,7 +443,8 @@ class ChatCompletionsAPI(
                     }
                 }
             }
-        }.mergeCustomBody(params.customBody)
+        }.mergeCustomBody(params.customBody).withPromptCacheKey(providerSetting, params)
+            .observePromptCacheRequest(params, PromptCacheApi.CHAT_COMPLETIONS)
     }
 
     private fun isModelAllowTemperature(model: Model): Boolean {
@@ -811,7 +818,6 @@ class ChatCompletionsAPI(
         val cachedTokens = jsonObject["prompt_tokens_details"]?.jsonObjectOrNull?.get("cached_tokens")?.jsonPrimitive?.intOrNull
             ?: jsonObject["cached_tokens"]?.jsonPrimitive?.intOrNull
             ?: jsonObject["prompt_cache_hit_tokens"]?.jsonPrimitive?.intOrNull
-            ?: 0
         return UsageNormalizer.normalize(
             totalInputTokens = jsonObject["prompt_tokens"]?.jsonPrimitive?.intOrNull,
             completionTokens = jsonObject["completion_tokens"]?.jsonPrimitive?.intOrNull,

@@ -65,6 +65,8 @@ sealed class ProviderSetting {
         var chatCompletionsPath: String = "/chat/completions",
         var useResponseApi: Boolean = false,
         var includeHistoryReasoning: Boolean = true,
+        var promptCacheKeyMode: PromptCacheKeyMode = PromptCacheKeyMode.AUTO,
+        var sessionAffinity: SessionAffinityMode = SessionAffinityMode.OFF,
     ) : ProviderSetting() {
         override fun addModel(model: Model): ProviderSetting {
             return copy(models = models + model)
@@ -191,6 +193,7 @@ sealed class ProviderSetting {
         var baseUrl: String = "https://api.anthropic.com/v1",
         var promptCaching: Boolean = false,
         var promptCacheTtl: ClaudePromptCacheTtl = ClaudePromptCacheTtl.FIVE_MINUTES,
+        var sessionAffinity: SessionAffinityMode = SessionAffinityMode.OFF,
     ) : ProviderSetting() {
         override fun addModel(model: Model): ProviderSetting {
             return copy(models = models + model)

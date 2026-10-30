@@ -1,6 +1,7 @@
 package me.rerere.ai.provider.providers.claude
 
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -20,6 +21,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
 import org.junit.Before
 import org.junit.Test
 
@@ -46,6 +48,34 @@ class ClaudePromptCacheRequestTest {
         )
         method.isAccessible = true
         return method.invoke(provider, providerSetting, messages, params, stream) as JsonObject
+    }
+
+    @Test
+    fun `diagnostics report applied boundaries without treating them as hits`() {
+        val prompt = LogicalPrompt(
+            system = listOf(UIMessage.system("system")),
+            memorySnapshot = listOf(UIMessage.system("memory")),
+            history = listOf(UIMessage.user("old"), UIMessage.assistant("answer")),
+            latestUser = UIMessage.user("latest"),
+        )
+        var snapshot: me.rerere.ai.provider.PromptCacheSnapshot? = null
+        val params = TextGenerationParams(
+            model = Model(modelId = "claude-test"), logicalPrompt = prompt,
+            onPromptCacheSnapshot = { snapshot = it },
+        )
+        buildRequest(ProviderSetting.Claude(promptCaching = true), prompt.toMessages(), params)
+        assertEquals(
+            listOf(me.rerere.ai.provider.CacheBoundary.SYSTEM_END, me.rerere.ai.provider.CacheBoundary.MEMORY_END, me.rerere.ai.provider.CacheBoundary.HISTORY_END),
+            snapshot!!.appliedBoundaries,
+        )
+        assertFalse(snapshot!!.cacheKeySent)
+        buildRequest(ProviderSetting.Claude(promptCaching = false), prompt.toMessages(), params)
+        assertTrue(snapshot!!.appliedBoundaries.isEmpty())
+        buildRequest(ProviderSetting.Claude(promptCaching = true), prompt.toMessages(), params.copy(
+            customBody = listOf(me.rerere.ai.provider.CustomBody("messages", JsonArray(emptyList()))),
+        ))
+        assertTrue(snapshot!!.layoutSkipped)
+        assertTrue(snapshot!!.appliedBoundaries.isEmpty())
     }
 
     private fun dummyTool(): Tool {

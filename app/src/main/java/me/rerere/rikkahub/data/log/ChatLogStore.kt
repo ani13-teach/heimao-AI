@@ -7,6 +7,8 @@ import kotlinx.coroutines.withContext
 import me.rerere.ai.core.TokenUsage
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ProviderSetting
+import me.rerere.ai.provider.PromptCacheSnapshot
+import me.rerere.ai.provider.PromptCacheTracker
 import me.rerere.rikkahub.AppScope
 import me.rerere.rikkahub.data.datastore.SettingsStore
 
@@ -26,8 +28,21 @@ class ChatLogStore(
         const val MAX_ENTRIES = 500
     }
 
-    /** 记一次模型请求的 token 明细。provider 没报 usage 时按 0 记，方便看出「这家不报数」。 */
-    fun recordTokenUsage(model: Model, provider: ProviderSetting, usage: TokenUsage?) {
+    private val promptCacheTracker = PromptCacheTracker()
+
+    val cacheDiagnosticsEnabled: Boolean
+        get() = settingsStore.settingsFlow.value.chatLogLevel == ChatLogLevel.ALL
+
+    fun recordTokenUsage(
+        model: Model, provider: ProviderSetting, usage: TokenUsage?,
+        sessionKey: String? = null, cacheSnapshot: PromptCacheSnapshot? = null,
+    ) {
+        if (!cacheDiagnosticsEnabled) return
+        val diagnostic = if (sessionKey != null && cacheSnapshot != null) {
+            promptCacheTracker.observe(
+                "$sessionKey:${provider.id}:${model.id}:${cacheSnapshot.api}", cacheSnapshot,
+            )
+        } else null
         val resolved = usage ?: TokenUsage()
         record(
             ChatLogEntry.RequestUsage(
@@ -41,6 +56,11 @@ class ChatLogStore(
                 cacheWriteTokens = resolved.cacheWriteTokens,
                 totalTokens = resolved.totalTokens.takeIf { it > 0 }
                     ?: (resolved.promptTokens + resolved.completionTokens),
+                sessionKey = sessionKey,
+                usageReported = usage != null,
+                cacheUsageReported = usage?.cacheUsageReported
+                    ?: if (resolved.cacheReadTokens > 0 || resolved.cacheWriteTokens > 0) true else null,
+                cacheDiagnostic = diagnostic,
             )
         )
     }
@@ -89,7 +109,10 @@ class ChatLogStore(
         ChatLogFile.writeAll(context, kept)
     }
 
-    suspend fun clear() = withContext(Dispatchers.IO) { ChatLogFile.delete(context) }
+    suspend fun clear() = withContext(Dispatchers.IO) {
+        ChatLogFile.delete(context)
+        promptCacheTracker.clear()
+    }
 
     private fun record(entry: ChatLogEntry) {
         if (!settingsStore.settingsFlow.value.chatLogLevel.allows(entry)) return

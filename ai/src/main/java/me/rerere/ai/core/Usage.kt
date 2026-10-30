@@ -17,6 +17,8 @@ data class TokenUsage(
     val cacheWriteTokens: Int = 0,
     val provider: String? = null,
     val model: String? = null,
+    /** Null for legacy data; false when usage omitted cache counters. */
+    val cacheUsageReported: Boolean? = null,
 )
 
 /** Normalized usage shape used by diagnostics before it is projected to [TokenUsage]. */
@@ -53,6 +55,7 @@ object UsageNormalizer {
             cacheWriteTokens = write,
             provider = provider,
             model = model,
+            cacheUsageReported = cacheReadTokens != null || cacheWriteTokens != null,
         )
     }
 
@@ -69,6 +72,12 @@ object UsageNormalizer {
         model = model,
         raw = raw,
     )
+}
+
+fun mergeCacheUsageReported(first: Boolean?, second: Boolean?): Boolean? = when {
+    first == true || second == true -> true
+    first == false || second == false -> false
+    else -> null
 }
 
 fun TokenUsage?.merge(other: TokenUsage): TokenUsage {
@@ -110,5 +119,6 @@ fun TokenUsage?.merge(other: TokenUsage): TokenUsage {
         cacheWriteTokens = cacheWriteTokens,
         provider = other.provider ?: this?.provider,
         model = other.model ?: this?.model,
+        cacheUsageReported = mergeCacheUsageReported(this?.cacheUsageReported, other.cacheUsageReported),
     )
 }

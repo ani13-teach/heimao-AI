@@ -10,6 +10,9 @@ import me.rerere.ai.provider.ClaudeMemoryCacheBlock
 import me.rerere.ai.provider.LogicalPrompt
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ProviderSetting
+import me.rerere.ai.provider.PromptCacheKeyMode
+import me.rerere.ai.provider.CustomBody
+import me.rerere.ai.provider.conversationPromptCacheKey
 import me.rerere.ai.provider.TextGenerationParams
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.util.KeyRoulette
@@ -32,6 +35,7 @@ class PromptCacheRequestTest {
     private fun buildChatRequest(
         params: TextGenerationParams,
         messages: List<UIMessage>,
+        provider: ProviderSetting.OpenAI = ProviderSetting.OpenAI(baseUrl = "https://api.openai.com/v1"),
     ): JsonObject {
         val method = ChatCompletionsAPI::class.java.getDeclaredMethod(
             "buildChatCompletionRequest",
@@ -45,9 +49,32 @@ class PromptCacheRequestTest {
             chat,
             messages,
             params,
-            ProviderSetting.OpenAI(baseUrl = "https://api.openai.com/v1"),
+            provider,
             false,
         ) as JsonObject
+    }
+
+    @Test
+    fun `both adapters honor automatic model and custom cache key policies`() {
+        val messages = listOf(UIMessage.user("hello"))
+        val key = conversationPromptCacheKey("assistant", "conversation")
+        val params = TextGenerationParams(model = Model(modelId = "gpt-test"), promptCacheKey = key)
+        val proxy = ProviderSetting.OpenAI(baseUrl = "https://relay.example/v1")
+        fun bodies(provider: ProviderSetting.OpenAI, p: TextGenerationParams) = listOf(
+            buildChatRequest(p, messages, provider), responses.buildRequestBody(provider, messages, p, false),
+            responses.buildRequestBody(provider, messages, p, true),
+        )
+        bodies(ProviderSetting.OpenAI(), params).forEach { assertEquals(key, it["prompt_cache_key"]?.jsonPrimitive?.content) }
+        bodies(proxy, params).forEach { assertFalse(it.containsKey("prompt_cache_key")) }
+        bodies(proxy.copy(promptCacheKeyMode = PromptCacheKeyMode.ENABLED), params).forEach {
+            assertEquals(key, it["prompt_cache_key"]?.jsonPrimitive?.content)
+        }
+        bodies(ProviderSetting.OpenAI(), params.copy(model = params.model.copy(promptCacheKeyEnabled = false))).forEach {
+            assertFalse(it.containsKey("prompt_cache_key"))
+        }
+        bodies(ProviderSetting.OpenAI(), params.copy(customBody = listOf(CustomBody("prompt_cache_key", JsonPrimitive("manual"))))).forEach {
+            assertEquals("manual", it["prompt_cache_key"]?.jsonPrimitive?.content)
+        }
     }
 
     @Test

@@ -27,12 +27,17 @@ import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.core.TokenUsage
 import me.rerere.ai.core.UsageNormalizer
 import me.rerere.ai.provider.BuiltInTools
+import me.rerere.ai.provider.inPromptOrder
 import me.rerere.ai.provider.LogicalPrompt
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.provider.TextGenerationResult
 import me.rerere.ai.provider.TextGenerationParams
+import me.rerere.ai.provider.withPromptCacheKey
+import me.rerere.ai.provider.PromptCacheApi
+import me.rerere.ai.provider.observePromptCacheRequest
+import me.rerere.ai.provider.withSessionAffinity
 import me.rerere.ai.provider.stream.SseEvent
 import me.rerere.ai.provider.providers.PartGroup
 import me.rerere.ai.provider.providers.groupPartsByToolBoundary
@@ -98,6 +103,7 @@ class ResponseAPI(
             )
             .addHeader("Content-Type", "application/json")
             .configureReferHeaders(providerSetting.baseUrl)
+            .withSessionAffinity(providerSetting, params)
             .build()
 
         Log.i(TAG, "generateText: ${json.encodeToString(requestBody)}")
@@ -135,6 +141,7 @@ class ResponseAPI(
                 "Bearer ${keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString())}"
             )
             .configureReferHeaders(providerSetting.baseUrl)
+            .withSessionAffinity(providerSetting, params)
             .build()
 
         Log.i(TAG, "streamText: ${json.encodeToString(requestBody)}")
@@ -279,7 +286,7 @@ class ResponseAPI(
                         }
                     }
                     // built-in tools
-                    params.model.tools.forEach { builtInTool ->
+                    params.model.tools.inPromptOrder().forEach { builtInTool ->
                         when (builtInTool) {
                             BuiltInTools.Search -> {
                                 add(buildJsonObject {
@@ -299,7 +306,8 @@ class ResponseAPI(
                     }
                 }
             }
-        }.mergeCustomBody(params.customBody)
+        }.mergeCustomBody(params.customBody).withPromptCacheKey(providerSetting, params)
+            .observePromptCacheRequest(params, PromptCacheApi.RESPONSES)
     }
 
     internal fun buildMessages(messages: List<UIMessage>) = buildJsonArray {
@@ -662,7 +670,7 @@ class ResponseAPI(
     private fun parseTokenUsage(jsonObject: JsonObject?, model: String?): TokenUsage? {
         if (jsonObject == null) return null
         val cachedTokens = jsonObject["input_tokens_details"]?.jsonObjectOrNull
-            ?.get("cached_tokens")?.jsonPrimitive?.intOrNull ?: 0
+            ?.get("cached_tokens")?.jsonPrimitive?.intOrNull
         return UsageNormalizer.normalize(
             totalInputTokens = jsonObject["input_tokens"]?.jsonPrimitive?.intOrNull,
             completionTokens = jsonObject["output_tokens"]?.jsonPrimitive?.intOrNull,

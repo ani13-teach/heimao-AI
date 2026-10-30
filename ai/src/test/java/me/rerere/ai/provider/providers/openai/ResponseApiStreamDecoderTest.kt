@@ -62,6 +62,7 @@ class ResponseApiStreamDecoderTest {
                 promptTokens = 10,
                 completionTokens = 20,
                 cachedTokens = 4,
+                cacheUsageReported = true,
                 totalTokens = 30,
                 provider = "openai",
                 model = "test-model",

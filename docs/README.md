@@ -20,7 +20,7 @@
 | [可携带工作区设计](HEIMAO_PORTABLE_WORKSPACE_DESIGN.md) | 归档设计背景；实际导出格式和隐私提醒以当前指南为准 |
 | [可携带工作区实施计划](HEIMAO_PORTABLE_WORKSPACE_IMPLEMENTATION_PLAN.md) | 计划，不等同于完成记录 |
 | [记忆缓存抓包报告](MEMORY_PROMPT_CACHE_CAPTURE_REPORT.md) | 当时环境下的观测结论，不保证所有模型/渠道一致 |
-| [提示词缓存优化计划](prompt-cache-optimization-plan.md) | 历史计划，实施状态需核对 |
+| [提示词缓存机制](prompt-cache-optimization-plan.md) | 请求分区、缓存键、可选中转站路由与用量诊断 |
 | [reasoning 字段修复计划](reasoning-level-field-fix-plan.md) | 问题背景与方案 |
 | [共享 Linux/Python 隔离研究](research_shared_linux_python_isolation_20260921.md) | 方案比较，不能代替实际安全边界验证 |
 

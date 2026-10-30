@@ -31,7 +31,10 @@ import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.core.TokenUsage
 import me.rerere.ai.core.UsageNormalizer
 import me.rerere.ai.provider.BuiltInTools
+import me.rerere.ai.provider.inPromptOrder
 import me.rerere.ai.provider.LogicalPrompt
+import me.rerere.ai.provider.PromptCacheApi
+import me.rerere.ai.provider.observePromptCacheRequest
 import me.rerere.ai.provider.Modality
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
@@ -428,7 +431,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         // 目前不能和工具调用兼容
         if (params.model.tools.isNotEmpty()) {
             put("tools", buildJsonArray {
-                params.model.tools.forEach { builtInTool ->
+                params.model.tools.inPromptOrder().forEach { builtInTool ->
                     when (builtInTool) {
                         BuiltInTools.Search -> {
                             add(buildJsonObject {
@@ -471,7 +474,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                 put("threshold", "OFF")
             })
         }
-    }.mergeCustomBody(params.customBody)
+    }.mergeCustomBody(params.customBody).observePromptCacheRequest(params, PromptCacheApi.GEMINI)
 
     private fun commonRoleToGoogleRole(role: MessageRole): String {
         return when (role) {
@@ -768,7 +771,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         }
         val promptTokens = jsonObject["promptTokenCount"]?.jsonPrimitiveOrNull?.intOrNull ?: 0
         val thoughtTokens = jsonObject["thoughtsTokenCount"]?.jsonPrimitiveOrNull?.intOrNull ?: 0
-        val cachedTokens = jsonObject["cachedContentTokenCount"]?.jsonPrimitiveOrNull?.intOrNull ?: 0
+        val cachedTokens = jsonObject["cachedContentTokenCount"]?.jsonPrimitiveOrNull?.intOrNull
         val candidatesTokens = jsonObject["candidatesTokenCount"]?.jsonPrimitiveOrNull?.intOrNull ?: 0
         val totalTokens = jsonObject["totalTokenCount"]?.jsonPrimitiveOrNull?.intOrNull ?: 0
         return UsageNormalizer.normalize(

@@ -259,6 +259,9 @@ data class TextGenerationParams(
     val customBody: List<CustomBody> = emptyList(),
     /** Logical prompt supplied by the request builder; omitted from serialization. */
     @Transient val logicalPrompt: LogicalPrompt? = null,
+    /** Opaque conversation identity; never serialized as an internal API field. */
+    @Transient val promptCacheKey: String? = null,
+    @Transient val onPromptCacheSnapshot: ((PromptCacheSnapshot) -> Unit)? = null,
 )
 
 @Serializable

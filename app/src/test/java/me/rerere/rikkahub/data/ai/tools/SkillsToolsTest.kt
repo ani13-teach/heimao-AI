@@ -15,6 +15,18 @@ class SkillsToolsTest {
     val tempFolder = TemporaryFolder()
 
     @Test
+    fun `skill index is identical regardless of discovery order`() {
+        val skills = listOf("z", "a", "A").mapIndexed { index, name ->
+            SkillMetadata(name = name, description = "description $name", skillDir = tempFolder.newFolder("skill-$index"))
+        }
+        fun prompt(entries: List<SkillMetadata>) = createSkillTools(
+            enabledSkills = skills.map { it.name }.toSet(), allSkills = entries,
+        ).single().systemPrompt(me.rerere.ai.provider.Model(), emptyList())
+        assertEquals(prompt(skills), prompt(skills.reversed()))
+        org.junit.Assert.assertTrue(prompt(skills).indexOf("<name>A</name>") < prompt(skills).indexOf("<name>a</name>"))
+    }
+
+    @Test
     fun `use_skill reads metadata directory when display name differs`() = runBlocking {
         val skillDir = tempFolder.newFolder("directory-name")
         skillDir.resolve("SKILL.md").writeText(

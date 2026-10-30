@@ -27,6 +27,9 @@ import me.rerere.ai.core.Tool
 import me.rerere.ai.provider.ClaudeMemoryCacheBlock
 import me.rerere.ai.provider.CustomBody
 import me.rerere.ai.provider.LogicalPrompt
+import me.rerere.ai.provider.inPromptOrder
+import me.rerere.ai.provider.conversationPromptCacheKey
+import me.rerere.ai.provider.PromptCacheSnapshot
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelType
 import me.rerere.ai.provider.ModelAbility
@@ -451,7 +454,7 @@ class GenerationHandler(
                     addAll(memoryTools)
                 }
                 addAll(tools.filterNot { it.name in protectedNames })
-            }
+            }.inPromptOrder()
 
             // Check if we have tool calls ready to continue after user interaction.
             val pendingTools = messages.lastOrNull()?.getTools()?.filter {
@@ -512,12 +515,6 @@ class GenerationHandler(
                     conversationModeInjectionIds = conversationModeInjectionIds,
                     workspaceId = workspaceId,
                     workspaceCwd = workspaceCwd,
-                )
-                // 一轮模型请求结束，记下这一轮的 token 明细和缓存命中情况。
-                chatLogStore.recordTokenUsage(
-                    model = model,
-                    provider = provider,
-                    usage = messages.lastOrNull()?.usage,
                 )
                 memoryResolution.commit?.let { commit ->
                     refreshAndCommitMemorySnapshot(
@@ -994,6 +991,8 @@ class GenerationHandler(
         val internalMessages = committedPrompt.toMessages()
 
         var messages: List<UIMessage> = messages
+        val cacheSessionKey = conversationPromptCacheKey(assistant.id.toString(), sourceConversation.id.toString())
+        var cacheSnapshot: PromptCacheSnapshot? = null
         val params = TextGenerationParams(
             model = model,
             temperature = assistant.temperature,
@@ -1010,6 +1009,8 @@ class GenerationHandler(
                 addAll(model.customBodies)
             },
             logicalPrompt = committedPrompt,
+            promptCacheKey = cacheSessionKey,
+            onPromptCacheSnapshot = if (chatLogStore.cacheDiagnosticsEnabled) { snapshot -> cacheSnapshot = snapshot } else null,
         )
         messages = providerImpl.generateTextWithModelTransport(
             providerSetting = provider,
@@ -1031,6 +1032,10 @@ class GenerationHandler(
                 }
             },
             onUpdateMessages = onUpdateMessages,
+        )
+        chatLogStore.recordTokenUsage(
+            model = model, provider = provider, usage = messages.lastOrNull()?.usage,
+            sessionKey = cacheSessionKey, cacheSnapshot = cacheSnapshot,
         )
     }
 

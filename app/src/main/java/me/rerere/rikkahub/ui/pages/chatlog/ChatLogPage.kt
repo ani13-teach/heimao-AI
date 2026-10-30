@@ -24,6 +24,9 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.nestedscroll.nestedScroll
@@ -44,6 +47,12 @@ import me.rerere.hugeicons.stroke.Refresh01
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.log.ChatLogEntry
 import me.rerere.rikkahub.data.log.ChatLogLevel
+import me.rerere.rikkahub.data.log.CacheLogSummary
+import me.rerere.rikkahub.data.log.summarizeCacheLogs
+import me.rerere.ai.provider.CacheBoundary
+import me.rerere.ai.provider.PromptCacheApi
+import me.rerere.ai.provider.PromptCacheChange
+import me.rerere.ai.provider.PromptCacheSection
 import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.theme.CustomColors
 import me.rerere.rikkahub.ui.theme.JetbrainsMono
@@ -57,6 +66,8 @@ private val TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("MM-
 fun ChatLogPage(vm: ChatLogVM = koinViewModel()) {
     val level by vm.level.collectAsStateWithLifecycle()
     val entries by vm.entries.collectAsStateWithLifecycle()
+    var showSummaries by remember { mutableStateOf(false) }
+    val summaries = remember(entries) { summarizeCacheLogs(entries) }
 
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
 
@@ -92,7 +103,25 @@ fun ChatLogPage(vm: ChatLogVM = koinViewModel()) {
                     modifier = Modifier.padding(horizontal = 8.dp),
                 )
             }
-            if (entries.isEmpty()) {
+            item {
+                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
+                    listOf(false to "请求明细", true to "缓存汇总").forEachIndexed { index, (summary, label) ->
+                        SegmentedButton(
+                            selected = showSummaries == summary,
+                            onClick = { showSummaries = summary },
+                            shape = SegmentedButtonDefaults.itemShape(index, 2),
+                        ) { Text(label) }
+                    }
+                }
+            }
+            if (showSummaries) {
+                if (summaries.isEmpty()) {
+                    item { Text("暂无缓存用量记录", modifier = Modifier.padding(16.dp)) }
+                }
+                items(summaries) { summary ->
+                    CacheSummaryCard(summary, Modifier.padding(horizontal = 8.dp))
+                }
+            } else if (entries.isEmpty()) {
                 item {
                     Card(
                         modifier = Modifier
@@ -216,12 +245,74 @@ private fun LogEntryCard(entry: ChatLogEntry, modifier: Modifier = Modifier) {
 private fun RequestUsageBody(entry: ChatLogEntry.RequestUsage) {
     DetailRow(stringResource(R.string.chat_log_model), entry.modelId)
     DetailRow(stringResource(R.string.chat_log_provider), "${entry.providerName} · ${entry.providerId}")
-    DetailRow(stringResource(R.string.chat_log_prompt_tokens), entry.promptTokens.formatNumber())
-    DetailRow(stringResource(R.string.chat_log_completion_tokens), entry.completionTokens.formatNumber())
-    DetailRow(stringResource(R.string.chat_log_cache_read), entry.cacheReadTokens.formatNumber())
-    DetailRow(stringResource(R.string.chat_log_cache_write), entry.cacheWriteTokens.formatNumber())
-    DetailRow(stringResource(R.string.chat_log_total_tokens), entry.totalTokens.formatNumber())
-    DetailRow(stringResource(R.string.chat_log_cache_hit_rate), entry.cacheHitRate.toPercentText())
+    entry.sessionKey?.let { DetailRow("会话", it.takeLast(10)) }
+    when (entry.usageReported) {
+        false -> DetailRow("用量", "服务商未报告")
+        null -> DetailRow("用量", "历史记录")
+        true -> Unit
+    }
+    if (entry.usageReported != false) {
+        DetailRow(stringResource(R.string.chat_log_prompt_tokens), entry.promptTokens.formatNumber())
+        DetailRow(stringResource(R.string.chat_log_completion_tokens), entry.completionTokens.formatNumber())
+        val missingCache = entry.cacheUsageReported == false
+        DetailRow(stringResource(R.string.chat_log_cache_read), if (missingCache) "未报告" else entry.cacheReadTokens.formatNumber())
+        DetailRow(stringResource(R.string.chat_log_cache_write), if (missingCache) "未报告" else entry.cacheWriteTokens.formatNumber())
+        DetailRow(stringResource(R.string.chat_log_total_tokens), entry.totalTokens.formatNumber())
+        DetailRow(stringResource(R.string.chat_log_cache_hit_rate), entry.cacheHitRate.toPercentText())
+    }
+    entry.cacheDiagnostic?.let { diagnostic ->
+        val changes = if (diagnostic.baseline) "首次记录" else diagnostic.changes.entries.joinToString("、") { (section, change) ->
+            "${section.displayName()}（${if (change == PromptCacheChange.APPENDED) "追加" else "变化"}）"
+        }.ifEmpty { "未变化" }
+        DetailRow("逻辑提示词分区", changes)
+        if (diagnostic.api == PromptCacheApi.CLAUDE) {
+            val boundaries = when {
+                diagnostic.layoutSkipped -> "自定义结构，已跳过"
+                diagnostic.appliedBoundaries.isEmpty() -> "未添加"
+                else -> diagnostic.appliedBoundaries.joinToString("、") {
+                    when (it) {
+                        CacheBoundary.SYSTEM_END -> "系统"
+                        CacheBoundary.MEMORY_END -> "记忆"
+                        CacheBoundary.HISTORY_END -> "历史"
+                    }
+                }
+            }
+            DetailRow("请求缓存断点", boundaries)
+        }
+        if (diagnostic.api == PromptCacheApi.CHAT_COMPLETIONS || diagnostic.api == PromptCacheApi.RESPONSES) {
+            DetailRow("会话缓存键", if (diagnostic.cacheKeySent) "已发送" else "未发送")
+        }
+    }
+}
+
+private fun PromptCacheSection.displayName(): String = when (this) {
+    PromptCacheSection.TOOLS -> "工具"
+    PromptCacheSection.SYSTEM -> "系统"
+    PromptCacheSection.MEMORY -> "记忆"
+    PromptCacheSection.HISTORY -> "历史"
+    PromptCacheSection.TRANSIENT -> "临时材料"
+    PromptCacheSection.MEMORY_DELTA -> "记忆补丁"
+    PromptCacheSection.CURRENT -> "当前轮"
+    PromptCacheSection.CUSTOM_PROMPT -> "自定义请求"
+}
+
+@Composable
+private fun CacheSummaryCard(summary: CacheLogSummary, modifier: Modifier = Modifier) {
+    Card(modifier = modifier.fillMaxWidth(), colors = CustomColors.cardColorsOnSurfaceContainer) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(summary.modelId, style = MaterialTheme.typography.titleSmall)
+            DetailRow("渠道", "${summary.providerName} · ${summary.providerId}")
+            DetailRow("会话", summary.sessionKey?.takeLast(10) ?: "历史记录")
+            DetailRow("生成步骤", summary.steps.toString())
+            DetailRow("报告用量", "${summary.usageReports}/${summary.steps}")
+            DetailRow("报告缓存用量", "${summary.cacheReports}/${summary.steps}")
+            DetailRow("有缓存读取", "${summary.hitSteps}/${summary.cacheReports}")
+            DetailRow("已报缓存请求的输入", summary.inputTokens.toString())
+            DetailRow("缓存读取", summary.cacheReadTokens.toString())
+            DetailRow("缓存写入", summary.cacheWriteTokens.toString())
+            DetailRow("缓存命中率", summary.cacheHitRate.toPercentText())
+        }
+    }
 }
 
 @Composable

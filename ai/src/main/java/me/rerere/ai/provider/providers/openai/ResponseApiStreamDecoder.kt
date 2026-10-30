@@ -235,7 +235,7 @@ internal class ResponseApiStreamDecoder : StreamChunkDecoder {
     private fun parseUsage(usage: JsonObject?, model: String?): TokenUsage? {
         if (usage == null) return null
         val cachedTokens = usage["input_tokens_details"]?.jsonObjectOrNull
-            ?.get("cached_tokens")?.jsonPrimitive?.intOrNull ?: 0
+            ?.get("cached_tokens")?.jsonPrimitive?.intOrNull
         return UsageNormalizer.normalize(
             totalInputTokens = usage["input_tokens"]?.jsonPrimitive?.intOrNull,
             completionTokens = usage["output_tokens"]?.jsonPrimitive?.intOrNull,

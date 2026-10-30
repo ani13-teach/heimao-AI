@@ -1,356 +1,118 @@
-# Prompt Cache Optimization 实施规划
+# 提示词缓存机制
 
-## 1. 目标与范围
+## 请求结构
 
-将当前提示词构建和 Provider 缓存参数收敛为：
+应用生成入口在完成工具冲突过滤后固定工具定义顺序，并用同一份顺序构造工具说明和 Provider 请求。技能目录按名称固定排序；历史工具调用、结果及执行顺序不参与排序。
 
-- 一个统一的逻辑提示词结构。
-- 两个 Provider 无关的逻辑缓存边界：`HISTORY_END`、`MEMORY_END`。
-- Claude 映射为两个 explicit `cache_control` 断点。
-- OpenAI 首版只使用稳定的 `prompt_cache_key`，依赖 implicit caching。
-- Gemini 首版不参与请求构建侧缓存控制，只保持语义顺序并读取 usage。
-- 一个统一的缓存用量模型，区分 cache read、cache write 和普通输入 token。
-
-本阶段不实现通用 `CachePlanner`，不根据收益自动选择断点，也不为当前工具循环增加第三个断点。
-
-## 2. 最终逻辑结构
-
-所有 Provider 先接收同一套逻辑顺序：
+逻辑提示词由 `LogicalPrompt` 表达：
 
 ```text
-Tool Definitions
+Tools
 System
+Memory Snapshot
 Historical Conversation
------------------------ Breakpoint A: HISTORY_END
-
-Transient Context (optional)
-Memory
------------------------ Breakpoint B: MEMORY_END
-
+Transient Context
+Memory Delta
 Latest User
-Current Tool Loop...
+Current Tool Loop
 ```
 
-其中：
+OpenAI 与 Gemini 使用当前完整记忆快照。Claude 使用独立的稳定记忆基线及后置补丁，不把每次记忆编辑都写回历史前面的基线。
 
-- `Tool Definitions + System + History` 是第一段稳定、可追加的前缀。
-- `Memory` 是第二个显式缓存边界；`Transient Context` 必须位于 `Memory` 前。
-- `Latest User` 后只追加本轮生成的 `tool_call` 和 `tool_result`。
-- 历史工具调用及其结果保留在历史时间线中，不重新排序或提取到其他区域。
-- Provider Adapter 只负责把逻辑结构转换为目标 API 的合法 wire format。
+## Claude
 
-## 3. 第一阶段：重构 RequestBuilder
+Claude 在协议允许的位置映射三个逻辑缓存边界：
 
-### 3.1 统一内部模型
+- `SYSTEM_END`：稳定系统内容末尾；没有系统内容时尝试工具定义末尾。
+- `MEMORY_END`：顶层 system 中的稳定记忆基线末尾；无记忆时跳过。
+- `HISTORY_END`：历史时间线末尾，向前查找允许添加标记的 block。
 
-在 AI 请求构建层引入等价于以下定义的内部结构。具体类型应复用现有 `Message`、内容部件和工具定义类型，不重复创建 Provider 专属消息模型：
+thinking 等不允许标记的 block 被跳过。当前用户轮和当前工具循环不额外添加断点。所有自动断点使用渠道配置的同一 TTL。
 
-```kotlin
-interface LogicalPrompt {
-    val tools: List<ToolDefinition>
-    val system: SystemContent
-    val history: List<Message>
-    val transientContext: Content?
-    val memory: Content?
-    val latestUser: Message
-}
+普通记忆基线在历史之前保持不变，新增、修改和删除通过历史之后的 Memory Patch 表达。补丁按顺序生效，后面的 upsert 覆盖同 ID 的旧值，deleted 为删除标记。补丁累计达到 4 KiB 时，候选状态压实为新基线；只有 Provider 请求成功并通过最新 Room 记忆校验，才提交候选状态。失败、取消和过期候选不推进已提交版本。
 
-enum class CacheBoundary {
-    HISTORY_END,
-    MEMORY_END,
-}
-```
+记忆快照状态仅在进程中保留，采用最多 32 个会话的 LRU。重启或淘汰后，以当前完整记忆重新建立基线。
 
-如现有代码使用 `data class` 或 sealed 类型更符合项目风格，可采用等价实现；关键是保持上述字段语义，不要求最终 JSON 与该结构一致。
+自定义请求体替换 `messages`、`system` 或 `tools` 时，Claude 不使用原布局的索引添加自动断点，以免标记落到错误内容上。
 
-### 3.2 RequestBuilder 必须保证的规则
+## OpenAI 会话缓存键
 
-1. Tool definitions 顺序稳定、可预测。
-2. System 内容在构建过程中保持确定，不被历史或 memory 插入逻辑改写。
-3. History 严格按照时间顺序输出。
-4. 历史 `tool_call`/`tool_result` 原样保留在历史时间线中。
-5. `transientContext`（如果存在）位于 `memory` 前。
-6. `memory`（如果存在）永远位于 `latestUser` 前。
-7. `latestUser` 后面只允许出现当前轮产生的 tool loop。
-8. 没有 memory 时不生成 `MEMORY_END` 的逻辑边界。
+Chat Completions 与 Responses 共用缓存键策略。
 
-### 3.3 不引入的抽象
+渠道设置提供三种模式：
 
-首版不要引入以下概念：
-
-- `StableMemory`
-- `DynamicMemory`
-- `ToolLoopTail`
-- `CacheCandidate`
-- `CacheStrategy`
-- 通用 `CachePlanner`
-
-这些概念会把 Provider 无关的顺序表达和 Provider 具体的缓存收益判断混在一起，当前需求不需要它们。
-
-### 3.4 搜索结果的归类
-
-RequestBuilder 必须区分两种搜索材料：
-
-- **模型主动搜索**：模型发起 tool call，应用返回 tool result。它属于当前 tool loop，追加在 `latestUser` 后。
-- **应用预取搜索**：应用在请求模型前完成 RAG、Web Search 或 Document Retrieval。它作为 `transientContext`，位于 History 与 Memory 之间。
-
-无论是哪种搜索材料，都不能破坏 `Memory` 位于最新用户消息前的规则。
-
-## 4. 第二阶段：Claude explicit breakpoints
-
-### 4.1 总体策略
-
-Claude 首版关闭 automatic caching，只使用两个 explicit breakpoint：
-
-- `HISTORY_END`：缓存 tools、system 和 historical conversation。
-- `MEMORY_END`：缓存 transient context 和 memory。
-
-逻辑映射：
-
-```text
-Tools + System + History -> HISTORY_END
-Transient + Memory       -> MEMORY_END
-Latest User              -> no breakpoint
-```
-
-TTL 继续复用现有 Claude 配置能力；本计划不扩大 TTL 选项，也不把 TTL 判断混入 RequestBuilder。
-
-### 4.2 `applyCacheBoundary`
-
-在 Claude Adapter 内实现小型、局部的辅助函数：
-
-```kotlin
-applyCacheBoundary(request, CacheBoundary.HISTORY_END)
-applyCacheBoundary(request, CacheBoundary.MEMORY_END)
-```
-
-职责仅限于：
-
-1. 找到指定逻辑区域最后一个 Claude 允许添加 `cache_control` 的 content block。
-2. 跳过 thinking/reasoning block 以及协议不允许添加 `cache_control` 的 block。
-3. 找不到合法 block 时静默不添加该断点，并返回明确的 applied/skipped 结果供调试输出。
-4. 只增加 `cache_control`，不修改消息角色、文本、工具调用参数、工具结果或 thinking 元数据。
-5. `MEMORY_END` 在 memory 为空时直接跳过，不退化到 latest user。
-
-Claude wire format 不是简单的统一消息数组，因此边界定位必须在 Adapter 对已生成的 Claude request 上完成，不能让 RequestBuilder 直接写入 Claude 专属 block 字段。
-
-### 4.3 工具循环行为
-
-历史工具调用归入 History，并允许 `HISTORY_END` 在其后设置断点：
-
-```text
-User 1
-Assistant tool_call
-Tool result
-Assistant final
----------------- Breakpoint A
-Memory
----------------- Breakpoint B
-User 2
-```
-
-当前轮首次请求：
-
-```text
-History + A + Memory + B + User 2
-```
-
-模型返回 tool call 后，下一次请求追加本轮 assistant tool call 和 tool result：
-
-```text
-History + A + Memory + B + User 2 + Assistant tool_call + Tool result
-```
-
-不新增第三个 breakpoint。当前工具循环尾部没有显式缓存是首版已接受的成本；只有真实 usage 显示该成本显著时，后续再单独规划 ToolLoop breakpoint。
-
-## 5. 第三阶段：UsageNormalizer
-
-与 Claude 第一阶段同步建立统一用量模型：
-
-```kotlin
-data class CacheUsage(
-    val totalInputTokens: Int? = null,
-    val cacheReadTokens: Int? = null,
-    val cacheWriteTokens: Int? = null,
-    val provider: Provider,
-    val model: String,
-    val raw: ProviderUsage? = null,
-)
-```
-
-实际类型可根据现有 usage 类型调整，但必须保留以下语义：
-
-- `totalInputTokens`：服务商报告的总输入 token。
-- `cacheReadTokens`：本次从缓存读取的 token。
-- `cacheWriteTokens`：本次写入缓存的 token。
-- `provider` 和 `model`：用于比较和诊断。
-- `raw`：仅用于调试；默认不要求持久化。
-
-Provider 字段映射：
-
-- Claude：`input_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens`。
-- OpenAI：Responses 或 Chat Completions 对应的 input/prompt token 与 cached token 字段；兼容现有中转站字段映射。
-- Gemini：输入 token 与 `cachedContentTokenCount`。
-
-现有 `TokenUsage.cachedTokens` 等业务展示字段可以继续保留作为兼容层；不要在首版同时让 UI 直接依赖多个 Provider 专属 usage 类型。归一化完成后，再决定是否将 read/write 细分持久化到消息或统计数据库。
-
-### 5.1 调试输出
-
-增加可控的调试输出，示例：
-
-```text
-[PromptCache]
-provider: claude
-model: claude-xxx
-input:       18,421
-cache read:  13,022
-cache write: 2,941
-historyBreakpoint: applied
-memoryBreakpoint: applied
-```
-
-`historyBreakpoint`/`memoryBreakpoint` 只表示请求构建时断点是否成功应用，不能称为 cache hit。实际 hit 必须来自服务商 usage，例如 `cacheReadTokens > 0`。
-
-## 6. 第四阶段：OpenAI
-
-OpenAI 首版不映射 `HISTORY_END` 或 `MEMORY_END`，只使用 implicit caching 和稳定的 `prompt_cache_key`：
-
-```text
-LogicalPrompt
-    -> OpenAI Adapter
-    -> normal Responses/Chat format + prompt_cache_key
-```
-
-推荐生成方式：
-
-```text
-prompt_cache_key = "chat_" + sha256(appId + conversationId)
-```
-
-最低要求：
-
-- 同一会话的 key 稳定。
-- 不同会话隔离。
-- 不包含 turn id、request id、timestamp 等每轮变化的字段。
-- 不直接暴露原始内部 conversation ID。
-
-关闭优化时不发送 `prompt_cache_key`。是否仍发生供应商内部 implicit caching 不由应用控制，也不在首版承诺范围内。
-
-首版先观察 `cached_tokens`/等价 usage，以及 memory 变化对 prefix 复用的影响。只有数据证明 implicit caching 不足时，才规划 OpenAI 的 explicit breakpoint 映射。
-
-## 7. 第五阶段：Gemini
-
-Gemini 首版保持正常请求格式：
-
-```text
-LogicalPrompt -> Gemini Adapter -> normal Gemini request
-```
-
-只保证 system、history、transient、memory、latest user 的最终语义顺序稳定，并读取 Gemini 返回的 cached token usage。
-
-首版不要：
-
-- 创建 explicit context cache。
-- 在应用侧计算 Gemini breakpoint。
-- 引入 Gemini cache key。
-- 增加特殊缓存生命周期管理。
-
-## 8. 配置语义
-
-全局配置：
-
-```text
-promptCacheEnabled: Boolean
-```
-
-Provider 行为：
-
-| Provider | 开启 | 关闭 |
-| --- | --- | --- |
-| Claude | 添加 explicit A+B；继续使用现有 TTL | 不发送 `cache_control` |
-| OpenAI | 发送稳定 `prompt_cache_key`，依赖 implicit caching | 不发送 `prompt_cache_key` |
-| Gemini | 请求格式不变 | 请求格式不变 |
-
-UI 文案建议使用“缓存优化”或 `Prompt Cache Optimization`，不要使用会让用户误以为可以完全控制供应商后台缓存的“缓存开关”。关闭的准确语义是：应用不主动添加缓存相关参数。
-
-现有 Claude 专属 prompt caching 设置需要在重构后与全局开关保持一致，避免出现全局关闭但 Claude 仍写入 `cache_control` 的路径。
-
-## 9. 测试矩阵
-
-第一批测试覆盖以下 8 个场景：
-
-| 场景 | 验证重点 |
+| 模式 | 行为 |
 | --- | --- |
-| 单轮普通聊天 | 请求合法，字段顺序正确 |
-| 连续 5 轮聊天 | History A 正常向后增长 |
-| Memory 不变 | B 结构稳定，具备复用机会 |
-| Memory 每轮变化 | A 仍可复用，Memory 不错误并入 History |
-| 无 Memory | 不生成 B，不把 B 放到 latest user |
-| 当前轮 5 次 tool loop | 追加顺序正确，未生成第三个断点 |
-| 历史包含 tool results | tool call/result 不移动，A 可正常设置 |
-| transient 搜索材料 | 位于 History 与 Memory 之间 |
+| 自动 | 仅为 HTTPS、主机名严格为 `api.openai.com` 的接口自动添加 |
+| 开启 | 为该渠道的聊天请求添加 |
+| 关闭 | 不自动添加 |
 
-Claude 额外覆盖：
+模型高级设置中的“跟随渠道 / 开启 / 关闭”优先于渠道策略。自定义请求体中的 `prompt_cache_key` 或 `promptCacheKey` 始终保留，包括显式空值，不被自动值覆盖。关闭选项只停止自动添加，不删除用户手动配置的字段。
 
-- 含 thinking/reasoning block 的请求。
-- 最后一个 block 不合法时向前查找合法 block。
-- 区域内没有合法 block 时不添加断点且请求仍可发送。
-- memory 为空时不生成 `MEMORY_END`。
-- 验证返回 usage 中 read/write 字段能正确归一化。
+应用用固定命名空间、助手 ID 和会话 ID 生成 SHA-256 摘要，输出 `hm-` 加 32 位十六进制字符。相同助手和会话在连续轮次、工具续跑及应用重启后得到相同标识，不包含时间、请求编号或原始内部 ID。标识通过非序列化的 `TextGenerationParams.promptCacheKey` 传递，只在适用的 Provider 请求正文中写为协议字段。没有会话身份的辅助调用不自动生成缓存键。
 
-建议优先在 `ai` 模块为 LogicalPrompt、Claude boundary 定位和 UsageNormalizer 编写 JVM 单元测试，再执行 Provider 层的请求快照/解析测试。
+缓存键用于支持该字段的服务端路由；请求内容仍须满足服务端前缀复用条件。
 
-## 10. 实施顺序
+## 可选中转站会话路由
 
-1. 盘点并拆分现有 Prompt 构建路径，明确 RequestBuilder 与 Provider Adapter 的边界。
-2. 重构 RequestBuilder，引入固定的 `LogicalPrompt` 顺序。
-3. 增加 `CacheBoundary.HISTORY_END` 和 `CacheBoundary.MEMORY_END` 两个逻辑边界。
-4. 实现 Claude `applyCacheBoundary`，落地 explicit A+B。
-5. 实现 `UsageNormalizer`，并接入 Claude usage 调试输出。
-6. 完成 Claude 普通聊天、thinking 和 tool loop 测试。
-7. 为 OpenAI 加入稳定的 `prompt_cache_key`。
-8. 确认 Gemini 只保持纯 implicit caching 和稳定语义顺序。
-9. 收集真实的 cache read/write usage，区分“断点已应用”和“实际命中”。
-10. 根据数据决定是否为 OpenAI 增加 explicit A/B；本阶段不预先实现。
+OpenAI 兼容和 Claude 原生 Messages 渠道均提供独立的“中转站会话路由”开关，默认关闭。开启后可选择请求头格式：
 
-## 11. 验收标准
+| 格式 | 自动请求头 |
+| --- | --- |
+| 通用会话头 | `session_id`、`x-client-request-id`、`x-session-affinity` |
+| x-session-id | `x-session-id` |
 
-- 所有 Provider 的请求都由同一套 LogicalPrompt 语义顺序生成。
-- 历史消息和历史工具调用结果没有被缓存逻辑重排或丢失。
-- Claude 最多存在两个 explicit breakpoint；无 memory 时不存在 B。
-- 当前 tool loop 不增加第三个 breakpoint。
-- OpenAI 首版只发送稳定 session-scoped `prompt_cache_key`。
-- Gemini 请求格式和缓存生命周期保持不变。
-- Usage 能分别展示 input、cache read、cache write，并保留 Provider/model 维度。
-- 日志不会把 breakpoint applied 误报为 cache hit。
-- 全局“缓存优化”关闭时，应用不主动发送缓存控制参数。
-- 完成 `ai` 模块相关单元测试，并通过项目既有编译/测试命令。
+开启时根据渠道地址为 OpenRouter 选用对应初始格式，之后可手动切换。所有自动请求头使用同一个匿名会话标识；查找同名请求头不区分大小写，用户手动填写的值不被替换或重复添加。
 
-## 12. 明确的后续决策点
+两种格式均为中转站请求头约定，按中转站支持情况选择。普通、流式、工具续跑以及 Claude 的 `pause_turn` 自动续跑沿用同一标识。在 OpenAI 兼容与 Claude 原生类型间切换渠道时，保留路由开关及所选格式。
 
-以下事项留到真实 usage 数据之后，不进入首发实现：
+路由开关不依赖 OpenAI 正文缓存键或 Claude 提示词缓存开关。Claude 继续使用原生 Messages 请求、原有缓存边界、缓存时长和记忆增量补丁，不在正文添加 `prompt_cache_key`。OpenAI 和 Anthropic 官方接口均不自动添加中转站路由头。该设置不修改 Gemini、授权请求头或多密钥轮询策略。
 
-- OpenAI 是否值得增加 explicit A/B 映射。
-- 当前工具循环是否需要第三个临时断点。
-- 是否需要把 cache read/write 细分持久化到消息和统计数据库。
-- 是否需要针对不同模型或上下文长度调整断点策略。
+## 用量及日志
 
-首发缓存模块保持如下结构：
+`TokenUsage.promptTokens` 表示总输入量，`cacheReadTokens` 和 `cacheWriteTokens` 分别表示缓存读取和写入。`cachedTokens` 保留为读取量的兼容字段。
 
-```text
-Prompt
-├── RequestBuilder
-│   ├── History End
-│   └── Memory End
-│
-├── ClaudeAdapter
-│   └── explicit breakpoint x 2
-│
-├── OpenAIAdapter
-│   └── prompt_cache_key
-│
-├── GeminiAdapter
-│   └── nothing
-│
-└── UsageNormalizer
-```
+- Claude 总输入量为普通输入、缓存读取和缓存写入之和。
+- OpenAI、Gemini 的输入字段本身为总输入量，不再次累加缓存读取。
+- `cacheUsageReported=true` 表示响应中存在可解析的缓存计数，显式零值也属于已报告。
+- `cacheUsageReported=false` 表示本次用量未带缓存计数。
+- 旧数据没有该状态时保留为 null，不推断成已测得的未命中。
+
+流式合并保留早先分片已报告的缓存证据，末尾只报告输出量的分片不会清除它。
+
+聊天日志选择“全部”后记录每个成功生成步骤的用量。`usageReported=false` 与报告了零用量分别展示；未报告缓存计数时，不把缓存读写显示为测得的零值。
+
+“缓存汇总”按照匿名会话、渠道及模型分组，统计当前保留日志中的生成步骤、用量覆盖、缓存覆盖、读取量和写入量。命中率为已报告缓存计数步骤的累计缓存读取除以这些步骤的累计输入，不是各步骤百分比的平均数。旧记录或未报告缓存计数的步骤不进入该分母。一个步骤可能包含底层重试或 Claude 原生续跑，步骤数不等于实际 HTTP 请求数。
+
+## 分区诊断
+
+Provider 完成请求体合并和缓存标记后，生成进程内诊断快照：
+
+- 工具使用实际请求中的工具定义。
+- 系统、记忆、历史、临时材料、记忆补丁和当前轮比较逻辑消息内容，忽略消息身份与本地时间、审批状态。
+- 自定义请求体接管提示词布局时，只比较实际自定义请求内容，不套用原逻辑分区。
+- Claude 记录实际成功添加的断点；OpenAI 记录最终正文是否带有效缓存键。
+
+指纹使用进程内随机密钥的 HMAC，仅用于比较前后内容。比较状态最多保留 64 个会话/渠道/模型/API 组合，每个消息分区最多保留 512 个摘要；超长尾部合并比较。重启、状态淘汰或清空日志后重新建立基准。
+
+日志只保存首次记录、分区追加或变化、断点状态、缓存键发送状态及数值计数，不保存指纹、随机密钥、提示词、工具参数、请求头或响应正文。诊断仅在“全部”日志等级下启用；不改变请求内容，诊断失败不阻断生成。
+
+分区变化是客户端观测，不直接判断服务端为何未命中；实际读取量仍以服务商用量为准。
+
+## 代码及测试入口
+
+| 职责 | 位置 |
+| --- | --- |
+| 工具排序 | `ai/.../provider/PromptOrdering.kt` |
+| 缓存键及路由策略 | `ai/.../provider/PromptCachePolicy.kt` |
+| 分区快照与比较 | `ai/.../provider/PromptCacheDiagnostics.kt` |
+| 请求分区 | `ai/.../provider/Prompt.kt` |
+| 用量状态与合并 | `ai/.../core/Usage.kt` |
+| 会话生成与记忆补丁 | `app/.../data/ai/GenerationHandler.kt` |
+| 日志与分组汇总 | `app/.../data/log/` |
+| 渠道及模型设置 | `app/.../ui/pages/setting/` |
+| 日志展示 | `app/.../ui/pages/chatlog/` |
+
+回归测试覆盖固定顺序、两种 OpenAI 接口及两种传输方式、路由开关与自定义请求头优先级、缓存键继承和旧设置兼容、各 Provider 缺失与零值用量、流式合并、分区追加与变化、Claude 基线补丁、日志隐私与分组计数。
+
+缓存优化不自动发送后台保活请求，不自动延长 OpenAI 缓存时效，不调整多密钥分配，也不压缩技能说明。
